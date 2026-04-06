@@ -306,15 +306,11 @@ fn string_literal_in_if() {
 /// It validates that our parser can handle the full complexity of real-world
 /// computational CSS.
 #[test]
+#[ignore = "requires x86css-computational.css fixture"]
 fn parse_real_x86css() {
     let css_path = "tests/fixtures/x86css-computational.css";
-    let css = match std::fs::read_to_string(css_path) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("Skipping parse_real_x86css: fixture not found at {css_path}");
-            return;
-        }
-    };
+    let css = std::fs::read_to_string(css_path)
+        .expect("fixture not found at tests/fixtures/x86css-computational.css");
 
     let parsed = parse_css(&css).expect("x86CSS should parse");
 
@@ -381,14 +377,10 @@ fn parse_real_x86css() {
 /// without CSS animation synchronization), we verify that calcify reaches the
 /// same main loop and register value ranges as Chrome.
 #[test]
+#[ignore = "requires x86css-main.css fixture"]
 fn chrome_conformance_steady_state() {
-    let css = match std::fs::read_to_string("../../tests/fixtures/x86css-main.css") {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("Skipping chrome_conformance_steady_state: fixture not found");
-            return;
-        }
-    };
+    let css = std::fs::read_to_string("../../tests/fixtures/x86css-main.css")
+        .expect("fixture not found at tests/fixtures/x86css-main.css");
 
     let parsed = parse_css(&css).expect("should parse");
     let evaluator = Evaluator::from_parsed(&parsed);

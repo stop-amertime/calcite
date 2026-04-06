@@ -5,16 +5,21 @@ edition.workspace = true
 license.workspace = true
 description = "JIT compiler for computational CSS — core engine"
 
+[features]
+default = []
+conformance = ["serde", "serde_json"]
+
 [dependencies]
 cssparser = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"
 criterion = { version = "0.5", features = ["html_reports"] }
+calcify-core = { path = ".", features = ["conformance"] }
 
 [[bench]]
 name = "x86css"

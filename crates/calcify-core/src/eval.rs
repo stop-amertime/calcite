@@ -163,15 +163,32 @@ impl Evaluator {
         }
     }
 
-    /// Run a batch of ticks.
+    /// Run a batch of ticks, returning the net state diff across all ticks.
+    ///
+    /// Takes a snapshot before the batch and diffs at the end, so callers
+    /// see every register/memory change — not just the final tick's delta.
     pub fn run_batch(&self, state: &mut State, count: u32) -> TickResult {
-        let mut result = TickResult::default();
+        let snapshot = state.clone();
         for _ in 0..count {
-            let tick_result = self.tick(state);
-            result.changes = tick_result.changes;
-            result.ticks_executed += 1;
+            self.tick(state);
         }
-        result
+
+        // Diff registers
+        let mut changes = Vec::new();
+        let reg_names = [
+            "--AX", "--CX", "--DX", "--BX", "--SP", "--BP", "--SI", "--DI",
+            "--IP", "--ES", "--CS", "--SS", "--DS", "--flags",
+        ];
+        for (i, name) in reg_names.iter().enumerate() {
+            if state.registers[i] != snapshot.registers[i] {
+                changes.push((name.to_string(), state.registers[i].to_string()));
+            }
+        }
+
+        TickResult {
+            changes,
+            ticks_executed: count,
+        }
     }
 
     /// Apply computed property values to state and return the changes.
@@ -216,26 +233,21 @@ fn is_buffer_copy(name: &str) -> bool {
     name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2")
 }
 
-/// Strip x86CSS triple-buffer prefixes (`--__0`, `--__1`, `--__2`) from a property name.
+/// Extract the bare register/memory name from a CSS custom property name.
 ///
-/// x86CSS uses a 4-phase triple buffer where each variable exists as:
-/// - `--{name}` — computed new value
-/// - `--__0{name}` — captured by execute keyframe
-/// - `--__1{name}` — current read value
-/// - `--__2{name}` — captured by store keyframe
-///
-/// Since the engine uses mutable state (no triple buffering needed),
-/// all buffer variants resolve to the canonical name.
-fn strip_buffer_prefix(name: &str) -> &str {
+/// Strips the `--` prefix and any triple-buffer prefix (`__0`, `__1`, `__2`):
+/// - `"--AX"` → `"AX"`
+/// - `"--__0AX"` → `"AX"`
+/// - `"--__1flags"` → `"flags"`
+/// - `"--m42"` → `"m42"`
+fn to_bare_name(name: &str) -> &str {
     let after_dashes = &name[2..]; // skip leading "--"
-    if let Some(_rest) = after_dashes.strip_prefix("__0") {
-        // "--__0AX" → "--AX": reconstruct by returning slice starting 3 chars earlier
-        // We need to return a slice of the original, so use byte offset
-        &name[5..]
-    } else if let Some(_rest) = after_dashes.strip_prefix("__1") {
-        &name[5..]
-    } else if let Some(_rest) = after_dashes.strip_prefix("__2") {
-        &name[5..]
+    if let Some(rest) = after_dashes.strip_prefix("__0") {
+        rest
+    } else if let Some(rest) = after_dashes.strip_prefix("__1") {
+        rest
+    } else if let Some(rest) = after_dashes.strip_prefix("__2") {
+        rest
     } else {
         after_dashes
     }
@@ -250,7 +262,7 @@ fn strip_buffer_prefix(name: &str) -> &str {
 /// Automatically strips triple-buffer prefixes (`--__0`, `--__1`, `--__2`).
 pub fn property_to_address(name: &str) -> Option<i32> {
     use crate::state::addr;
-    let canonical = strip_buffer_prefix(name);
+    let canonical = to_bare_name(name);
     match canonical {
         "AX" => Some(addr::AX),
         "CX" => Some(addr::CX),
@@ -449,9 +461,9 @@ impl<'a> EvalEnv<'a> {
     fn eval_style_test(&mut self, test: &StyleTest, state: &State) -> bool {
         match test {
             StyleTest::Single { property, value } => {
-                let prop_val = self.resolve_property(property, state);
-                let test_val = self.eval_expr(value, state);
-                (prop_val - test_val).abs() < 0.5
+                let prop_val = self.resolve_property(property, state) as i64;
+                let test_val = self.eval_expr(value, state) as i64;
+                prop_val == test_val
             }
             StyleTest::And(tests) => tests.iter().all(|t| self.eval_style_test(t, state)),
             StyleTest::Or(tests) => tests.iter().any(|t| self.eval_style_test(t, state)),

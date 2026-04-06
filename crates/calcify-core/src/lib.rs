@@ -5,6 +5,7 @@
 //! operations. The primary target is running x86CSS faster than Chrome's native style
 //! resolver.
 
+#[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod error;
 pub mod eval;

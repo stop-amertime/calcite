@@ -149,10 +149,10 @@ impl State {
                 let lo = Self::lo8(self.registers[reg_idx]);
                 self.registers[reg_idx] = (value & 0xFF) * 256 + lo;
             }
-            // Write to full register
+            // Write to full register (mask to 16 bits — x86 8088 registers are 16-bit)
             -14..=-1 => {
                 let reg_idx = (-addr - 1) as usize;
-                self.registers[reg_idx] = value;
+                self.registers[reg_idx] = value & 0xFFFF;
             }
             _ => {
                 let addr = addr as usize;
@@ -172,15 +172,7 @@ impl State {
     pub fn hi8(value: i32) -> i32 {
         (value >> 8) & 0xFF
     }
-}
 
-impl Default for State {
-    fn default() -> Self {
-        Self::new(DEFAULT_MEM_SIZE)
-    }
-}
-
-impl State {
     /// Initialize state from `@property` initial values.
     ///
     /// This loads the program binary and register defaults from the CSS —
@@ -191,7 +183,6 @@ impl State {
         for prop in properties {
             let value = match &prop.initial_value {
                 Some(CssValue::Integer(v)) => *v as i32,
-                Some(CssValue::Number(v)) => *v as i32,
                 _ => continue,
             };
 
@@ -200,6 +191,12 @@ impl State {
                 self.write_mem(addr, value);
             }
         }
+    }
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::new(DEFAULT_MEM_SIZE)
     }
 }
 
@@ -284,5 +281,19 @@ mod tests {
 
         state.write_mem(addr::BH, 0x00);
         assert_eq!(state.registers[reg::BX], 0x00EF);
+    }
+
+    #[test]
+    fn register_write_masks_to_16_bits() {
+        let mut state = State::default();
+        // Values exceeding 16 bits should be masked
+        state.write_mem(addr::AX, 0x1_ABCD);
+        assert_eq!(state.registers[reg::AX], 0xABCD);
+
+        state.write_mem(addr::SP, 0xFFFF_FFFF_u32 as i32);
+        assert_eq!(state.registers[reg::SP], 0xFFFF);
+
+        state.write_mem(addr::FLAGS, 0x10000);
+        assert_eq!(state.registers[reg::FLAGS], 0);
     }
 }

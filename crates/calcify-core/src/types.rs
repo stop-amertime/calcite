@@ -6,7 +6,6 @@
 #[derive(Debug, Clone)]
 pub enum CssValue {
     Integer(i64),
-    Number(f64),
     String(String),
 }
 
@@ -140,21 +139,4 @@ pub struct ParsedProgram {
 pub struct Assignment {
     pub property: String,
     pub value: Expr,
-}
-
-/// A compiled program after pattern recognition and optimisation.
-#[derive(Debug)]
-pub struct CompiledProgram {
-    /// Opcode → instruction handler index.
-    pub decode_table: std::collections::HashMap<u16, usize>,
-    /// Compiled instruction handlers.
-    pub instructions: Vec<CompiledInstruction>,
-}
-
-/// A single compiled instruction (post-pattern-recognition).
-#[derive(Debug)]
-pub struct CompiledInstruction {
-    pub name: String,
-    pub has_modrm: bool,
-    // The actual execution logic will be filled in during Phase 2.
 }
