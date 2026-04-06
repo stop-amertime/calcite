@@ -146,6 +146,9 @@ fn parse_atom<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Expr> {
 
         Token::ParenthesisBlock => nested_block(input, parse_expr_css),
 
+        // String literals (used by display functions like --i2char, --getInstStr)
+        Token::QuotedString(ref s) => Ok(Expr::StringLiteral(s.to_string())),
+
         // A bare custom property ident — treat as var reference.
         Token::Ident(ref name) if name.starts_with("--") => Ok(Expr::Var {
             name: name.to_string(),
@@ -204,7 +207,7 @@ fn parse_var<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Expr> {
     Ok(Expr::Var { name, fallback })
 }
 
-/// Parse `if(style(--prop: val): then; style(--prop: val): then; ...; else: fallback)`.
+/// Parse `if(style(--prop: val): then; style(--a:1) and style(--b:2): then; ...; else: fallback)`.
 fn parse_if<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Expr> {
     let mut branches = Vec::new();
 
@@ -221,48 +224,108 @@ fn parse_if<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Expr> {
             });
         }
 
-        // Try to parse `style(--prop: val): then_expr`
-        match input.next().cloned() {
-            Ok(Token::Function(ref name)) if &**name == "style" => {
-                let (prop, val) = nested_block(input, |inner| {
-                    let prop = inner
-                        .expect_ident_cloned()
-                        .map_err(|e| wrap_err(basic_err(e), inner.current_source_location()))?;
-                    inner
-                        .expect_colon()
-                        .map_err(|e| wrap_err(basic_err(e), inner.current_source_location()))?;
-                    let val = parse_expr_css(inner)?;
-                    Ok((prop.to_string(), val))
-                })?;
-
+        // Try to parse a condition (possibly compound with and/or) then `: then_expr`
+        match parse_style_condition(input) {
+            Ok(condition) => {
                 input.expect_colon().map_err(basic_err)?;
-
-                // Parse the then-expression up to `;` separator
                 let then = parse_expr(input)?;
-
-                branches.push(StyleBranch {
-                    property: prop,
-                    value: val,
-                    then,
-                });
-
-                // Consume `;` separator between branches
+                branches.push(StyleBranch { condition, then });
                 let _ = input.try_parse(|i| i.expect_semicolon());
             }
-            _ => {
+            Err(_) => {
                 input.reset(&state);
                 if branches.is_empty() {
                     return Err(crate::CalcifyError::Parse(
                         "expected style() or else in if()".to_string(),
                     ));
                 }
-                // Implicit fallback
-                let fallback = parse_expr(input)?;
+                // Try to parse an implicit fallback expression; if exhausted, use 0
+                let fallback = if input.is_exhausted() {
+                    Expr::Literal(0.0)
+                } else {
+                    parse_expr(input).unwrap_or(Expr::Literal(0.0))
+                };
                 return Ok(Expr::StyleCondition {
                     branches,
                     fallback: Box::new(fallback),
                 });
             }
+        }
+    }
+}
+
+/// Parse a style condition: `style(--prop: val)` possibly followed by `and`/`or` chains.
+fn parse_style_condition<'i, 't>(input: &mut Parser<'i, 't>) -> Result<StyleTest> {
+    let first = parse_single_style_test(input)?;
+
+    // Check for `and`/`or` chaining
+    let state = input.state();
+    match input.next() {
+        Ok(Token::Ident(ref kw)) if &**kw == "and" => {
+            let mut tests = vec![first];
+            tests.push(parse_single_style_test(input)?);
+            // Continue consuming `and style(...)` pairs
+            loop {
+                let s = input.state();
+                match input.next() {
+                    Ok(Token::Ident(ref kw)) if &**kw == "and" => {
+                        tests.push(parse_single_style_test(input)?);
+                    }
+                    _ => {
+                        input.reset(&s);
+                        break;
+                    }
+                }
+            }
+            Ok(StyleTest::And(tests))
+        }
+        Ok(Token::Ident(ref kw)) if &**kw == "or" => {
+            let mut tests = vec![first];
+            tests.push(parse_single_style_test(input)?);
+            loop {
+                let s = input.state();
+                match input.next() {
+                    Ok(Token::Ident(ref kw)) if &**kw == "or" => {
+                        tests.push(parse_single_style_test(input)?);
+                    }
+                    _ => {
+                        input.reset(&s);
+                        break;
+                    }
+                }
+            }
+            Ok(StyleTest::Or(tests))
+        }
+        _ => {
+            input.reset(&state);
+            Ok(first)
+        }
+    }
+}
+
+/// Parse a single `style(--prop: val)` test.
+fn parse_single_style_test<'i, 't>(input: &mut Parser<'i, 't>) -> Result<StyleTest> {
+    // Expect `style` function token
+    let state = input.state();
+    match input.next().cloned() {
+        Ok(Token::Function(ref name)) if &**name == "style" => nested_block(input, |inner| {
+            let prop = inner
+                .expect_ident_cloned()
+                .map_err(|e| wrap_err(basic_err(e), inner.current_source_location()))?;
+            inner
+                .expect_colon()
+                .map_err(|e| wrap_err(basic_err(e), inner.current_source_location()))?;
+            let val = parse_expr_css(inner)?;
+            Ok(StyleTest::Single {
+                property: prop.to_string(),
+                value: val,
+            })
+        }),
+        _ => {
+            input.reset(&state);
+            Err(crate::CalcifyError::Parse(
+                "expected style() in condition".to_string(),
+            ))
         }
     }
 }
@@ -293,8 +356,12 @@ fn parse_round<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Expr> {
         .unwrap_or(RoundStrategy::Nearest);
 
     let value = parse_expr(input)?;
-    input.expect_comma().map_err(basic_err)?;
-    let interval = parse_expr(input)?;
+    // Interval is optional — defaults to 1 if not provided
+    let interval = if input.try_parse(|i| i.expect_comma()).is_ok() {
+        parse_expr(input)?
+    } else {
+        Expr::Literal(1.0)
+    };
 
     Ok(Expr::Calc(CalcOp::Round(
         strategy,
@@ -460,7 +527,10 @@ mod tests {
                 fallback: _,
             } => {
                 assert_eq!(branches.len(), 2);
-                assert_eq!(branches[0].property, "--x");
+                match &branches[0].condition {
+                    StyleTest::Single { property, .. } => assert_eq!(property, "--x"),
+                    other => panic!("expected Single, got: {other:?}"),
+                }
             }
             other => panic!("unexpected: {other:?}"),
         }

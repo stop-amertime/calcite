@@ -34,19 +34,27 @@ pub fn recognise_dispatch(branches: &[StyleBranch], fallback: &Expr) -> Option<D
         return None;
     }
 
-    // Check that all branches test the same property against integer literals
-    let key_property = &branches[0].property;
+    // Check that all branches are simple Single tests on the same property with integer literals
+    let key_property = match &branches[0].condition {
+        StyleTest::Single { property, .. } => property,
+        _ => return None, // Compound conditions can't form a dispatch table
+    };
     let mut entries = HashMap::with_capacity(branches.len());
 
     for branch in branches {
-        if branch.property != *key_property {
-            return None; // Different properties — not a dispatch table
-        }
-        match &branch.value {
-            Expr::Literal(v) => {
-                entries.insert(*v as i64, branch.then.clone());
+        match &branch.condition {
+            StyleTest::Single { property, value } => {
+                if property != key_property {
+                    return None; // Different properties — not a dispatch table
+                }
+                match value {
+                    Expr::Literal(v) => {
+                        entries.insert(*v as i64, branch.then.clone());
+                    }
+                    _ => return None, // Non-literal comparison
+                }
             }
-            _ => return None, // Non-literal comparison — not a dispatch table
+            _ => return None, // Compound condition — not a dispatch table
         }
     }
 
@@ -63,8 +71,10 @@ mod tests {
 
     fn make_branch(prop: &str, val: f64, then: f64) -> StyleBranch {
         StyleBranch {
-            property: prop.to_string(),
-            value: Expr::Literal(val),
+            condition: StyleTest::Single {
+                property: prop.to_string(),
+                value: Expr::Literal(val),
+            },
             then: Expr::Literal(then),
         }
     }

@@ -227,16 +227,15 @@ impl<'a> EvalEnv<'a> {
                 0.0
             }
 
+            Expr::StringLiteral(_) => 0.0, // strings have no numeric value
+
             Expr::Calc(op) => self.eval_calc(op, state),
 
             Expr::StyleCondition {
                 branches, fallback, ..
             } => {
                 for branch in branches {
-                    let prop_val = self.resolve_property(&branch.property, state);
-                    let test_val = self.eval_expr(&branch.value, state);
-                    // Integer comparison (CSS style() does exact matching)
-                    if (prop_val - test_val).abs() < 0.5 {
+                    if self.eval_style_test(&branch.condition, state) {
                         return self.eval_expr(&branch.then, state);
                     }
                 }
@@ -321,6 +320,19 @@ impl<'a> EvalEnv<'a> {
             return state.read_mem(addr) as f64;
         }
         0.0
+    }
+
+    /// Evaluate a style test (condition inside an `if()` branch).
+    fn eval_style_test(&mut self, test: &StyleTest, state: &State) -> bool {
+        match test {
+            StyleTest::Single { property, value } => {
+                let prop_val = self.resolve_property(property, state);
+                let test_val = self.eval_expr(value, state);
+                (prop_val - test_val).abs() < 0.5
+            }
+            StyleTest::And(tests) => tests.iter().all(|t| self.eval_style_test(t, state)),
+            StyleTest::Or(tests) => tests.iter().any(|t| self.eval_style_test(t, state)),
+        }
     }
 
     /// Evaluate a @function call.
@@ -486,13 +498,17 @@ mod tests {
         let expr = Expr::StyleCondition {
             branches: vec![
                 StyleBranch {
-                    property: "--AX".to_string(),
-                    value: Expr::Literal(1.0),
+                    condition: StyleTest::Single {
+                        property: "--AX".to_string(),
+                        value: Expr::Literal(1.0),
+                    },
                     then: Expr::Literal(100.0),
                 },
                 StyleBranch {
-                    property: "--AX".to_string(),
-                    value: Expr::Literal(2.0),
+                    condition: StyleTest::Single {
+                        property: "--AX".to_string(),
+                        value: Expr::Literal(2.0),
+                    },
                     then: Expr::Literal(200.0),
                 },
             ],

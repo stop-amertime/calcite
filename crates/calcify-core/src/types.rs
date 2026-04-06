@@ -58,6 +58,9 @@ pub enum Expr {
     /// A literal numeric value.
     Literal(f64),
 
+    /// A literal string value (for display functions like --i2char).
+    StringLiteral(String),
+
     /// A `var(--name)` reference, with optional fallback.
     Var {
         name: String,
@@ -80,9 +83,20 @@ pub enum Expr {
 /// A single branch in an `if(style(...): ...)` chain.
 #[derive(Debug, Clone)]
 pub struct StyleBranch {
-    pub property: String,
-    pub value: Expr,
+    /// The condition — a single `style()` test or a compound `and`/`or`.
+    pub condition: StyleTest,
     pub then: Expr,
+}
+
+/// A style condition test inside `if()`.
+#[derive(Debug, Clone)]
+pub enum StyleTest {
+    /// A single `style(--prop: val)` test.
+    Single { property: String, value: Expr },
+    /// `condition1 and condition2` — all must match.
+    And(Vec<StyleTest>),
+    /// `condition1 or condition2` — any must match.
+    Or(Vec<StyleTest>),
 }
 
 /// Arithmetic / math operations from `calc()`, `mod()`, `round()`, etc.

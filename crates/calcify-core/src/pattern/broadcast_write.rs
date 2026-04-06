@@ -75,17 +75,19 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> Vec<BroadcastWrite> {
 fn extract_broadcast_assignment(assignment: &Assignment) -> Option<(String, i64, Expr)> {
     match &assignment.value {
         Expr::StyleCondition { branches, .. } => {
-            // The first branch should be `style(--addrDest: N): value`
             let first = branches.first()?;
 
-            // The property should be a destination address property
-            if !first.property.starts_with("--addrDest") && !first.property.starts_with("--addr") {
-                return None;
-            }
-
-            // The value should be a literal integer (the address)
-            match &first.value {
-                Expr::Literal(v) => Some((first.property.clone(), *v as i64, first.then.clone())),
+            // Must be a simple Single test
+            match &first.condition {
+                StyleTest::Single { property, value } => {
+                    if !property.starts_with("--addrDest") && !property.starts_with("--addr") {
+                        return None;
+                    }
+                    match value {
+                        Expr::Literal(v) => Some((property.clone(), *v as i64, first.then.clone())),
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         }
@@ -102,8 +104,10 @@ mod tests {
             property: format!("--{name}"),
             value: Expr::StyleCondition {
                 branches: vec![StyleBranch {
-                    property: "--addrDestA".to_string(),
-                    value: Expr::Literal(addr as f64),
+                    condition: StyleTest::Single {
+                        property: "--addrDestA".to_string(),
+                        value: Expr::Literal(addr as f64),
+                    },
                     then: Expr::Var {
                         name: "--addrValA".to_string(),
                         fallback: None,
