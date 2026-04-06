@@ -27,6 +27,21 @@ The line we draw: **the input is real CSS, the output is computed property value
 - Not trying to be spec-complete for all of CSS (only the computational subset needs to be correct)
 - Not tied to x86CSS specifically — any computational CSS using the same feature set should work
 
+## The Cardinal Rule: No Psychic Knowledge
+
+**Calcify must never do anything the CSS couldn't.** It is a JIT compiler that optimises the evaluation of CSS — it is not a co-processor that secretly fixes things the CSS got wrong.
+
+If the CSS can't express an instruction correctly (e.g. because of x86CSS's 2-write-slot limitation), that is a bug in the CSS, and the fix belongs in the CSS. Calcify's job is to evaluate whatever CSS it's given, faster. If the CSS says MOVSB is a no-op, calcify says MOVSB is a no-op. If x86CSS is extended to handle MOVSB correctly (multi-tick decomposition, a third write slot, or any other CSS-level solution), calcify will evaluate that new CSS correctly and fast.
+
+The reason is non-negotiable: **this is Doom running in CSS, not Doom running in a compiler that papers over broken CSS.** The moment calcify silently compensates for limitations in the CSS source, the project stops being "Doom in CSS" and becomes "Doom in a Rust emulator with CSS as a config format." That defeats the entire point.
+
+Concretely:
+- Calcify **must not** inspect `--instId` and branch on known instruction semantics
+- Calcify **must not** add extra writes that the CSS evaluation wouldn't produce
+- Calcify **must not** have any x86-specific logic — it doesn't know what x86 is
+- Pattern recognition (dispatch tables, broadcast writes, etc.) is fine because it produces the same result the CSS would, just faster
+- If a CSS pattern is too slow or can't express what's needed, the CSS must be changed
+
 ## How x86CSS Actually Works (Source Analysis)
 
 *This section is based on reading `base_template.html`, `build_css.py`, and `x86css.html` from the x86CSS repository.*

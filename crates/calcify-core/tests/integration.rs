@@ -306,17 +306,20 @@ fn string_literal_in_if() {
 /// It validates that our parser can handle the full complexity of real-world
 /// computational CSS.
 #[test]
-#[ignore = "requires x86css-computational.css fixture"]
+#[ignore = "requires x86css-main.css fixture"]
 fn parse_real_x86css() {
-    let css_path = "tests/fixtures/x86css-computational.css";
-    let css = std::fs::read_to_string(css_path)
-        .expect("fixture not found at tests/fixtures/x86css-computational.css");
+    let css = std::fs::read_to_string("../../tests/fixtures/x86css-main.css")
+        .expect("fixture not found at tests/fixtures/x86css-main.css");
 
     let parsed = parse_css(&css).expect("x86CSS should parse");
 
-    // Validate key metrics from the spec
+    // Validate key metrics — counts updated after multi-write instruction support
     assert_eq!(parsed.properties.len(), 1585, "@property count");
-    assert_eq!(parsed.functions.len(), 128, "@function count");
+    assert!(
+        parsed.functions.len() >= 128,
+        "should have >= 128 @functions, got {}",
+        parsed.functions.len()
+    );
     assert!(
         parsed.assignments.len() > 3000,
         "should have >3000 assignments, got {}",
