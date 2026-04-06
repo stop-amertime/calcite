@@ -345,6 +345,8 @@ The evaluator is generic. It doesn't contain fetch-decode-execute logic, instruc
 
 The key insight: the optimisations are at the CSS pattern level (large dispatch → hash lookup, broadcast write → direct store, bit decomposition → native bitwise), not at the application level. The engine never asks "what is this CSS computing?" It only asks "can this expression be evaluated more efficiently?"
 
+The engine is **correct by default, fast by opportunity.** Every CSS expression can be evaluated naively — linear scan of `if(style())` branches, literal bit decomposition via `mod`/`round`, broadcast comparison for writes. The pattern compiler upgrades expressions it recognises into efficient equivalents, but unrecognised patterns fall back to naive evaluation. The result is always correct; only the speed varies.
+
 ### Browser Integration (Primary Deliverable)
 
 ```javascript
