@@ -56,7 +56,7 @@ fn main() {
                 return;
             }
 
-            let evaluator = calcify_core::Evaluator::from_parsed(&parsed);
+            let mut evaluator = calcify_core::Evaluator::from_parsed(&parsed);
             let mut state = calcify_core::State::default();
             state.load_properties(&parsed.properties);
 

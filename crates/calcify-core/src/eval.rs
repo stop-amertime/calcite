@@ -14,6 +14,11 @@ use crate::state::State;
 use crate::types::*;
 
 /// The main evaluator.
+///
+/// Holds both the immutable compiled program (functions, dispatch tables,
+/// broadcast writes, assignments) and mutable per-tick evaluation state
+/// (properties map, call depth). The properties map is allocated once and
+/// reused across ticks via `clear()` to avoid per-tick allocation overhead.
 #[derive(Debug)]
 pub struct Evaluator {
     /// Parsed @function definitions, keyed by name.
@@ -24,6 +29,10 @@ pub struct Evaluator {
     pub dispatch_tables: HashMap<String, DispatchTable>,
     /// Recognised broadcast write patterns.
     pub broadcast_writes: Vec<BroadcastWrite>,
+    /// Property values computed during the current tick. Reused across ticks.
+    properties: HashMap<String, f64>,
+    /// Call depth for recursion protection.
+    call_depth: usize,
 }
 
 /// The result of running a batch of ticks.
@@ -102,48 +111,57 @@ impl Evaluator {
             }
         }
 
+        let properties_capacity = assignments.len();
         Evaluator {
             functions,
             assignments,
             dispatch_tables,
             broadcast_writes: broadcast_result.writes,
+            properties: HashMap::with_capacity(properties_capacity),
+            call_depth: 0,
         }
     }
 
     /// Run a single tick: evaluate all assignments against the state.
-    pub fn tick(&self, state: &mut State) -> TickResult {
-        let mut env = EvalEnv::new(
-            &self.functions,
-            &self.dispatch_tables,
-            self.assignments.len(),
-        );
+    pub fn tick(&mut self, state: &mut State) -> TickResult {
+        // Reuse the properties map — clear() retains the allocated capacity.
+        self.properties.clear();
+        self.call_depth = 0;
 
-        // Execute all assignments in declaration order
-        for assignment in &self.assignments {
-            let value = env.eval_expr(&assignment.value, state);
-            // Store the computed value in the environment for subsequent declarations
-            env.properties.insert(assignment.property.clone(), value);
+        // Execute all assignments in declaration order.
+        // We use raw pointers to read from self.assignments while mutating self.properties.
+        let assignments_ptr = self.assignments.as_ptr();
+        let assignments_len = self.assignments.len();
+        for i in 0..assignments_len {
+            // SAFETY: assignments is not modified during tick; pointer is valid.
+            let assignment = unsafe { &*assignments_ptr.add(i) };
+            let value = self.eval_expr(&assignment.value, state);
+            self.properties.insert(assignment.property.clone(), value);
         }
 
         // Apply broadcast writes: O(1) HashMap lookup per write.
-        // Writes go directly to state — no need to update env.properties since
+        // Writes go directly to state — no need to update properties since
         // absorbed memory cells are never read by the remaining assignments
         // (memory reads go through --readMem dispatch table which reads from state).
-        for bw in &self.broadcast_writes {
-            let dest = env.resolve_property(&bw.dest_property, state);
+        let bw_ptr = self.broadcast_writes.as_ptr();
+        let bw_len = self.broadcast_writes.len();
+        for i in 0..bw_len {
+            // SAFETY: broadcast_writes is not modified during tick; pointer is valid.
+            let bw = unsafe { &*bw_ptr.add(i) };
+            let dest = self.resolve_property(&bw.dest_property, state);
             let dest_i64 = dest as i64;
-            if let Some(_var_name) = bw.address_map.get(&dest_i64) {
-                let value = env.eval_expr(&bw.value_expr, state);
+            if bw.address_map.contains_key(&dest_i64) {
+                let value = self.eval_expr(&bw.value_expr, state);
                 state.write_mem(dest_i64 as i32, value as i32);
             }
             // Handle word-write spillover: if the guard (e.g., --isWordWrite) is set,
             // also write the high byte to the next address (dest + 1).
             if !bw.spillover_map.is_empty() {
                 if let Some(ref guard) = bw.spillover_guard {
-                    let guard_val = env.resolve_property(guard, state);
+                    let guard_val = self.resolve_property(guard, state);
                     if (guard_val as i64) == 1 {
                         if let Some((_var_name, val_expr)) = bw.spillover_map.get(&dest_i64) {
-                            let value = env.eval_expr(val_expr, state);
+                            let value = self.eval_expr(val_expr, state);
                             state.write_mem(dest_i64 as i32 + 1, value as i32);
                         }
                     }
@@ -152,8 +170,7 @@ impl Evaluator {
         }
 
         // Apply non-broadcast property values back to state
-        // (This maps custom property names to state addresses)
-        let changes = self.apply_state(&env.properties, state);
+        let changes = self.apply_state(state);
 
         state.frame_counter += 1;
 
@@ -167,7 +184,7 @@ impl Evaluator {
     ///
     /// Takes a snapshot before the batch and diffs at the end, so callers
     /// see every register/memory change — not just the final tick's delta.
-    pub fn run_batch(&self, state: &mut State, count: u32) -> TickResult {
+    pub fn run_batch(&mut self, state: &mut State, count: u32) -> TickResult {
         let snapshot = state.clone();
         for _ in 0..count {
             self.tick(state);
@@ -197,14 +214,10 @@ impl Evaluator {
     /// Buffer copies (`--__0AX`, `--__1AX`, `--__2AX`) are skipped —
     /// they exist for x86CSS's triple-buffer pipeline but carry stale values
     /// that would nondeterministically overwrite the current tick's result.
-    fn apply_state(
-        &self,
-        properties: &HashMap<String, f64>,
-        state: &mut State,
-    ) -> Vec<(String, String)> {
+    fn apply_state(&self, state: &mut State) -> Vec<(String, String)> {
         let mut changes = Vec::new();
 
-        for (name, &value) in properties {
+        for (name, &value) in &self.properties {
             // Skip buffer copies — only the canonical name should write to state
             if name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2") {
                 continue;
@@ -278,39 +291,38 @@ pub fn property_to_address(name: &str) -> Option<i32> {
         "SS" => Some(addr::SS),
         "DS" => Some(addr::DS),
         "flags" => Some(addr::FLAGS),
-        _ if canonical.starts_with("m") => canonical[1..].parse::<i32>().ok(),
+        _ if canonical.starts_with('m') => parse_mem_address(&canonical[1..]),
         _ => None,
     }
 }
 
-/// Evaluation environment for a single tick.
-///
-/// Holds function definitions and computed property values for the current tick.
-struct EvalEnv<'a> {
-    functions: &'a HashMap<String, FunctionDef>,
-    dispatch_tables: &'a HashMap<String, DispatchTable>,
-    /// Property values computed so far in this tick.
-    properties: HashMap<String, f64>,
-    /// Call depth for recursion protection.
-    call_depth: usize,
+/// Parse a memory address from digit chars without allocating (replaces `str::parse::<i32>()`).
+fn parse_mem_address(s: &str) -> Option<i32> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut result: i32 = 0;
+    for &b in s.as_bytes() {
+        if b.is_ascii_digit() {
+            result = result.checked_mul(10)?.checked_add((b - b'0') as i32)?;
+        } else {
+            return None;
+        }
+    }
+    Some(result)
 }
 
 const MAX_CALL_DEPTH: usize = 64;
 
-impl<'a> EvalEnv<'a> {
-    fn new(
-        functions: &'a HashMap<String, FunctionDef>,
-        dispatch_tables: &'a HashMap<String, DispatchTable>,
-        capacity: usize,
-    ) -> Self {
-        Self {
-            functions,
-            dispatch_tables,
-            properties: HashMap::with_capacity(capacity),
-            call_depth: 0,
-        }
-    }
+// --- Evaluation methods ---
+//
+// These methods need &mut self to write to self.properties/call_depth, but also
+// read self.functions/dispatch_tables. We use raw pointers in eval_function_call
+// and eval_dispatch_raw to read from immutable program data while mutating
+// properties. This is safe because functions/dispatch_tables are never modified
+// during evaluation.
 
+impl Evaluator {
     /// Evaluate an expression to a numeric value.
     fn eval_expr(&mut self, expr: &Expr, state: &State) -> f64 {
         match expr {
@@ -318,13 +330,10 @@ impl<'a> EvalEnv<'a> {
 
             Expr::Var { name, fallback } => {
                 let v = self.resolve_property(name, state);
-                // If we got 0.0 and there's a fallback, check if the property
-                // actually exists or if 0.0 is just the default for "not found"
                 if v != 0.0 {
                     return v;
                 }
                 // Property might genuinely be 0, or might not exist.
-                // Check if it exists in properties or state before using fallback.
                 if self.properties.contains_key(name.as_str()) {
                     return v;
                 }
@@ -337,14 +346,14 @@ impl<'a> EvalEnv<'a> {
                 if property_to_address(name).is_some() {
                     return v;
                 }
-                // Not found anywhere — use fallback
                 if let Some(fb) = fallback {
                     return self.eval_expr(fb, state);
                 }
+                log::warn!("undefined variable: {name}");
                 0.0
             }
 
-            Expr::StringLiteral(_) => 0.0, // strings have no numeric value
+            Expr::StringLiteral(_) => 0.0,
 
             Expr::Calc(op) => self.eval_calc(op, state),
 
@@ -436,14 +445,8 @@ impl<'a> EvalEnv<'a> {
         if let Some(&v) = self.properties.get(name) {
             return v;
         }
-        // For buffer-prefixed names (--__0X, --__1X, --__2X), try the canonical
-        // name in properties before falling back to state. Avoid allocation by
-        // checking state first (property_to_address strips the prefix internally).
         if name.starts_with("--__") && name.len() > 5 {
-            // Check canonical name in computed properties (allocation-free via slice)
-            let suffix = &name[5..]; // e.g., "AX" from "--__1AX"
-                                     // Only allocate if the suffix could match a computed property
-                                     // In practice, buffer refs to registers resolve via property_to_address below
+            let suffix = &name[5..];
             if !self.properties.is_empty() {
                 let canonical = format!("--{suffix}");
                 if let Some(&v) = self.properties.get(&canonical) {
@@ -478,14 +481,11 @@ impl<'a> EvalEnv<'a> {
         }
 
         // Check for a dispatch table optimisation.
-        // Borrow dispatch_tables via the lifetime reference to avoid cloning.
         if let Some(table) = self.dispatch_tables.get(name) {
-            // Re-borrow to avoid holding &self across mutable calls
             let table_key = table.key_property.clone();
             let table_entries = &table.entries as *const HashMap<i64, Expr>;
             let table_fallback = &table.fallback as *const Expr;
-            // SAFETY: dispatch_tables is behind &'a, the Evaluator outlives this call.
-            // We only need the pointer to avoid the borrow conflict with &mut self.
+            // SAFETY: dispatch_tables is not modified during evaluation.
             return unsafe {
                 self.eval_dispatch_raw(
                     name,
@@ -501,12 +501,11 @@ impl<'a> EvalEnv<'a> {
         let func = match self.functions.get(name) {
             Some(f) => f as *const FunctionDef,
             None => {
-                log::debug!("undefined function: {name}");
+                log::warn!("undefined function: {name}");
                 return 0.0;
             }
         };
-        // SAFETY: functions is behind &'a, the Evaluator outlives this call.
-        // The raw pointer avoids cloning the entire FunctionDef on every call.
+        // SAFETY: functions is not modified during evaluation.
         let func = unsafe { &*func };
 
         self.call_depth += 1;
@@ -536,7 +535,6 @@ impl<'a> EvalEnv<'a> {
             })
             .collect();
 
-        // Evaluate result
         let result = self.eval_expr(&func.result, state);
 
         // Restore previous property values
@@ -556,10 +554,9 @@ impl<'a> EvalEnv<'a> {
     }
 
     /// Evaluate using a dispatch table — O(1) lookup.
-    /// Uses raw references to avoid cloning the dispatch table and function def.
     ///
-    /// SAFETY: The caller must ensure `entries` and `fallback` pointers are valid
-    /// for the duration of the call. In practice they point into &'a data.
+    /// SAFETY: `entries` and `fallback` must point into self.dispatch_tables,
+    /// which is not modified during evaluation.
     unsafe fn eval_dispatch_raw(
         &mut self,
         name: &str,
@@ -569,7 +566,6 @@ impl<'a> EvalEnv<'a> {
         args: &[Expr],
         state: &State,
     ) -> f64 {
-        // Bind function parameters first — the key property may be a parameter
         let func = self.functions.get(name).map(|f| f as *const FunctionDef);
         let old_props: Vec<(String, Option<f64>)> = if let Some(func_ptr) = func {
             let func = &*func_ptr;
@@ -587,7 +583,6 @@ impl<'a> EvalEnv<'a> {
             Vec::new()
         };
 
-        // Resolve the dispatch key after parameter binding
         let key = self.resolve_property(key_property, state) as i64;
 
         let result = if let Some(result_expr) = entries.get(&key) {
@@ -596,7 +591,6 @@ impl<'a> EvalEnv<'a> {
             self.eval_expr(fallback, state)
         };
 
-        // Restore parameter bindings
         for (name, old) in old_props {
             match old {
                 Some(v) => {
@@ -617,47 +611,55 @@ mod tests {
     use super::*;
     use crate::state;
 
+    /// Helper: create a minimal Evaluator for unit tests (no assignments/patterns).
+    fn test_evaluator(
+        functions: HashMap<String, FunctionDef>,
+        dispatch_tables: HashMap<String, DispatchTable>,
+    ) -> Evaluator {
+        Evaluator {
+            functions,
+            assignments: vec![],
+            dispatch_tables,
+            broadcast_writes: vec![],
+            properties: HashMap::with_capacity(16),
+            call_depth: 0,
+        }
+    }
+
     #[test]
     fn eval_literal() {
-        let functions = HashMap::new();
-        let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch, 16);
+        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
         let state = State::default();
-
-        assert_eq!(env.eval_expr(&Expr::Literal(42.0), &state), 42.0);
+        assert_eq!(eval.eval_expr(&Expr::Literal(42.0), &state), 42.0);
     }
 
     #[test]
     fn eval_calc_operations() {
-        let functions = HashMap::new();
-        let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch, 16);
+        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
         let state = State::default();
 
         let expr = Expr::Calc(CalcOp::Add(
             Box::new(Expr::Literal(10.0)),
             Box::new(Expr::Literal(20.0)),
         ));
-        assert_eq!(env.eval_expr(&expr, &state), 30.0);
+        assert_eq!(eval.eval_expr(&expr, &state), 30.0);
 
         let expr = Expr::Calc(CalcOp::Mul(
             Box::new(Expr::Literal(3.0)),
             Box::new(Expr::Literal(7.0)),
         ));
-        assert_eq!(env.eval_expr(&expr, &state), 21.0);
+        assert_eq!(eval.eval_expr(&expr, &state), 21.0);
 
         let expr = Expr::Calc(CalcOp::Mod(
             Box::new(Expr::Literal(17.0)),
             Box::new(Expr::Literal(5.0)),
         ));
-        assert_eq!(env.eval_expr(&expr, &state), 2.0);
+        assert_eq!(eval.eval_expr(&expr, &state), 2.0);
     }
 
     #[test]
     fn eval_var_from_state() {
-        let functions = HashMap::new();
-        let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch, 16);
+        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
         let mut state = State::default();
         state.registers[state::reg::AX] = 0x1234;
 
@@ -665,28 +667,24 @@ mod tests {
             name: "--AX".to_string(),
             fallback: None,
         };
-        assert_eq!(env.eval_expr(&expr, &state), 0x1234 as f64);
+        assert_eq!(eval.eval_expr(&expr, &state), 0x1234 as f64);
     }
 
     #[test]
     fn eval_var_fallback() {
-        let functions = HashMap::new();
-        let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch, 16);
+        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
         let state = State::default();
 
         let expr = Expr::Var {
             name: "--nonexistent".to_string(),
             fallback: Some(Box::new(Expr::Literal(99.0))),
         };
-        assert_eq!(env.eval_expr(&expr, &state), 99.0);
+        assert_eq!(eval.eval_expr(&expr, &state), 99.0);
     }
 
     #[test]
     fn eval_style_condition() {
-        let functions = HashMap::new();
-        let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch, 16);
+        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
         let mut state = State::default();
         state.registers[state::reg::AX] = 2;
 
@@ -710,14 +708,12 @@ mod tests {
             fallback: Box::new(Expr::Literal(0.0)),
         };
 
-        assert_eq!(env.eval_expr(&expr, &state), 200.0);
+        assert_eq!(eval.eval_expr(&expr, &state), 200.0);
     }
 
     #[test]
     fn eval_round() {
-        let functions = HashMap::new();
-        let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch, 16);
+        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
         let state = State::default();
 
         let expr = Expr::Calc(CalcOp::Round(
@@ -725,7 +721,7 @@ mod tests {
             Box::new(Expr::Literal(7.8)),
             Box::new(Expr::Literal(1.0)),
         ));
-        assert_eq!(env.eval_expr(&expr, &state), 7.0);
+        assert_eq!(eval.eval_expr(&expr, &state), 7.0);
     }
 
     #[test]
@@ -750,22 +746,19 @@ mod tests {
             },
         );
 
-        let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch, 16);
+        let mut eval = test_evaluator(functions, HashMap::new());
         let state = State::default();
 
         let expr = Expr::FunctionCall {
             name: "--double".to_string(),
             args: vec![Expr::Literal(21.0)],
         };
-        assert_eq!(env.eval_expr(&expr, &state), 42.0);
+        assert_eq!(eval.eval_expr(&expr, &state), 42.0);
     }
 
     #[test]
     fn eval_dispatch_table() {
         let mut functions = HashMap::new();
-        // The dispatch table's key_property is "--key", which is a function parameter.
-        // We need the function definition so parameter binding works.
         functions.insert(
             "--lookup".to_string(),
             FunctionDef {
@@ -775,12 +768,11 @@ mod tests {
                     syntax: PropertySyntax::Integer,
                 }],
                 locals: vec![],
-                result: Expr::Literal(0.0), // unused — dispatch table replaces it
+                result: Expr::Literal(0.0),
             },
         );
 
         let mut dispatch = HashMap::new();
-
         let mut entries = HashMap::new();
         entries.insert(0, Expr::Literal(100.0));
         entries.insert(1, Expr::Literal(200.0));
@@ -796,22 +788,20 @@ mod tests {
             },
         );
 
-        let mut env = EvalEnv::new(&functions, &dispatch, 16);
+        let mut eval = test_evaluator(functions, dispatch);
         let state = State::default();
 
-        // Look up key=42 → should return 999.0
         let expr = Expr::FunctionCall {
             name: "--lookup".to_string(),
             args: vec![Expr::Literal(42.0)],
         };
-        assert_eq!(env.eval_expr(&expr, &state), 999.0);
+        assert_eq!(eval.eval_expr(&expr, &state), 999.0);
 
-        // Look up key=99 (missing) → should return fallback 0.0
         let expr = Expr::FunctionCall {
             name: "--lookup".to_string(),
             args: vec![Expr::Literal(99.0)],
         };
-        assert_eq!(env.eval_expr(&expr, &state), 0.0);
+        assert_eq!(eval.eval_expr(&expr, &state), 0.0);
     }
 
     #[test]
@@ -831,7 +821,7 @@ mod tests {
             ],
         };
 
-        let evaluator = Evaluator::from_parsed(&program);
+        let mut evaluator = Evaluator::from_parsed(&program);
         let mut state = State::default();
 
         let result = evaluator.tick(&mut state);
@@ -840,5 +830,19 @@ mod tests {
         assert_eq!(state.memory[0], 255);
         assert_eq!(result.ticks_executed, 1);
         assert!(!result.changes.is_empty());
+    }
+
+    #[test]
+    fn parse_mem_address_valid() {
+        assert_eq!(parse_mem_address("0"), Some(0));
+        assert_eq!(parse_mem_address("42"), Some(42));
+        assert_eq!(parse_mem_address("1585"), Some(1585));
+    }
+
+    #[test]
+    fn parse_mem_address_invalid() {
+        assert_eq!(parse_mem_address(""), None);
+        assert_eq!(parse_mem_address("abc"), None);
+        assert_eq!(parse_mem_address("12x"), None);
     }
 }

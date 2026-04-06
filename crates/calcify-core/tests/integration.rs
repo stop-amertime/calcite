@@ -24,7 +24,7 @@ fn simple_assignment() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     assert_eq!(state.registers[state::reg::AX], 42);
@@ -40,7 +40,7 @@ fn calc_expression() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     assert_eq!(state.registers[state::reg::AX], 42);
@@ -58,7 +58,7 @@ fn var_references_between_properties() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     assert_eq!(state.registers[state::reg::AX], 100);
@@ -75,7 +75,7 @@ fn if_style_condition() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     assert_eq!(state.registers[state::reg::BX], 20);
@@ -92,7 +92,7 @@ fn mod_and_round() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     assert_eq!(state.registers[state::reg::AX], 4660);
@@ -112,7 +112,7 @@ fn memory_writes() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     assert_eq!(state.memory[0], 255);
@@ -133,7 +133,7 @@ fn function_call() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     assert_eq!(state.registers[state::reg::AX], 42);
@@ -148,7 +148,7 @@ fn multiple_ticks_accumulate() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
 
     for _ in 0..10 {
         evaluator.tick(&mut state);
@@ -177,7 +177,7 @@ fn dispatch_table_in_function() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     assert_eq!(state.registers[state::reg::AX], 400);
@@ -215,7 +215,7 @@ fn complex_nested_expression() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     // BX should reconstruct AX from its bytes: AL + AH*256 = AX
@@ -233,7 +233,7 @@ fn min_max_clamp() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     assert_eq!(state.registers[state::reg::AX], 50);
@@ -261,7 +261,7 @@ fn and_or_conditions() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     // Both conditions true → 1
@@ -279,7 +279,7 @@ fn if_without_else() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     assert_eq!(state.registers[state::reg::BX], 100);
@@ -294,7 +294,7 @@ fn string_literal_in_if() {
         }
     "#;
 
-    let (evaluator, mut state) = setup(css);
+    let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
     assert_eq!(state.registers[state::reg::AX], 1);
@@ -383,7 +383,7 @@ fn chrome_conformance_steady_state() {
         .expect("fixture not found at tests/fixtures/x86css-main.css");
 
     let parsed = parse_css(&css).expect("should parse");
-    let evaluator = Evaluator::from_parsed(&parsed);
+    let mut evaluator = Evaluator::from_parsed(&parsed);
     let mut calcify_state = State::default();
     calcify_state.load_properties(&parsed.properties);
 
@@ -411,23 +411,26 @@ fn chrome_conformance_steady_state() {
         calcify_flags_values.insert(regs.flags);
     }
 
-    // Chrome baseline ranges (captured from lyra.horse/x86css/ via Playwright):
-    //   AX: [1227]  (constant)
-    //   IP: [285..313, 891..895, 8196]  (main loop + subroutine calls)
-    //   SI: [0, 1120, 1128, 1227, 1235, 1243, 1251]  (string pointer)
-    //   SP: [1508..1520]  (stack fluctuation)
-    //   BP: [1512, 1514, 1524]  (frame pointer)
-    //   flags: [0, 192]
+    // Chrome baseline ranges (captured from lyra.horse/x86css/ via Playwright).
+    // See tests/fixtures/chrome-baseline.json for the full captured data.
+
+    /// AX holds 0x4CB (1227) in Doom8088's steady-state main loop —
+    /// this is the character code being processed by the BIOS print routine.
+    const CHROME_AX_STEADY_STATE: i32 = 1227;
+
+    /// IP addresses for the main instruction decode loop (0x124–0x139).
+    /// These correspond to the fetch-decode-execute cycle of the emulated CPU.
+    const MAIN_LOOP_IPS: &[i32] = &[292, 295, 302, 303, 307, 310, 313];
 
     // Critical: AX must match
     assert!(
-        calcify_ax_values.contains(&1227),
-        "AX should reach 1227 (Chrome baseline), got: {:?}",
+        calcify_ax_values.contains(&CHROME_AX_STEADY_STATE),
+        "AX should reach {CHROME_AX_STEADY_STATE} (Chrome baseline), got: {:?}",
         calcify_ax_values
     );
 
     // IP should be cycling through the main loop (292-313 range)
-    let main_loop_ips: Vec<i32> = vec![292, 295, 302, 303, 307, 310, 313];
+    let main_loop_ips: Vec<i32> = MAIN_LOOP_IPS.to_vec();
     let calcify_hits_main_loop = main_loop_ips
         .iter()
         .any(|ip| calcify_ip_values.contains(ip));
@@ -468,4 +471,123 @@ fn chrome_conformance_steady_state() {
         v.sort();
         v
     });
+}
+
+// --- Parser negative / error path tests ---
+
+#[test]
+fn completely_invalid_css() {
+    // Random garbage should parse without crashing, producing empty output
+    let parsed = parse_css("}{}{}{not css at all!!!").expect("should not error");
+    assert!(parsed.assignments.is_empty());
+    assert!(parsed.functions.is_empty());
+    assert!(parsed.properties.is_empty());
+}
+
+#[test]
+fn unclosed_rule_block() {
+    let css = ".cpu { --AX: 42;";
+    // cssparser is lenient with unclosed blocks
+    let parsed = parse_css(css).expect("should not error");
+    assert_eq!(parsed.assignments.len(), 1);
+    assert_eq!(parsed.assignments[0].property, "--AX");
+}
+
+#[test]
+fn missing_semicolons() {
+    // Missing semicolons between declarations — parser should recover
+    let css = r#"
+        .cpu {
+            --AX: 10
+            --BX: 20;
+        }
+    "#;
+    let parsed = parse_css(css).expect("should not error");
+    // At minimum BX (after the semicolon) should parse. AX may or may not
+    // depending on how the parser recovers.
+    assert!(!parsed.assignments.is_empty());
+}
+
+#[test]
+fn non_custom_properties_ignored() {
+    let css = r#"
+        .cpu {
+            color: red;
+            font-size: 12px;
+            --AX: 42;
+        }
+    "#;
+    let parsed = parse_css(css).expect("should not error");
+    // Only --AX should be captured
+    assert_eq!(parsed.assignments.len(), 1);
+    assert_eq!(parsed.assignments[0].property, "--AX");
+}
+
+#[test]
+fn empty_function_body() {
+    let css = r#"
+        @function --empty(--x <integer>) returns <integer> {
+        }
+    "#;
+    let parsed = parse_css(css).expect("should not error");
+    assert_eq!(parsed.functions.len(), 1);
+    assert_eq!(parsed.functions[0].name, "--empty");
+}
+
+#[test]
+fn function_without_result() {
+    let css = r#"
+        @function --noResult(--x <integer>) returns <integer> {
+            --local: calc(var(--x) + 1);
+        }
+    "#;
+    let parsed = parse_css(css).expect("should not error");
+    // Function should still parse (result defaults to 0)
+    assert_eq!(parsed.functions.len(), 1);
+    assert_eq!(parsed.functions[0].locals.len(), 1);
+}
+
+#[test]
+fn nested_calc_missing_operand() {
+    // calc(1 +) — missing right operand
+    let css = r#"
+        .cpu {
+            --AX: calc(1 +);
+            --BX: 42;
+        }
+    "#;
+    let parsed = parse_css(css).expect("should not error");
+    // AX may fail to parse; BX should succeed
+    let bx = parsed.assignments.iter().find(|a| a.property == "--BX");
+    assert!(bx.is_some(), "BX should still parse after bad AX");
+}
+
+#[test]
+fn unknown_at_rules_skipped() {
+    let css = r#"
+        @keyframes spin { from { } to { } }
+        @media screen { }
+        .cpu {
+            --AX: 1;
+        }
+    "#;
+    let parsed = parse_css(css).expect("should not error");
+    assert_eq!(parsed.assignments.len(), 1);
+}
+
+#[test]
+fn deeply_nested_expressions() {
+    // Deeply nested calc — should not stack overflow
+    let mut expr = "1".to_string();
+    for _ in 0..50 {
+        expr = format!("calc({expr} + 1)");
+    }
+    let css = format!(".cpu {{ --AX: {expr}; }}");
+    let parsed = parse_css(&css).expect("should not error");
+    assert_eq!(parsed.assignments.len(), 1);
+
+    let mut evaluator = Evaluator::from_parsed(&parsed);
+    let mut state = State::default();
+    evaluator.tick(&mut state);
+    assert_eq!(state.registers[state::reg::AX], 51);
 }

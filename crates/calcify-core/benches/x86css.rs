@@ -27,7 +27,7 @@ fn bench_setup(c: &mut Criterion) {
 fn bench_tick(c: &mut Criterion) {
     let css = load_css();
     let parsed = parse_css(&css).unwrap();
-    let evaluator = Evaluator::from_parsed(&parsed);
+    let mut evaluator = Evaluator::from_parsed(&parsed);
     let mut state = State::default();
     state.load_properties(&parsed.properties);
     // Warm up past BIOS init
@@ -43,7 +43,7 @@ fn bench_tick(c: &mut Criterion) {
 fn bench_batch(c: &mut Criterion) {
     let css = load_css();
     let parsed = parse_css(&css).unwrap();
-    let evaluator = Evaluator::from_parsed(&parsed);
+    let mut evaluator = Evaluator::from_parsed(&parsed);
 
     let mut group = c.benchmark_group("batch_ticks");
     for &count in &[10, 100] {
