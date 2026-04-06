@@ -16,8 +16,11 @@ use super::property::parse_property_body;
 /// A top-level CSS rule we care about.
 #[derive(Debug)]
 pub enum CssRule {
+    /// `@property` declaration.
     Property(PropertyDef),
+    /// `@function` definition.
     Function(FunctionDef),
+    /// Style rule (`.cpu { ... }`) containing property assignments.
     Style(Vec<Assignment>),
 }
 
@@ -26,7 +29,9 @@ pub struct CalcifyRuleParser;
 
 /// Prelude for at-rules (saved between parse_prelude and parse_block).
 pub enum AtRulePrelude {
+    /// `@property --name` prelude.
     Property(String),
+    /// `@function --name(params)` prelude.
     Function(String, Vec<FunctionParam>),
     /// An at-rule we don't care about — skip it.
     Unknown,

@@ -410,11 +410,7 @@ mod tests {
 
     /// Build an assignment with a side-channel delta in the else branch:
     /// `--SP: if(style(--addrDestA:-5):val; else: calc(var(--__1SP) + var(--moveStack)))`
-    fn make_side_channel_assignment(
-        name: &str,
-        addr: i64,
-        side_channel: &str,
-    ) -> Assignment {
+    fn make_side_channel_assignment(name: &str, addr: i64, side_channel: &str) -> Assignment {
         Assignment {
             property: format!("--{name}"),
             value: Expr::StyleCondition {

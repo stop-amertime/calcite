@@ -13,49 +13,68 @@ fn hash_f64<H: Hasher>(v: &f64, state: &mut H) {
 /// A raw CSS value (before expression parsing).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CssValue {
+    /// An integer value from `initial-value`.
     Integer(i64),
+    /// A string value from `initial-value`.
     String(String),
 }
 
 /// A parsed `@property` declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PropertyDef {
+    /// Property name (e.g., `"--AX"`).
     pub name: String,
+    /// The `syntax` descriptor.
     pub syntax: PropertySyntax,
+    /// Whether the property inherits.
     pub inherits: bool,
+    /// The `initial-value` descriptor.
     pub initial_value: Option<CssValue>,
 }
 
 /// The `syntax` descriptor of an `@property` rule.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PropertySyntax {
+    /// `<integer>`.
     Integer,
+    /// `<number>`.
     Number,
+    /// `<length>`.
     Length,
+    /// Any other syntax string.
     Custom(String),
+    /// `*` (universal).
     Any,
 }
 
 /// A parsed `@function` definition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionDef {
+    /// Function name (e.g., `"--readMem"`).
     pub name: String,
+    /// Declared parameters.
     pub parameters: Vec<FunctionParam>,
+    /// Local variable definitions (evaluated on call).
     pub locals: Vec<LocalVarDef>,
+    /// The `result:` expression.
     pub result: Expr,
 }
 
 /// A parameter of a `@function`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionParam {
+    /// Parameter name (e.g., `"--at"`).
     pub name: String,
+    /// Declared syntax type.
     pub syntax: PropertySyntax,
 }
 
 /// A local variable within a `@function`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LocalVarDef {
+    /// Variable name.
     pub name: String,
+    /// Initializer expression.
     pub value: Expr,
 }
 
@@ -73,7 +92,9 @@ pub enum Expr {
 
     /// A `var(--name)` reference, with optional fallback.
     Var {
+        /// The property name being referenced.
         name: String,
+        /// Fallback expression if the variable is undefined.
         fallback: Option<Box<Expr>>,
     },
 
@@ -82,12 +103,19 @@ pub enum Expr {
 
     /// `if(style(--prop: val): then; else: otherwise)` conditional.
     StyleCondition {
+        /// Ordered condition branches to test.
         branches: Vec<StyleBranch>,
+        /// Default value when no branch matches.
         fallback: Box<Expr>,
     },
 
     /// A `@function` call: `--funcName(arg1, arg2)`.
-    FunctionCall { name: String, args: Vec<Expr> },
+    FunctionCall {
+        /// The function name.
+        name: String,
+        /// Argument expressions.
+        args: Vec<Expr>,
+    },
 }
 
 impl PartialEq for Expr {
@@ -155,6 +183,7 @@ impl Hash for Expr {
 pub struct StyleBranch {
     /// The condition — a single `style()` test or a compound `and`/`or`.
     pub condition: StyleTest,
+    /// Expression to evaluate when the condition matches.
     pub then: Expr,
 }
 
@@ -162,7 +191,12 @@ pub struct StyleBranch {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StyleTest {
     /// A single `style(--prop: val)` test.
-    Single { property: String, value: Expr },
+    Single {
+        /// The property being tested.
+        property: String,
+        /// The value to compare against.
+        value: Expr,
+    },
     /// `condition1 and condition2` — all must match.
     And(Vec<StyleTest>),
     /// `condition1 or condition2` — any must match.
@@ -172,34 +206,53 @@ pub enum StyleTest {
 /// Arithmetic / math operations from `calc()`, `mod()`, `round()`, etc.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CalcOp {
+    /// `a + b`.
     Add(Box<Expr>, Box<Expr>),
+    /// `a - b`.
     Sub(Box<Expr>, Box<Expr>),
+    /// `a * b`.
     Mul(Box<Expr>, Box<Expr>),
+    /// `a / b` (returns 0 for division by zero).
     Div(Box<Expr>, Box<Expr>),
+    /// `mod(a, b)`.
     Mod(Box<Expr>, Box<Expr>),
+    /// `min(a, b, ...)`.
     Min(Vec<Expr>),
+    /// `max(a, b, ...)`.
     Max(Vec<Expr>),
+    /// `clamp(min, val, max)`.
     Clamp(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `round(strategy, val, interval)`.
     Round(RoundStrategy, Box<Expr>, Box<Expr>),
+    /// `pow(base, exp)`.
     Pow(Box<Expr>, Box<Expr>),
+    /// `sign(val)` — returns -1, 0, or 1.
     Sign(Box<Expr>),
+    /// `abs(val)`.
     Abs(Box<Expr>),
+    /// Unary negation (`-val`).
     Negate(Box<Expr>),
 }
 
 /// The rounding strategy for `round()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoundStrategy {
+    /// Round to nearest (ties to even).
     Nearest,
+    /// Round toward positive infinity.
     Up,
+    /// Round toward negative infinity.
     Down,
+    /// Round toward zero.
     ToZero,
 }
 
 /// A complete parsed CSS program ready for pattern compilation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ParsedProgram {
+    /// `@property` declarations (used to initialise state).
     pub properties: Vec<PropertyDef>,
+    /// `@function` definitions.
     pub functions: Vec<FunctionDef>,
     /// Property assignments on `.cpu`, in declaration order.
     pub assignments: Vec<Assignment>,
@@ -208,6 +261,8 @@ pub struct ParsedProgram {
 /// A single property assignment: `--name: <expr>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Assignment {
+    /// The property being assigned (e.g., `"--AX"`).
     pub property: String,
+    /// The value expression.
     pub value: Expr,
 }

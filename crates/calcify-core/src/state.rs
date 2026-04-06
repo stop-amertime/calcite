@@ -4,20 +4,35 @@
 
 /// CPU register indices into `State::registers`.
 pub mod reg {
+    /// Accumulator.
     pub const AX: usize = 0;
+    /// Counter.
     pub const CX: usize = 1;
+    /// Data.
     pub const DX: usize = 2;
+    /// Base.
     pub const BX: usize = 3;
+    /// Stack pointer.
     pub const SP: usize = 4;
+    /// Base pointer.
     pub const BP: usize = 5;
+    /// Source index.
     pub const SI: usize = 6;
+    /// Destination index.
     pub const DI: usize = 7;
+    /// Instruction pointer.
     pub const IP: usize = 8;
+    /// Extra segment.
     pub const ES: usize = 9;
+    /// Code segment.
     pub const CS: usize = 10;
+    /// Stack segment.
     pub const SS: usize = 11;
+    /// Data segment.
     pub const DS: usize = 12;
+    /// Flags register.
     pub const FLAGS: usize = 13;
+    /// Total number of registers.
     pub const COUNT: usize = 14;
 }
 
@@ -26,39 +41,59 @@ pub mod reg {
 /// x86CSS uses negative addresses for registers and split register halves.
 /// These constants match the convention used in `base_template.html`.
 pub mod addr {
-    // Full 16-bit registers (negative addresses used by readMem/broadcast write)
+    /// AX register (full 16-bit).
     pub const AX: i32 = -1;
+    /// CX register (full 16-bit).
     pub const CX: i32 = -2;
+    /// DX register (full 16-bit).
     pub const DX: i32 = -3;
+    /// BX register (full 16-bit).
     pub const BX: i32 = -4;
+    /// SP register (full 16-bit).
     pub const SP: i32 = -5;
+    /// BP register (full 16-bit).
     pub const BP: i32 = -6;
+    /// SI register (full 16-bit).
     pub const SI: i32 = -7;
+    /// DI register (full 16-bit).
     pub const DI: i32 = -8;
+    /// IP register (full 16-bit).
     pub const IP: i32 = -9;
+    /// ES register (full 16-bit).
     pub const ES: i32 = -10;
+    /// CS register (full 16-bit).
     pub const CS: i32 = -11;
+    /// SS register (full 16-bit).
     pub const SS: i32 = -12;
+    /// DS register (full 16-bit).
     pub const DS: i32 = -13;
+    /// FLAGS register (full 16-bit).
     pub const FLAGS: i32 = -14;
 
-    // High byte halves (AH, CH, DH, BH) — address = -(reg_index + 20)
+    /// AH — high byte of AX. Address = -(reg_index + 20).
     pub const AH: i32 = -21;
+    /// CH — high byte of CX.
     pub const CH: i32 = -22;
+    /// DH — high byte of DX.
     pub const DH: i32 = -23;
+    /// BH — high byte of BX.
     pub const BH: i32 = -24;
 
-    // Low byte halves (AL, CL, DL, BL) — address = -(reg_index + 30)
+    /// AL — low byte of AX. Address = -(reg_index + 30).
     pub const AL: i32 = -31;
+    /// CL — low byte of CX.
     pub const CL: i32 = -32;
+    /// DL — low byte of DX.
     pub const DL: i32 = -33;
+    /// BL — low byte of BX.
     pub const BL: i32 = -34;
 
-    // External function addresses (0x2000–0x200F)
+    /// Base address for external function addresses (0x2000–0x200F).
     pub const EXT_BASE: i32 = 0x2000;
+    /// BIOS write character function (INT 10h AH=0Eh).
     pub const EXT_WRITE_CHAR: i32 = 0x2006;
 
-    // External I/O addresses (0x2100–0x210F)
+    /// Base address for external I/O (0x2100–0x210F).
     pub const EXT_IO_BASE: i32 = 0x2100;
 }
 
@@ -68,10 +103,15 @@ pub const DEFAULT_MEM_SIZE: usize = 0x600;
 /// The flat machine state that replaces CSS's triple-buffered custom properties.
 #[derive(Debug, Clone)]
 pub struct State {
+    /// CPU registers (AX, CX, DX, BX, SP, BP, SI, DI, IP, ES, CS, SS, DS, FLAGS).
     pub registers: [i32; reg::COUNT],
+    /// Flat memory (byte-addressable, default 1,536 bytes).
     pub memory: Vec<u8>,
+    /// Text display buffer for BIOS INT 10h output.
     pub text_buffer: String,
+    /// Last keyboard input (for INT 16h emulation).
     pub keyboard: u8,
+    /// Tick counter (incremented each evaluation cycle).
     pub frame_counter: u32,
 }
 

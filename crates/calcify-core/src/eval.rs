@@ -38,7 +38,9 @@ pub struct Evaluator {
 /// The result of running a batch of ticks.
 #[derive(Debug, Clone, Default)]
 pub struct TickResult {
+    /// State changes as (property_name, new_value) pairs.
     pub changes: Vec<(String, String)>,
+    /// Number of ticks executed.
     pub ticks_executed: u32,
 }
 

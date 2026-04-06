@@ -5,13 +5,20 @@
 //! operations. The primary target is running x86CSS faster than Chrome's native style
 //! resolver.
 
+/// Chrome conformance comparison utilities (requires `conformance` feature).
 #[cfg(feature = "conformance")]
 pub mod conformance;
+/// Error types.
 pub mod error;
+/// Expression evaluator — runs compiled programs against flat state.
 pub mod eval;
+/// CSS parser — tokenisation and expression tree construction.
 pub mod parser;
+/// Pattern recognition — dispatch tables, broadcast writes.
 pub mod pattern;
+/// Machine state — registers and memory.
 pub mod state;
+/// IR type definitions — expressions, assignments, programs.
 pub mod types;
 
 pub use error::{CalcifyError, Result};
