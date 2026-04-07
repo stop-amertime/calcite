@@ -1,4 +1,4 @@
-# calc(ite)
+# *calc(ite)*
 
 A JIT compiler for computational CSS. Parses real CSS, recognises computational
 patterns, and compiles them into efficient native operations.
@@ -88,4 +88,4 @@ positive addresses = memory bytes.
 
 ## License
 
-MIT
+GNU GPLv3
