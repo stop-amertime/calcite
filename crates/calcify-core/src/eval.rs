@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use crate::compile::{self, CompiledProgram};
 use crate::pattern::broadcast_write::{self, BroadcastWrite};
 use crate::pattern::dispatch_table::{self, DispatchTable};
 use crate::state::State;
@@ -33,6 +34,10 @@ pub struct Evaluator {
     properties: HashMap<String, f64>,
     /// Call depth for recursion protection.
     call_depth: usize,
+    /// Compiled bytecode program (flat ops over indexed slots).
+    compiled: CompiledProgram,
+    /// Slot array reused across ticks (avoids per-tick allocation).
+    slots: Vec<f64>,
 }
 
 /// The result of running a batch of ticks.
@@ -120,6 +125,22 @@ impl Evaluator {
             }
         }
 
+        let compiled = compile::compile(
+            &assignments,
+            &broadcast_result.writes,
+            &functions,
+            &dispatch_tables,
+        );
+
+        log::info!(
+            "Compiled: {} ops, {} slots, {} dispatch tables, {} broadcast writes",
+            compiled.ops.len(),
+            compiled.slot_count,
+            compiled.dispatch_tables.len(),
+            compiled.broadcast_writes.len(),
+        );
+
+        let slot_count = compiled.slot_count as usize;
         let properties_capacity = assignments.len();
         Evaluator {
             functions,
@@ -128,6 +149,8 @@ impl Evaluator {
             broadcast_writes: broadcast_result.writes,
             properties: HashMap::with_capacity(properties_capacity),
             call_depth: 0,
+            compiled,
+            slots: Vec::with_capacity(slot_count),
         }
     }
 
@@ -170,29 +193,80 @@ impl Evaluator {
             _ => {}
         }
 
-        // Reuse the properties map — clear() retains the allocated capacity.
+        // Snapshot registers for change detection
+        let prev_regs = state.registers;
+
+        // Execute via compiled bytecode
+        compile::execute(&self.compiled, state, &mut self.slots);
+
+        // Detect register changes
+        let mut changes = Vec::new();
+        let reg_names = [
+            "--AX", "--CX", "--DX", "--BX", "--SP", "--BP", "--SI", "--DI",
+            "--IP", "--ES", "--CS", "--SS", "--DS", "--flags",
+        ];
+        for (i, name) in reg_names.iter().enumerate() {
+            if state.registers[i] != prev_regs[i] {
+                changes.push((name.to_string(), state.registers[i].to_string()));
+            }
+        }
+
+        state.frame_counter += 1;
+
+        TickResult {
+            changes,
+            ticks_executed: 1,
+        }
+    }
+
+    /// Run a single tick using the interpreted path (for comparison testing).
+    pub fn tick_interpreted(&mut self, state: &mut State) -> TickResult {
+        // Same external function handling
+        let prev_ip = state.registers[crate::state::reg::IP];
+        match prev_ip {
+            0x2000 => {
+                let ch = state.read_mem(state.registers[crate::state::reg::SP] + 2);
+                if ch > 0 && ch < 128 {
+                    state.text_buffer.push(ch as u8 as char);
+                }
+            }
+            0x2002 => {
+                let ptr = state.read_mem16(state.registers[crate::state::reg::SP] + 2);
+                for off in 0..4 {
+                    let ch = state.read_mem(ptr + off);
+                    if ch == 0 { break; }
+                    if ch > 0 && ch < 128 {
+                        state.text_buffer.push(ch as u8 as char);
+                    }
+                }
+            }
+            0x2004 => {
+                let ptr = state.read_mem16(state.registers[crate::state::reg::SP] + 2);
+                for off in 0..8 {
+                    let ch = state.read_mem(ptr + off);
+                    if ch == 0 { break; }
+                    if ch > 0 && ch < 128 {
+                        state.text_buffer.push(ch as u8 as char);
+                    }
+                }
+            }
+            _ => {}
+        }
+
         self.properties.clear();
         self.call_depth = 0;
 
-        // Execute all assignments in declaration order.
-        // We use raw pointers to read from self.assignments while mutating self.properties.
         let assignments_ptr = self.assignments.as_ptr();
         let assignments_len = self.assignments.len();
         for i in 0..assignments_len {
-            // SAFETY: assignments is not modified during tick; pointer is valid.
             let assignment = unsafe { &*assignments_ptr.add(i) };
             let value = self.eval_expr(&assignment.value, state);
             self.properties.insert(assignment.property.clone(), value);
         }
 
-        // Apply broadcast writes: O(1) HashMap lookup per write.
-        // Writes go directly to state — no need to update properties since
-        // absorbed memory cells are never read by the remaining assignments
-        // (memory reads go through --readMem dispatch table which reads from state).
         let bw_ptr = self.broadcast_writes.as_ptr();
         let bw_len = self.broadcast_writes.len();
         for i in 0..bw_len {
-            // SAFETY: broadcast_writes is not modified during tick; pointer is valid.
             let bw = unsafe { &*bw_ptr.add(i) };
             let dest = self.resolve_property(&bw.dest_property, state);
             let dest_i64 = dest as i64;
@@ -200,8 +274,6 @@ impl Evaluator {
                 let value = self.eval_expr(&bw.value_expr, state);
                 state.write_mem(dest_i64 as i32, value as i32);
             }
-            // Handle word-write spillover: if the guard (e.g., --isWordWrite) is set,
-            // also write the high byte to the next address (dest + 1).
             if !bw.spillover_map.is_empty() {
                 if let Some(ref guard) = bw.spillover_guard {
                     let guard_val = self.resolve_property(guard, state);
@@ -215,9 +287,7 @@ impl Evaluator {
             }
         }
 
-        // Apply non-broadcast property values back to state
         let changes = self.apply_state(state);
-
         state.frame_counter += 1;
 
         TickResult {
@@ -817,6 +887,7 @@ mod tests {
         functions: HashMap<String, FunctionDef>,
         dispatch_tables: HashMap<String, DispatchTable>,
     ) -> Evaluator {
+        let compiled = crate::compile::compile(&[], &[], &functions, &dispatch_tables);
         Evaluator {
             functions,
             assignments: vec![],
@@ -824,6 +895,8 @@ mod tests {
             broadcast_writes: vec![],
             properties: HashMap::with_capacity(16),
             call_depth: 0,
+            compiled,
+            slots: Vec::new(),
         }
     }
 

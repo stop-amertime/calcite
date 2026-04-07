@@ -542,6 +542,58 @@ fn execution_trace() {
 /// keyboard input. Pressing '1' runs the Fibonacci function which outputs:
 ///   "Fibonacci sequence:\n0 1 1 2 3 5 8 13 21 34 55 89"
 ///
+/// Benchmark compiled vs interpreted: run 10K ticks on the demo fixture with each path.
+/// Run with: cargo test --ignored compiled_vs_interpreted_benchmark -- --nocapture
+#[test]
+#[ignore = "requires x86css-demo.css fixture"]
+fn compiled_vs_interpreted_benchmark() {
+    let css = std::fs::read_to_string("../../tests/fixtures/x86css-demo.css")
+        .expect("fixture not found at tests/fixtures/x86css-demo.css");
+
+    let parsed = parse_css(&css).expect("should parse demo CSS");
+    let ticks = 10_000u32;
+
+    // Interpreted path
+    let mut eval_interp = Evaluator::from_parsed(&parsed);
+    let mut state_interp = State::default();
+    state_interp.load_properties(&parsed.properties);
+
+    let start = std::time::Instant::now();
+    for _ in 0..ticks {
+        eval_interp.tick_interpreted(&mut state_interp);
+    }
+    let interp_elapsed = start.elapsed();
+
+    // Compiled path
+    let mut eval_compiled = Evaluator::from_parsed(&parsed);
+    let mut state_compiled = State::default();
+    state_compiled.load_properties(&parsed.properties);
+
+    let start = std::time::Instant::now();
+    for _ in 0..ticks {
+        eval_compiled.tick(&mut state_compiled);
+    }
+    let compiled_elapsed = start.elapsed();
+
+    let interp_tps = ticks as f64 / interp_elapsed.as_secs_f64();
+    let compiled_tps = ticks as f64 / compiled_elapsed.as_secs_f64();
+    let speedup = interp_elapsed.as_secs_f64() / compiled_elapsed.as_secs_f64();
+
+    println!("\n=== Compiled vs Interpreted Benchmark ({ticks} ticks) ===");
+    println!("  Interpreted: {:.1}ms ({:.0} ticks/sec)", interp_elapsed.as_secs_f64() * 1000.0, interp_tps);
+    println!("  Compiled:    {:.1}ms ({:.0} ticks/sec)", compiled_elapsed.as_secs_f64() * 1000.0, compiled_tps);
+    println!("  Speedup:     {:.1}x", speedup);
+
+    // Verify both paths reach same state
+    for i in 0..state::reg::COUNT {
+        assert_eq!(
+            state_compiled.registers[i], state_interp.registers[i],
+            "register {} diverged after {ticks} ticks: compiled={}, interpreted={}",
+            i, state_compiled.registers[i], state_interp.registers[i]
+        );
+    }
+}
+
 /// Run with: cargo test --ignored fibonacci_benchmark -- --nocapture
 #[test]
 #[ignore = "requires x86css-demo.css fixture"]
@@ -713,4 +765,60 @@ fn deeply_nested_expressions() {
     let mut state = State::default();
     evaluator.tick(&mut state);
     assert_eq!(state.registers[state::reg::AX], 51);
+}
+
+/// Run the same CSS through both compiled and interpreted paths and verify
+/// they produce identical state.
+#[test]
+fn compiled_vs_interpreted() {
+    let css = r#"
+        @property --AX { syntax: "<integer>"; inherits: false; initial-value: 0; }
+        @property --CX { syntax: "<integer>"; inherits: false; initial-value: 0; }
+        @property --DX { syntax: "<integer>"; inherits: false; initial-value: 0; }
+        @property --BX { syntax: "<integer>"; inherits: false; initial-value: 100; }
+        @property --IP { syntax: "<integer>"; inherits: false; initial-value: 5; }
+
+        @function --double {
+            --x: <integer>;
+            result: calc(var(--x) * 2);
+        }
+
+        .cpu {
+            --AX: calc(var(--BX) + 1);
+            --CX: --double(var(--AX));
+            --DX: if(
+                style(--BX: 100): calc(var(--CX) + 10);
+                else: 0;
+            );
+            --IP: calc(var(--IP) + 1);
+        }
+    "#;
+
+    let parsed = parse_css(css).expect("CSS should parse");
+
+    // Compiled path
+    let mut eval_compiled = Evaluator::from_parsed(&parsed);
+    let mut state_compiled = State::default();
+    state_compiled.load_properties(&parsed.properties);
+    for _ in 0..5 {
+        eval_compiled.tick(&mut state_compiled);
+    }
+
+    // Interpreted path
+    let mut eval_interp = Evaluator::from_parsed(&parsed);
+    let mut state_interp = State::default();
+    state_interp.load_properties(&parsed.properties);
+    for _ in 0..5 {
+        eval_interp.tick_interpreted(&mut state_interp);
+    }
+
+    // Compare all registers
+    for i in 0..state::reg::COUNT {
+        assert_eq!(
+            state_compiled.registers[i],
+            state_interp.registers[i],
+            "register {} diverged: compiled={}, interpreted={}",
+            i, state_compiled.registers[i], state_interp.registers[i]
+        );
+    }
 }
