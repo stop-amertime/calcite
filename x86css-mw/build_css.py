@@ -120,10 +120,14 @@ EXTFUNS = {
   "writeChar8": [0x2004, 2],
   "readInput": [0x2006, 0],
   # "writeStr": 0x2002,
+  "dosSignal": [0x2200, 0],
 }
 
 EXTERNAL_IO_START = 0x2100
 EXTERNAL_IO_END = 0x2110
+
+DOS_SIGNAL_START = 0x2200
+DOS_SIGNAL_END = 0x2210
 
 for i in range(EXTERNAL_FUNCTIONS_START,EXTERNAL_FUNCTIONS_END):
   target_loc = var_offset+i
@@ -136,6 +140,13 @@ for i in range(EXTERNAL_IO_START,EXTERNAL_IO_END):
   target_loc = var_offset+i
   if target_loc >= len(variables):
     variables.append(createChosenMemoryInt(f"m{i}", i, True, 0x00))# if i != 0x2002 else 0xcc))
+  else:
+    variables[target_loc][2] = str(0x00)
+
+for i in range(DOS_SIGNAL_START,DOS_SIGNAL_END):
+  target_loc = var_offset+i
+  if target_loc >= len(variables):
+    variables.append(createChosenMemoryInt(f"m{i}", i, True, 0x00))
   else:
     variables[target_loc][2] = str(0x00)
 

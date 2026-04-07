@@ -1491,18 +1491,22 @@ SUB, ADD
 /* INT dispatch: handle DOS services, skip unsupported interrupts.
    INT 3: no-op (breakpoint, just advance IP)
    INT 21h (instArg1=33):
-     AH=01h (1):  Read char with echo → AL = keyboard input
-     AH=02h (2):  Write char in DL (side effect in calcify hook)
-     AH=06h (6):  Direct console I/O: DL=FF reads → AL, else writes DL
-     AH=08h (8):  Read char without echo → AL = keyboard input
-     AH=09h (9):  Write $-terminated string (side effect in calcify hook)
-     AH=0Ah (10): Buffered input (side effect in calcify hook)
-     AH=1Ah (26): Set DTA address — no-op
-     AH=25h (37): Set interrupt vector — no-op
-     AH=2Ch (44): Get system time (side effect in calcify hook)
+     AH=01h (1):  Read char with echo → AL = keyboard, signal 0x2200
+     AH=02h (2):  Write char in DL → signal 0x2200
+     AH=06h (6):  Direct console I/O → AL = keyboard, signal 0x2200
+     AH=08h (8):  Read char without echo → AL = keyboard, signal 0x2200
+     AH=09h (9):  Write $-terminated string → signal 0x2200
+     AH=0Ah (10): Buffered input → signal 0x2200
+     AH=1Ah (26): Set DTA address → signal 0x2200
+     AH=25h (37): Set interrupt vector → signal 0x2200
+     AH=2Ch (44): Get system time → signal 0x2200
      AH=30h (48): Get DOS version → AX = 5
-     AH=35h (53): Get interrupt vector (side effect in calcify hook)
+     AH=35h (53): Get interrupt vector → signal 0x2200
      AH=4Ch (76): Exit → halt (IP = IP)
+
+   Write slot 0: register/memory write for the service result
+   Write slot 1: signal AH value to address 0x2200 for calcify hook
+     (calcify reads 0x2200 each tick — nonzero means "DOS service requested")
    All others: no-op (advance IP normally) */
 @function --D-INT(--w <integer>) returns <integer> {
   result: if(
@@ -1511,6 +1515,7 @@ SUB, ADD
     style(--w:0) and style(--instArg1:33) and style(--AH:8):-31;
     style(--w:0) and style(--instArg1:33) and style(--AH:48):-1;
     style(--w:0) and style(--instArg1:33) and style(--AH:76):-9;
+    style(--w:1) and style(--instArg1:33):#dosSignal;
   else:-100);
 }
 
@@ -1521,6 +1526,7 @@ SUB, ADD
     style(--w:0) and style(--instArg1:33) and style(--AH:8):var(--keyboard, 0);
     style(--w:0) and style(--instArg1:33) and style(--AH:48):5;
     style(--w:0) and style(--instArg1:33) and style(--AH:76):var(--__1IP);
+    style(--w:1) and style(--instArg1:33):var(--AH);
   else:0);
 }
 

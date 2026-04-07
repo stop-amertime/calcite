@@ -342,41 +342,46 @@ pub fn x86css_text_output_hook() -> Box<dyn Fn(&mut State)> {
     })
 }
 
+/// Address of the DOS service signal port.
+///
+/// The CSS INT 21h handler writes the AH value here (via write slot 1)
+/// when a DOS service is invoked. The hook reads this address each tick;
+/// nonzero means "DOS service was requested on this tick."
+/// The hook clears it back to zero after handling.
+const DOS_SIGNAL_ADDR: usize = 0x2200;
+
 /// Create a pre-tick hook that handles DOS INT 21h services.
 ///
-/// Detects `INT 21h` (opcode 0xCD 0x21) at the current IP and dispatches
-/// based on AH. Handles text I/O services so DOS .COM programs can print
-/// and read characters. The CSS INT handler treats unrecognised AH values
-/// as no-ops (advancing IP normally), so this hook only needs to capture
-/// side effects like text output.
+/// Reads the DOS signal port (0x2200) each tick. When the CSS INT handler
+/// writes a nonzero AH value there, this hook dispatches the corresponding
+/// DOS service. No opcode reading — all x86 knowledge stays in the CSS.
 ///
 /// Supported functions:
-/// - AH=01h: Read character with echo (reads keyboard, echoes to text_buffer)
+/// - AH=01h: Read character with echo (echoes to text_buffer)
 /// - AH=02h: Write character (DL → text_buffer)
 /// - AH=06h: Direct console I/O (DL=FF reads, else writes DL)
-/// - AH=08h: Read character without echo (reads keyboard, no echo)
+/// - AH=08h: Read character without echo
 /// - AH=09h: Write $-terminated string from DS:DX
 /// - AH=0Ah: Buffered keyboard input (reads line into DS:DX buffer)
 /// - AH=2Ch: Get system time (returns tick counter as time)
-/// - AH=25h: Set interrupt vector (no-op, acknowledge)
+/// - AH=25h: Set interrupt vector (no-op)
 /// - AH=35h: Get interrupt vector (returns 0:0)
-/// - AH=1Ah: Set DTA address (no-op, acknowledge)
+/// - AH=1Ah: Set DTA address (no-op)
 pub fn dos_services_hook() -> Box<dyn Fn(&mut State)> {
     Box::new(|state: &mut State| {
-        let ip = state.registers[reg::IP];
-        let ip_u = ip as usize;
+        // Check the DOS signal port — CSS writes AH here on INT 21h
+        if DOS_SIGNAL_ADDR >= state.memory.len() { return; }
+        let signal = state.memory[DOS_SIGNAL_ADDR];
+        if signal == 0 { return; }
 
-        // Check for INT 21h: opcode 0xCD followed by 0x21
-        if ip_u + 1 >= state.memory.len() { return; }
-        if state.memory[ip_u] != 0xCD || state.memory[ip_u + 1] != 0x21 { return; }
+        // Clear the signal so it doesn't re-trigger next tick
+        state.memory[DOS_SIGNAL_ADDR] = 0;
 
-        let ah = State::hi8(state.registers[reg::AX]);
-        let _al = State::lo8(state.registers[reg::AX]);
         let dl = State::lo8(state.registers[reg::DX]);
         let ds = state.registers[reg::DS];
         let dx = state.registers[reg::DX];
 
-        match ah {
+        match signal {
             // AH=01h: Read character with echo
             // CSS writes keyboard → AL; hook just echoes to text buffer
             0x01 => {
@@ -398,8 +403,7 @@ pub fn dos_services_hook() -> Box<dyn Fn(&mut State)> {
                     state.text_buffer.push(dl as u8 as char);
                 }
             }
-            // AH=08h: Read character without echo
-            // CSS writes keyboard → AL; hook has nothing to do
+            // AH=08h: Read character without echo — nothing to do
             0x08 => {}
             // AH=09h: Write $-terminated string at DS:DX
             0x09 => {
@@ -421,14 +425,11 @@ pub fn dos_services_hook() -> Box<dyn Fn(&mut State)> {
                 if max_len > 0 {
                     let ch = state.keyboard as i32;
                     if ch != 0 {
-                        // Read current count
                         let count = state.read_mem(buf_addr + 1) as usize;
                         if ch == 0x0D {
-                            // Enter: finalize the buffer
                             state.text_buffer.push('\n');
                             state.keyboard = 0;
                         } else if count < max_len - 1 {
-                            // Append character
                             state.write_mem(buf_addr + 2 + count as i32, ch);
                             state.write_mem(buf_addr + 1, (count + 1) as i32);
                             state.text_buffer.push(ch as u8 as char);
@@ -437,7 +438,7 @@ pub fn dos_services_hook() -> Box<dyn Fn(&mut State)> {
                     }
                 }
             }
-            // AH=1Ah: Set DTA address — no-op (acknowledge by advancing)
+            // AH=1Ah: Set DTA address — no-op
             0x1A => {}
             // AH=25h: Set interrupt vector — no-op
             0x25 => {}
