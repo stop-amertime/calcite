@@ -1,136 +1,145 @@
-# x86CSS
+# x86css-mw (multi-write fork)
 
-**Check out the live website [here](https://lyra.horse/x86css).**
+A complete CSS-only 8086 emulator. Transpiles x86 binaries into CSS custom
+properties and `@function` definitions that execute in a browser — or via
+[calcify](https://github.com/nicholasgasior/calcify), a JIT compiler for
+computational CSS.
 
-**x86CSS** is a working CSS-only x86 CPU/emulator/computer. Yes, the _Cascading Style Sheets_ CSS. No JavaScript required.
+Forked from [rebane2001/x86css](https://github.com/rebane2001/x86css) with
+significant extensions for multi-write instructions, full ISA coverage, and
+segmented memory support.
 
-What you're seeing above is a [C program](#) that was compiled using [GCC](https://en.wikipedia.org/wiki/GNU_Compiler_Collection) into native [8086](https://en.wikipedia.org/wiki/Intel_8086) machine code being executed fully within CSS.
+## Status
 
-## Frequently Asked Questions
+### 8086 ISA — complete
 
-### Is CSS a programming language?
+All 106 8086 instructions are implemented:
 
-Do you really need to ask at this point?
+| Category | Instructions |
+|----------|-------------|
+| Arithmetic | ADD, ADC, SUB, SBB, INC, DEC, NEG, MUL, IMUL, DIV, IDIV, CBW, CWD |
+| Logic | AND, OR, XOR, NOT, TEST, SHL, SHR, SAR, ROL, ROR, RCL, RCR |
+| Data movement | MOV, XCHG, LEA, LES, LDS, XLAT, PUSH, POP |
+| String ops | MOVSB/W, STOSB/W, LODSB/W, CMPSB/W, SCASB/W |
+| Control flow | JMP, CALL, RET, RETF, IRET, INT, INTO, LOOP, LOOPZ, LOOPNZ, JCXZ |
+| Conditional jumps | JZ, JNZ, JB, JNB, JBE, JA, JS, JNS, JL, JGE, JLE, JG, JO, JNO, JPE, JPO |
+| Flags | CLC, STC, CMC, CLD, STD, CLI, STI, PUSHF, POPF, SAHF, LAHF |
+| Prefixes | REP/REPZ, REPNZ, LOCK, segment overrides (ES:, CS:, SS:, DS:) |
+| BCD | DAA, DAS, AAA, AAS, AAM, AAD |
+| Far calls | CALL FAR, JMP FAR, RETF, IRET |
+| I/O | IN, OUT, HLT, WAIT, NOP |
 
-### How??
+### Segmented memory — working
 
-I plan on writing a blog post that explains how this works as well as many of the tricks used. Bookmark [my blog](https://lyra.horse/blog/) or add it to your RSS reader.
+- ModR/M address calculation applies `segment * 16 + offset` with correct
+  default segment selection (SS for BP-based, DS for others)
+- String instructions use `DS:SI` and `ES:DI` per the 8086 spec
+- LES/LDS load far pointers (offset + segment)
+- Far CALL/JMP/RETF/IRET push/pop CS correctly
+- Segment override prefixes are recognised but currently **no-ops** (the
+  prefix doesn't change the default segment for the next instruction)
 
-### Surely you still need a little bit of JavaScript?
+### Multi-write support
 
-Nope, this is CSS-only!
+The original x86css could only write one value per tick. This fork supports
+two write slots per tick (`addrDestA`/`addrDestB`), enabling instructions that
+modify multiple destinations (e.g., XCHG, MUL/DIV writing DX:AX, string ops
+updating both data and index registers).
 
-There is a script tag on this site, which is there to provide a clock to the CSS - but this is only there to make the entire thing a bit faster and more stable. The CSS also has a JS-less clock implementation, so if you disable scripts on this site, it will still run. **JavaScript is not required.**
+Side channels handle additional implicit writes (SI/DI deltas for string ops,
+SP for PUSH/POP, flags).
 
-My CSS clock uses an animation combined with style container queries, which means you don't need to interact with anything for the program to run, but it also means its a bit slower and less stable as a result. A hover-based clock, such as the one in [Jane Ori's CPU Hack](https://dev.to/janeori/expert-css-the-cpu-hack-4ddj), is fast and stable, but requires you to hold your mouse on the screen, [which some people claim](https://news.ycombinator.com/item?id=32622021) does not count as turing complete for whatever reason, so I wanted this demo to be fully functional with zero user input.
+### DOS services (INT 21h) — minimal
 
-### But you still need HTML, right?
+Currently stubbed:
 
-Not really... well, kind of?
+| AH | Function | Status |
+|----|----------|--------|
+| 30h | Get DOS version | Returns DOS 5.0 |
+| 4Ch | Exit program | Halts (IP = IP) |
 
-This entire CPU runs in just CSS and doesn't require any HTML code, but there is no way to load the CSS without a \<style> tag, so that much is required. In Firefox [it is possible](https://lyra.horse/fun/tic-tac-nohtml/) to load CSS with no HTML, but atm this demo only works in Chromium-based browsers.
+All other INT 21h functions return no-op. To run real DOS programs (text I/O,
+file access), additional stubs are needed.
 
-### What preprocessor do you use?
+### Other interrupts
 
-I straight up just write CSS! The CSS in [base\_template.html](https://github.com/rebane2001/x86css/blob/mane/base_template.html) is handwritten in Sublime Text, but for the more repetitive parts of the code I wrote a [python script](https://github.com/rebane2001/x86css/blob/mane/build_css.py).
+| Interrupt | Status |
+|-----------|--------|
+| INT 3 | No-op (breakpoint) |
+| INT 10h | Not stubbed (BIOS video) |
+| INT 16h | Keyboard via memory address 0x2100 |
+| All others | No-op (advance IP) |
 
-### Is this practical?
+### REP prefixes
 
-Not really, you can get way better performance by writing code in CSS directly rather than emulating an entire archaic CPU architecture.
+REP/REPZ/REPNZ are recognised as instructions in the CSS but execute as
+no-ops. The [calcify evaluator](../crates/calcify-core/) handles REP
+natively, decrementing CX and repeating the following string instruction in a
+loop within a single tick.
 
-It is fun though, and computers are made for art and fun!
+## Building
 
-### Can I write/run my own programs?
+### From assembly
 
-Yes, but you'll have to compile them yourself. See below.
+Place your 8086 binary in `program.bin` and the `_start` offset in
+`program.start` (as a decimal number). Then:
 
-### What's x86?
+```sh
+python3 build_css.py
+# Output: x86css.html
+```
 
-[x86](https://en.wikipedia.org/wiki/X86) is the CPU architecture most computers these days run on. Heavily simplified, this demo runs the same machine code in CSS that your computer does in its processor. To be fair, modern x86 is 64bit and has a bunch of useful extensions, so it's not quite the same - this here is the original 16bit x86 that ran on the [8086](https://en.wikipedia.org/wiki/Intel_8086).
+### From C
 
-### What's horsle?
+Requires [gcc-ia16](https://gitlab.com/tkchia/build-ia16):
 
-[neigh](https://cabletwo.net/horsle/).
+```sh
+python3 build_c.py
+python3 build_css.py
+```
 
-## Compatibility
+### Configuration
 
-This project implements most of the x86 architecture, but not literally every single instruction and quirk, because a lot of it is unnecessary and not worth adding.
+Edit the top of `build_css.py`:
 
-The way I approached this project was by writing programs I wanted to run in C, compiling them in GCC with various levels of optimization, and then implementing every instruction I needed. This way I know I have everything I need implemented.
+```python
+MEM_SIZE = 0x600       # Memory size in bytes (default 1.5KB)
+PROG_OFFSET = 0x100    # Program load address (.COM convention)
+```
 
-There is some behaviour that's wrong, and some things are missing (e.g. setting the CF/OF flag bits). That's okay.
+Increase `MEM_SIZE` for larger programs. Each byte becomes a CSS custom
+property, so large memory = large CSS output.
 
-## Compiling
+### Custom I/O
 
-You can run your own software in this emulator!
+| Address | Function |
+|---------|----------|
+| 0x2000 | writeChar1 — write single byte to screen |
+| 0x2002 | writeChar4 — write 4 bytes to screen |
+| 0x2004 | writeChar8 — write 8 bytes to screen |
+| 0x2006 | readInput — read keyboard input |
+| 0x2100 | SHOW_KEYBOARD — toggle on-screen keyboard (0=off, 1=numeric, 2=alpha) |
 
-If you have 8086 assembly ready to go, clone my repo, and put the assembly in a file called _program.bin_. Then, put the path to the \_start() function in _program.start_ as a number. Once that's set, you can just run _build\_css.py_ with Python3 (no dependencies required!) and the output will be in _x86css.html_.
+## Running with calcify
 
-If you want to write C code, you can do so using [gcc-ia16](https://gitlab.com/tkchia/build-ia16) (you can build it yourself or install it from the [PPA](https://launchpad.net/~tkchia/+archive/ubuntu/build-ia16/)). The _build\_c.py_ script does the build with the correct flags and also makes the _program.bin/start_ files. Don't forget to run _build\_css.py_ after! This building setup works on both Linux and WSL1/2 (I haven't tried on macOS).
+The generated CSS can be executed directly by calcify for much higher
+throughput than browser rendering:
 
-By default there is 0x600 bytes (1.5kB) of memory, but this can be increased in the _build\_css.py_ file as necessary. The program gets loaded at memory address 0x100. There's some custom I/O addresses for you to be able to interface with the program.
+```sh
+# Parse and run the CSS
+cargo run -p calcify-cli -- path/to/x86css.html --ticks 1000000
+```
 
-Here's an example program:
-
-    static const char STR_4BYTES[] = "hell";
-    static const char STR_8BYTES[] = "o world!";
-    
-    void (*writeChar1)(char);
-    void (*writeChar4)(const char[4]);
-    void (*writeChar8)(const char[8]);
-    char (*readInput)(void);
-    
-    int _start(void) {
-      // Set up custom stuff
-      writeChar1 = (void*)(0x2000);
-      writeChar4 = (void*)(0x2002);
-      writeChar8 = (void*)(0x2004);
-      readInput = (void*)(0x2006);
-      int* SHOW_KEYBOARD = (int*)(0x2100);
-    
-      // Write a single byte to screen
-      writeChar1(0x0a);
-      // Write 4 bytes from pointer to screen
-      writeChar4(STR_4BYTES);
-      // Write 8 bytes from pointer to screen
-      writeChar8(STR_8BYTES);
-      // Write a character from custom charset
-      writeChar1(0x80);
-    
-      while (1) {
-        // Show numeric keyboard
-        *SHOW_KEYBOARD = 1;
-        // Read keyboard input
-        char input = readInput();
-        if (!input) continue;
-        *SHOW_KEYBOARD = 0;
-        // Echo input
-        writeChar1(input);
-        break;
-      }
-    
-      while (1) {
-        // Show alphanumeric keyboard
-        *SHOW_KEYBOARD = 2;
-        char input = readInput();
-        if (!input) continue;
-        *SHOW_KEYBOARD = 0;
-        writeChar1(input);
-        break;
-      }
-    
-      return 1337;
-    }
+calcify compiles the CSS expressions to bytecode, achieving ~230K ticks/sec
+with pattern recognition for dispatch tables, broadcast writes, and bitwise
+operations.
 
 ## Credits
 
-Greetz/thanks to:
+- [rebane2001](https://github.com/rebane2001) for the original x86css
+- Jane Ori for the original [CPU Hack](https://dev.to/janeori/expert-css-the-cpu-hack-4ddj)
+- Soo-Young Lee for the [8086 instruction set reference](https://www.eng.auburn.edu/~sylee/ee2220/8086_instruction_set.html)
+- mlsite.net for the [8086 opcode map](http://www.mlsite.net/8086/)
+- crtc-demos && tkchia for [gcc-ia16](https://gitlab.com/tkchia/build-ia16)
 
-*   Jane Ori for the original [CPU Hack](https://dev.to/janeori/expert-css-the-cpu-hack-4ddj)
-*   Soo-Young Lee for the [8086 instruction set reference](https://www.eng.auburn.edu/~sylee/ee2220/8086_instruction_set.html)
-*   mlsite.net for the [8086 opcode map](http://www.mlsite.net/8086/)
-*   crtc-demos && tkchia for [gcc-ia16](https://gitlab.com/tkchia/build-ia16)
-*   [polly](https://blog.polly.computer) for teaching me arm and hardware
-*   cohosters for inspiring me to learn CSS in the first place
-
-_Feb 2026_
+_Originally Feb 2026 by rebane2001. Multi-write fork Apr 2026._

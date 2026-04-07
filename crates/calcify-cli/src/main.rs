@@ -30,6 +30,10 @@ struct Cli {
     /// Memory is read in text-mode format (char+attribute byte pairs).
     #[arg(long, value_name = "ADDR WxH", num_args = 2)]
     screen: Option<Vec<String>>,
+
+    /// Enable DOS INT 21h service stubs (text I/O, time, etc.)
+    #[arg(long)]
+    dos: bool,
 }
 
 fn parse_screen_args(args: &[String]) -> (i32, usize, usize) {
@@ -94,6 +98,9 @@ fn main() {
             let t1 = std::time::Instant::now();
             let mut evaluator = calcify_core::Evaluator::from_parsed(&parsed);
             evaluator.add_pre_tick_hook(calcify_core::state::x86css_text_output_hook());
+            if cli.dos {
+                evaluator.add_pre_tick_hook(calcify_core::state::dos_services_hook());
+            }
             let compile_time = t1.elapsed();
 
             let mut state = calcify_core::State::default();
@@ -155,6 +162,10 @@ fn main() {
                 tick_time.as_secs_f64(),
                 cli.ticks as f64 / tick_time.as_secs_f64(),
             );
+
+            if !state.text_buffer.is_empty() {
+                println!("\n--- Text Output ---\n{}", state.text_buffer);
+            }
 
             if let Some(ref args) = cli.screen {
                 let (addr, width, height) = parse_screen_args(args);

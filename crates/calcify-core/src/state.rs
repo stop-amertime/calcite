@@ -342,6 +342,121 @@ pub fn x86css_text_output_hook() -> Box<dyn Fn(&mut State)> {
     })
 }
 
+/// Create a pre-tick hook that handles DOS INT 21h services.
+///
+/// Detects `INT 21h` (opcode 0xCD 0x21) at the current IP and dispatches
+/// based on AH. Handles text I/O services so DOS .COM programs can print
+/// and read characters. The CSS INT handler treats unrecognised AH values
+/// as no-ops (advancing IP normally), so this hook only needs to capture
+/// side effects like text output.
+///
+/// Supported functions:
+/// - AH=01h: Read character with echo (reads keyboard, echoes to text_buffer)
+/// - AH=02h: Write character (DL → text_buffer)
+/// - AH=06h: Direct console I/O (DL=FF reads, else writes DL)
+/// - AH=08h: Read character without echo (reads keyboard, no echo)
+/// - AH=09h: Write $-terminated string from DS:DX
+/// - AH=0Ah: Buffered keyboard input (reads line into DS:DX buffer)
+/// - AH=2Ch: Get system time (returns tick counter as time)
+/// - AH=25h: Set interrupt vector (no-op, acknowledge)
+/// - AH=35h: Get interrupt vector (returns 0:0)
+/// - AH=1Ah: Set DTA address (no-op, acknowledge)
+pub fn dos_services_hook() -> Box<dyn Fn(&mut State)> {
+    Box::new(|state: &mut State| {
+        let ip = state.registers[reg::IP];
+        let ip_u = ip as usize;
+
+        // Check for INT 21h: opcode 0xCD followed by 0x21
+        if ip_u + 1 >= state.memory.len() { return; }
+        if state.memory[ip_u] != 0xCD || state.memory[ip_u + 1] != 0x21 { return; }
+
+        let ah = State::hi8(state.registers[reg::AX]);
+        let _al = State::lo8(state.registers[reg::AX]);
+        let dl = State::lo8(state.registers[reg::DX]);
+        let ds = state.registers[reg::DS];
+        let dx = state.registers[reg::DX];
+
+        match ah {
+            // AH=01h: Read character with echo
+            // CSS writes keyboard → AL; hook just echoes to text buffer
+            0x01 => {
+                let ch = state.keyboard as i32;
+                if ch != 0 && ch < 128 {
+                    state.text_buffer.push(ch as u8 as char);
+                }
+            }
+            // AH=02h: Write character in DL
+            0x02 => {
+                if dl > 0 && dl < 128 {
+                    state.text_buffer.push(dl as u8 as char);
+                }
+            }
+            // AH=06h: Direct console I/O
+            // CSS writes keyboard → AL for input (DL=FF); hook handles output
+            0x06 => {
+                if dl != 0xFF && dl > 0 && dl < 128 {
+                    state.text_buffer.push(dl as u8 as char);
+                }
+            }
+            // AH=08h: Read character without echo
+            // CSS writes keyboard → AL; hook has nothing to do
+            0x08 => {}
+            // AH=09h: Write $-terminated string at DS:DX
+            0x09 => {
+                let mut addr = ds * 16 + dx;
+                for _ in 0..4096 {
+                    let ch = state.read_mem(addr);
+                    if ch == 0x24 { break; } // '$' terminator
+                    if ch > 0 && ch < 128 {
+                        state.text_buffer.push(ch as u8 as char);
+                    }
+                    addr += 1;
+                }
+            }
+            // AH=0Ah: Buffered keyboard input into buffer at DS:DX
+            // Buffer format: [max_len] [actual_len] [chars...]
+            0x0A => {
+                let buf_addr = ds * 16 + dx;
+                let max_len = state.read_mem(buf_addr) as usize;
+                if max_len > 0 {
+                    let ch = state.keyboard as i32;
+                    if ch != 0 {
+                        // Read current count
+                        let count = state.read_mem(buf_addr + 1) as usize;
+                        if ch == 0x0D {
+                            // Enter: finalize the buffer
+                            state.text_buffer.push('\n');
+                            state.keyboard = 0;
+                        } else if count < max_len - 1 {
+                            // Append character
+                            state.write_mem(buf_addr + 2 + count as i32, ch);
+                            state.write_mem(buf_addr + 1, (count + 1) as i32);
+                            state.text_buffer.push(ch as u8 as char);
+                            state.keyboard = 0;
+                        }
+                    }
+                }
+            }
+            // AH=1Ah: Set DTA address — no-op (acknowledge by advancing)
+            0x1A => {}
+            // AH=25h: Set interrupt vector — no-op
+            0x25 => {}
+            // AH=2Ch: Get system time → CH=hour, CL=min, DH=sec, DL=1/100sec
+            0x2C => {
+                let t = state.frame_counter as i32;
+                state.registers[reg::CX] = (((t / 3600) % 24) << 8) | ((t / 60) % 60);
+                state.registers[reg::DX] = ((t % 60) << 8) | ((t * 100 / 60) % 100);
+            }
+            // AH=35h: Get interrupt vector → ES:BX = handler address
+            0x35 => {
+                state.registers[reg::ES] = 0;
+                state.registers[reg::BX] = 0;
+            }
+            _ => {}
+        }
+    })
+}
+
 impl Default for State {
     fn default() -> Self {
         Self::new(DEFAULT_MEM_SIZE)
