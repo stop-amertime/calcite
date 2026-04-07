@@ -45,9 +45,11 @@ self.onmessage = async function (event) {
         }
         const changesJson = engine.tick_batch(data.count || 1);
         const changes = JSON.parse(changesJson);
+        const stringProps = JSON.parse(engine.get_string_properties());
         self.postMessage({
           type: 'tick-result',
           changes,
+          stringProperties: stringProps,
           ticks: data.count || 1,
         });
         break;

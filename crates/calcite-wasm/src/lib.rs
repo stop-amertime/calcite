@@ -85,4 +85,23 @@ impl CalciteEngine {
     pub fn render_screen(&self, base_addr: usize, width: usize, height: usize) -> String {
         self.state.render_screen(base_addr, width, height)
     }
+
+    /// Return string properties as a JSON object string, e.g. `{"textBuffer":"Hello"}`.
+    pub fn get_string_properties(&self) -> String {
+        let pairs: Vec<String> = self
+            .state
+            .string_properties
+            .iter()
+            .map(|(k, v)| {
+                let escaped = v
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('\t', "\\t");
+                format!("\"{k}\":\"{escaped}\"")
+            })
+            .collect();
+        format!("{{{}}}", pairs.join(","))
+    }
 }
