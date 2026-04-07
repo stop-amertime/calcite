@@ -459,6 +459,10 @@ impl Evaluator {
         if let Some(addr) = property_to_address(name) {
             return state.read_mem(addr) as f64;
         }
+        // Special I/O properties not mapped to the register/memory address space
+        if name == "--keyboard" || name == "--__1keyboard" || name == "--__2keyboard" {
+            return state.keyboard as f64;
+        }
         0.0
     }
 
