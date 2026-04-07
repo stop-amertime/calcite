@@ -420,6 +420,202 @@ pub(crate) fn is_dispatch_identity_read(table: &DispatchTable) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Constant folding — simplify Expr trees before compilation
+// ---------------------------------------------------------------------------
+
+/// Recursively fold constant expressions and eliminate identity operations.
+fn const_fold(expr: &Expr) -> Expr {
+    match expr {
+        Expr::Calc(op) => fold_calc(op),
+        Expr::StyleCondition {
+            branches, fallback, ..
+        } => {
+            let folded_branches: Vec<StyleBranch> = branches
+                .iter()
+                .map(|b| StyleBranch {
+                    condition: fold_test(&b.condition),
+                    then: const_fold(&b.then),
+                })
+                .collect();
+            let folded_fallback = const_fold(fallback);
+            Expr::StyleCondition {
+                branches: folded_branches,
+                fallback: Box::new(folded_fallback),
+            }
+        }
+        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+            name: name.clone(),
+            args: args.iter().map(const_fold).collect(),
+        },
+        _ => expr.clone(),
+    }
+}
+
+/// Fold a StyleTest's value expressions.
+fn fold_test(test: &StyleTest) -> StyleTest {
+    match test {
+        StyleTest::Single { property, value } => StyleTest::Single {
+            property: property.clone(),
+            value: const_fold(value),
+        },
+        StyleTest::And(tests) => StyleTest::And(tests.iter().map(fold_test).collect()),
+        StyleTest::Or(tests) => StyleTest::Or(tests.iter().map(fold_test).collect()),
+    }
+}
+
+/// Fold a CalcOp, returning a simplified Expr.
+fn fold_calc(op: &CalcOp) -> Expr {
+    match op {
+        CalcOp::Add(a, b) => {
+            let fa = const_fold(a);
+            let fb = const_fold(b);
+            match (&fa, &fb) {
+                (Expr::Literal(x), Expr::Literal(y)) => Expr::Literal(x + y),
+                (_, Expr::Literal(v)) if *v == 0.0 => fa,
+                (Expr::Literal(v), _) if *v == 0.0 => fb,
+                _ => Expr::Calc(CalcOp::Add(Box::new(fa), Box::new(fb))),
+            }
+        }
+        CalcOp::Sub(a, b) => {
+            let fa = const_fold(a);
+            let fb = const_fold(b);
+            match (&fa, &fb) {
+                (Expr::Literal(x), Expr::Literal(y)) => Expr::Literal(x - y),
+                (_, Expr::Literal(v)) if *v == 0.0 => fa,
+                _ => Expr::Calc(CalcOp::Sub(Box::new(fa), Box::new(fb))),
+            }
+        }
+        CalcOp::Mul(a, b) => {
+            let fa = const_fold(a);
+            let fb = const_fold(b);
+            match (&fa, &fb) {
+                (Expr::Literal(x), Expr::Literal(y)) => Expr::Literal(x * y),
+                (_, Expr::Literal(v)) if *v == 1.0 => fa,
+                (Expr::Literal(v), _) if *v == 1.0 => fb,
+                (_, Expr::Literal(v)) if *v == 0.0 => Expr::Literal(0.0),
+                (Expr::Literal(v), _) if *v == 0.0 => Expr::Literal(0.0),
+                _ => Expr::Calc(CalcOp::Mul(Box::new(fa), Box::new(fb))),
+            }
+        }
+        CalcOp::Div(a, b) => {
+            let fa = const_fold(a);
+            let fb = const_fold(b);
+            match (&fa, &fb) {
+                (Expr::Literal(x), Expr::Literal(y)) if *y != 0.0 => Expr::Literal(x / y),
+                (_, Expr::Literal(v)) if *v == 1.0 => fa,
+                _ => Expr::Calc(CalcOp::Div(Box::new(fa), Box::new(fb))),
+            }
+        }
+        CalcOp::Mod(a, b) => {
+            let fa = const_fold(a);
+            let fb = const_fold(b);
+            match (&fa, &fb) {
+                (Expr::Literal(x), Expr::Literal(y)) if *y != 0.0 => Expr::Literal(x % y),
+                _ => Expr::Calc(CalcOp::Mod(Box::new(fa), Box::new(fb))),
+            }
+        }
+        CalcOp::Pow(a, b) => {
+            let fa = const_fold(a);
+            let fb = const_fold(b);
+            match (&fa, &fb) {
+                (Expr::Literal(x), Expr::Literal(y)) => Expr::Literal(x.powf(*y)),
+                (_, Expr::Literal(v)) if *v == 0.0 => Expr::Literal(1.0),
+                (_, Expr::Literal(v)) if *v == 1.0 => fa,
+                _ => Expr::Calc(CalcOp::Pow(Box::new(fa), Box::new(fb))),
+            }
+        }
+        CalcOp::Negate(a) => {
+            let fa = const_fold(a);
+            match &fa {
+                Expr::Literal(v) => Expr::Literal(-v),
+                _ => Expr::Calc(CalcOp::Negate(Box::new(fa))),
+            }
+        }
+        CalcOp::Abs(a) => {
+            let fa = const_fold(a);
+            match &fa {
+                Expr::Literal(v) => Expr::Literal(v.abs()),
+                _ => Expr::Calc(CalcOp::Abs(Box::new(fa))),
+            }
+        }
+        CalcOp::Sign(a) => {
+            let fa = const_fold(a);
+            match &fa {
+                Expr::Literal(v) => Expr::Literal(if *v > 0.0 {
+                    1.0
+                } else if *v < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                }),
+                _ => Expr::Calc(CalcOp::Sign(Box::new(fa))),
+            }
+        }
+        CalcOp::Min(args) => {
+            let folded: Vec<Expr> = args.iter().map(const_fold).collect();
+            if folded.iter().all(|e| matches!(e, Expr::Literal(_))) {
+                let min = folded
+                    .iter()
+                    .map(|e| match e {
+                        Expr::Literal(v) => *v,
+                        _ => unreachable!(),
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                Expr::Literal(min)
+            } else {
+                Expr::Calc(CalcOp::Min(folded))
+            }
+        }
+        CalcOp::Max(args) => {
+            let folded: Vec<Expr> = args.iter().map(const_fold).collect();
+            if folded.iter().all(|e| matches!(e, Expr::Literal(_))) {
+                let max = folded
+                    .iter()
+                    .map(|e| match e {
+                        Expr::Literal(v) => *v,
+                        _ => unreachable!(),
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max);
+                Expr::Literal(max)
+            } else {
+                Expr::Calc(CalcOp::Max(folded))
+            }
+        }
+        CalcOp::Clamp(min, val, max) => {
+            let fmin = const_fold(min);
+            let fval = const_fold(val);
+            let fmax = const_fold(max);
+            match (&fmin, &fval, &fmax) {
+                (Expr::Literal(mn), Expr::Literal(v), Expr::Literal(mx)) => {
+                    Expr::Literal(v.clamp(*mn, *mx))
+                }
+                _ => Expr::Calc(CalcOp::Clamp(
+                    Box::new(fmin),
+                    Box::new(fval),
+                    Box::new(fmax),
+                )),
+            }
+        }
+        CalcOp::Round(strategy, val, interval) => {
+            let fval = const_fold(val);
+            let fint = const_fold(interval);
+            match (&fval, &fint) {
+                (Expr::Literal(v), Expr::Literal(i)) if *i != 0.0 => {
+                    let result = match strategy {
+                        RoundStrategy::Nearest => (v / i).round() * i,
+                        RoundStrategy::Up => (v / i).ceil() * i,
+                        RoundStrategy::Down => (v / i).floor() * i,
+                        RoundStrategy::ToZero => (v / i).trunc() * i,
+                    };
+                    Expr::Literal(result)
+                }
+                _ => Expr::Calc(CalcOp::Round(*strategy, Box::new(fval), Box::new(fint))),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Compiler — translates Evaluator data into CompiledProgram
 // ---------------------------------------------------------------------------
 
@@ -460,6 +656,9 @@ impl Compiler {
 
     /// Compile an Expr into ops, returning the slot holding the result.
     fn compile_expr(&mut self, expr: &Expr, ops: &mut Vec<Op>) -> Slot {
+        // Constant-fold before compiling
+        let folded = const_fold(expr);
+        let expr = &folded;
         match expr {
             Expr::Literal(v) => {
                 let dst = self.alloc();
