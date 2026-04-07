@@ -98,7 +98,7 @@ pub struct Evaluator {
     /// Compiled bytecode program (flat ops over indexed slots).
     compiled: CompiledProgram,
     /// Slot array reused across ticks (avoids per-tick allocation).
-    slots: Vec<f64>,
+    slots: Vec<i32>,
 }
 
 /// The result of running a batch of ticks.
@@ -297,8 +297,10 @@ impl Evaluator {
             // can read intermediate computed values (e.g., --instId, --instArg1).
             for (name, &slot) in &self.compiled.property_slots {
                 if (slot as usize) < self.slots.len() {
-                    self.properties
-                        .insert(name.clone(), Value::Number(self.slots[slot as usize]));
+                    self.properties.insert(
+                        name.clone(),
+                        Value::Number(self.slots[slot as usize] as f64),
+                    );
                 }
             }
             for i in 0..self.string_assignments.len() {

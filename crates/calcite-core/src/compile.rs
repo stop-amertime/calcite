@@ -25,7 +25,7 @@ pub type Slot = u32;
 
 /// A single operation in the compiled bytecode.
 ///
-/// All operands are `Slot` (u32) indices into a flat `Vec<f64>` array.
+/// All operands are `Slot` (u32) indices into a flat `Vec<i32>` array.
 /// State reads/writes use `i32` addresses matching the x86CSS convention.
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -33,7 +33,7 @@ pub enum Op {
     /// slot[dst] = literal value
     LoadLit {
         dst: Slot,
-        val: f64,
+        val: i32,
     },
     /// slot[dst] = slot[src]
     LoadSlot {
@@ -55,7 +55,7 @@ pub enum Op {
         dst: Slot,
         addr_slot: Slot,
     },
-    /// slot[dst] = state.keyboard as f64
+    /// slot[dst] = state.keyboard
     LoadKeyboard {
         dst: Slot,
     },
@@ -463,13 +463,16 @@ impl Compiler {
         match expr {
             Expr::Literal(v) => {
                 let dst = self.alloc();
-                ops.push(Op::LoadLit { dst, val: *v });
+                ops.push(Op::LoadLit {
+                    dst,
+                    val: *v as i32,
+                });
                 dst
             }
 
             Expr::StringLiteral(_) | Expr::Concat(_) => {
                 let dst = self.alloc();
-                ops.push(Op::LoadLit { dst, val: 0.0 });
+                ops.push(Op::LoadLit { dst, val: 0 });
                 dst
             }
 
@@ -520,7 +523,7 @@ impl Compiler {
         }
 
         let dst = self.alloc();
-        ops.push(Op::LoadLit { dst, val: 0.0 });
+        ops.push(Op::LoadLit { dst, val: 0 });
         dst
     }
 
@@ -711,7 +714,7 @@ impl Compiler {
                 let result = self.alloc();
                 ops.push(Op::LoadLit {
                     dst: result,
-                    val: 1.0,
+                    val: 1,
                 });
 
                 for t in tests {
@@ -740,7 +743,7 @@ impl Compiler {
                 let result = self.alloc();
                 ops.push(Op::LoadLit {
                     dst: result,
-                    val: 0.0,
+                    val: 0,
                 });
                 let mut jumps_to_end = Vec::new();
 
@@ -919,7 +922,7 @@ impl Compiler {
                         .map(|a| self.compile_expr(a, ops))
                         .unwrap_or_else(|| {
                             let s = self.alloc();
-                            ops.push(Op::LoadLit { dst: s, val: 0.0 });
+                            ops.push(Op::LoadLit { dst: s, val: 0 });
                             s
                         });
                     self.property_slots.insert(param.name.clone(), val_slot);
@@ -981,7 +984,7 @@ impl Compiler {
             Some(f) => f,
             None => {
                 let dst = self.alloc();
-                ops.push(Op::LoadLit { dst, val: 0.0 });
+                ops.push(Op::LoadLit { dst, val: 0 });
                 return dst;
             }
         };
@@ -998,7 +1001,7 @@ impl Compiler {
                     .map(|a| self.compile_expr(a, ops))
                     .unwrap_or_else(|| {
                         let s = self.alloc();
-                        ops.push(Op::LoadLit { dst: s, val: 0.0 });
+                        ops.push(Op::LoadLit { dst: s, val: 0 });
                         s
                     });
                 self.property_slots.insert(param.name.clone(), val_slot);
@@ -1589,17 +1592,17 @@ fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> Comp
 // ---------------------------------------------------------------------------
 
 /// Execute a compiled program for one tick.
-pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<f64>) {
+pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32>) {
     // Reset slots (reuse allocation)
     slots.clear();
-    slots.resize(program.slot_count as usize, 0.0);
+    slots.resize(program.slot_count as usize, 0);
 
     // Execute main ops
     exec_ops(&program.ops, &program.dispatch_tables, state, slots);
 
     // Writeback: apply computed values to state
     for &(slot, addr) in &program.writeback {
-        let value = slots[slot as usize] as i32;
+        let value = slots[slot as usize];
         let old = state.read_mem(addr);
         if old != value {
             state.write_mem(addr, value);
@@ -1612,17 +1615,17 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<f64
         let dest_i64 = dest as i64;
         if bw.address_map.contains_key(&dest_i64) {
             exec_ops(&bw.value_ops, &program.dispatch_tables, state, slots);
-            let value = slots[bw.value_slot as usize] as i32;
-            state.write_mem(dest_i64 as i32, value);
+            let value = slots[bw.value_slot as usize];
+            state.write_mem(dest, value);
         }
         // Spillover
         if let Some(ref spillover) = bw.spillover {
-            let guard = slots[spillover.guard_slot as usize] as i64;
+            let guard = slots[spillover.guard_slot as usize];
             if guard == 1 {
                 if let Some((ref spill_ops, spill_slot)) = spillover.entries.get(&dest_i64) {
                     exec_ops(spill_ops, &program.dispatch_tables, state, slots);
-                    let value = slots[*spill_slot as usize] as i32;
-                    state.write_mem(dest_i64 as i32 + 1, value);
+                    let value = slots[*spill_slot as usize];
+                    state.write_mem(dest + 1, value);
                 }
             }
         }
@@ -1634,7 +1637,7 @@ fn exec_ops(
     ops: &[Op],
     dispatch_tables: &[CompiledDispatchTable],
     state: &mut State,
-    slots: &mut [f64],
+    slots: &mut [i32],
 ) {
     let len = ops.len();
     let mut pc: usize = 0;
@@ -1648,76 +1651,78 @@ fn exec_ops(
                 slots[*dst as usize] = slots[*src as usize];
             }
             Op::LoadState { dst, addr } => {
-                slots[*dst as usize] = state.read_mem(*addr) as f64;
+                slots[*dst as usize] = state.read_mem(*addr);
             }
             Op::LoadMem { dst, addr_slot } => {
-                let addr = slots[*addr_slot as usize] as i32;
-                slots[*dst as usize] = state.read_mem(addr) as f64;
+                let addr = slots[*addr_slot as usize];
+                slots[*dst as usize] = state.read_mem(addr);
             }
             Op::LoadMem16 { dst, addr_slot } => {
-                let addr = slots[*addr_slot as usize] as i32;
+                let addr = slots[*addr_slot as usize];
                 if addr < 0 {
-                    slots[*dst as usize] = state.read_mem(addr) as f64;
+                    slots[*dst as usize] = state.read_mem(addr);
                 } else {
-                    slots[*dst as usize] = state.read_mem16(addr) as f64;
+                    slots[*dst as usize] = state.read_mem16(addr);
                 }
             }
             Op::LoadKeyboard { dst } => {
-                slots[*dst as usize] = state.keyboard as f64;
+                slots[*dst as usize] = state.keyboard as i32;
             }
             Op::Add { dst, a, b } => {
-                slots[*dst as usize] = slots[*a as usize] + slots[*b as usize];
+                slots[*dst as usize] = slots[*a as usize].wrapping_add(slots[*b as usize]);
             }
             Op::Sub { dst, a, b } => {
-                slots[*dst as usize] = slots[*a as usize] - slots[*b as usize];
+                slots[*dst as usize] = slots[*a as usize].wrapping_sub(slots[*b as usize]);
             }
             Op::Mul { dst, a, b } => {
-                slots[*dst as usize] = slots[*a as usize] * slots[*b as usize];
+                slots[*dst as usize] = slots[*a as usize].wrapping_mul(slots[*b as usize]);
             }
             Op::Div { dst, a, b } => {
                 let divisor = slots[*b as usize];
-                slots[*dst as usize] = if divisor == 0.0 {
-                    0.0
+                slots[*dst as usize] = if divisor == 0 {
+                    0
                 } else {
                     slots[*a as usize] / divisor
                 };
             }
             Op::Mod { dst, a, b } => {
                 let divisor = slots[*b as usize];
-                slots[*dst as usize] = if divisor == 0.0 {
-                    0.0
+                slots[*dst as usize] = if divisor == 0 {
+                    0
                 } else {
                     slots[*a as usize] % divisor
                 };
             }
             Op::Neg { dst, src } => {
-                slots[*dst as usize] = -slots[*src as usize];
+                slots[*dst as usize] = slots[*src as usize].wrapping_neg();
             }
             Op::Abs { dst, src } => {
-                slots[*dst as usize] = slots[*src as usize].abs();
+                slots[*dst as usize] = slots[*src as usize].wrapping_abs();
             }
             Op::Sign { dst, src } => {
                 let v = slots[*src as usize];
-                slots[*dst as usize] = if v > 0.0 {
-                    1.0
-                } else if v < 0.0 {
-                    -1.0
+                slots[*dst as usize] = if v > 0 {
+                    1
+                } else if v < 0 {
+                    -1
                 } else {
-                    0.0
+                    0
                 };
             }
             Op::Pow { dst, base, exp } => {
-                slots[*dst as usize] = slots[*base as usize].powf(slots[*exp as usize]);
+                let b = slots[*base as usize];
+                let e = slots[*exp as usize];
+                slots[*dst as usize] = if e < 0 { 0 } else { b.wrapping_pow(e as u32) };
             }
             Op::Min { dst, args } => {
-                let mut v = f64::INFINITY;
+                let mut v = i32::MAX;
                 for &a in args {
                     v = v.min(slots[a as usize]);
                 }
                 slots[*dst as usize] = v;
             }
             Op::Max { dst, args } => {
-                let mut v = f64::NEG_INFINITY;
+                let mut v = i32::MIN;
                 for &a in args {
                     v = v.max(slots[a as usize]);
                 }
@@ -1737,54 +1742,55 @@ fn exec_ops(
             } => {
                 let v = slots[*val as usize];
                 let i = slots[*interval as usize];
-                slots[*dst as usize] = if i == 0.0 {
+                slots[*dst as usize] = if i == 0 {
                     v
                 } else {
+                    // Integer rounding: round(down, v/i, 1)*i is just floor-div
                     match strategy {
-                        RoundStrategy::Nearest => (v / i).round() * i,
-                        RoundStrategy::Up => (v / i).ceil() * i,
-                        RoundStrategy::Down => (v / i).floor() * i,
-                        RoundStrategy::ToZero => (v / i).trunc() * i,
+                        RoundStrategy::Down => v.div_euclid(i) * i,
+                        RoundStrategy::Up => (v + i - 1).div_euclid(i) * i,
+                        RoundStrategy::Nearest => ((v + i / 2).div_euclid(i)) * i,
+                        RoundStrategy::ToZero => (v / i) * i,
                     }
                 };
             }
             Op::Floor { dst, src } => {
-                slots[*dst as usize] = slots[*src as usize].floor();
+                // No-op for integers — value is already floored
+                slots[*dst as usize] = slots[*src as usize];
             }
             Op::And { dst, a, b } => {
-                let av = slots[*a as usize] as i64;
+                let av = slots[*a as usize];
                 let bv = slots[*b as usize] as u32;
-                slots[*dst as usize] = if bv >= 64 {
-                    av as f64
+                slots[*dst as usize] = if bv >= 32 {
+                    av
                 } else {
-                    (av & ((1i64 << bv) - 1)) as f64
+                    av & ((1i32 << bv) - 1)
                 };
             }
             Op::Shr { dst, a, b } => {
-                let av = slots[*a as usize] as i64;
+                let av = slots[*a as usize];
                 let bv = slots[*b as usize] as u32;
-                slots[*dst as usize] = if bv >= 64 { 0.0 } else { (av >> bv) as f64 };
+                slots[*dst as usize] = if bv >= 32 { 0 } else { av >> bv };
             }
             Op::Shl { dst, a, b } => {
-                let av = slots[*a as usize] as i64;
+                let av = slots[*a as usize];
                 let bv = slots[*b as usize] as u32;
-                slots[*dst as usize] = if bv >= 64 { 0.0 } else { (av << bv) as f64 };
+                slots[*dst as usize] = if bv >= 32 { 0 } else { av << bv };
             }
             Op::Bit { dst, val, idx } => {
-                let v = slots[*val as usize] as i64;
+                let v = slots[*val as usize];
                 let i = slots[*idx as usize] as u32;
-                slots[*dst as usize] = if i >= 64 { 0.0 } else { ((v >> i) & 1) as f64 };
+                slots[*dst as usize] = if i >= 32 { 0 } else { (v >> i) & 1 };
             }
             Op::CmpEq { dst, a, b } => {
-                slots[*dst as usize] = if (slots[*a as usize] as i64) == (slots[*b as usize] as i64)
-                {
-                    1.0
+                slots[*dst as usize] = if slots[*a as usize] == slots[*b as usize] {
+                    1
                 } else {
-                    0.0
+                    0
                 };
             }
             Op::BranchIfZero { cond, target } => {
-                if slots[*cond as usize] == 0.0 {
+                if slots[*cond as usize] == 0 {
                     pc = *target as usize;
                     continue;
                 }
@@ -1807,13 +1813,10 @@ fn exec_ops(
                 }
             }
             Op::StoreState { addr, src } => {
-                state.write_mem(*addr, slots[*src as usize] as i32);
+                state.write_mem(*addr, slots[*src as usize]);
             }
             Op::StoreMem { addr_slot, src } => {
-                state.write_mem(
-                    slots[*addr_slot as usize] as i32,
-                    slots[*src as usize] as i32,
-                );
+                state.write_mem(slots[*addr_slot as usize], slots[*src as usize]);
             }
         }
         pc += 1;
@@ -1887,9 +1890,9 @@ mod tests {
         assert_eq!(ops.len(), 1);
 
         let mut state = State::default();
-        let mut slots = vec![0.0; compiler.next_slot as usize];
+        let mut slots = vec![0i32; compiler.next_slot as usize];
         exec_ops(&ops, &[], &mut state, &mut slots);
-        assert_eq!(slots[slot as usize], 42.0);
+        assert_eq!(slots[slot as usize], 42);
     }
 
     #[test]
@@ -1903,9 +1906,9 @@ mod tests {
         let slot = compiler.compile_expr(&expr, &mut ops);
 
         let mut state = State::default();
-        let mut slots = vec![0.0; compiler.next_slot as usize];
+        let mut slots = vec![0i32; compiler.next_slot as usize];
         exec_ops(&ops, &[], &mut state, &mut slots);
-        assert_eq!(slots[slot as usize], 30.0);
+        assert_eq!(slots[slot as usize], 30);
     }
 
     #[test]
@@ -1921,9 +1924,9 @@ mod tests {
 
         let mut state = State::default();
         state.registers[state::reg::AX] = 0x1234;
-        let mut slots = vec![0.0; compiler.next_slot as usize];
+        let mut slots = vec![0i32; compiler.next_slot as usize];
         exec_ops(&ops, &[], &mut state, &mut slots);
-        assert_eq!(slots[slot as usize], 0x1234 as f64);
+        assert_eq!(slots[slot as usize], 0x1234);
     }
 
     #[test]
@@ -1954,9 +1957,9 @@ mod tests {
 
         let mut state = State::default();
         state.registers[state::reg::AX] = 2;
-        let mut slots = vec![0.0; compiler.next_slot as usize];
+        let mut slots = vec![0i32; compiler.next_slot as usize];
         exec_ops(&ops, &[], &mut state, &mut slots);
-        assert_eq!(slots[slot as usize], 200.0);
+        assert_eq!(slots[slot as usize], 200);
     }
 
     #[test]
@@ -2022,9 +2025,9 @@ mod tests {
 
         let mut state = State::default();
         state.registers[state::reg::AX] = 42;
-        let mut slots = vec![0.0; compiler.next_slot as usize];
+        let mut slots = vec![0i32; compiler.next_slot as usize];
         exec_ops(&ops, &compiler.compiled_dispatches, &mut state, &mut slots);
-        assert_eq!(slots[slot as usize], 42.0);
+        assert_eq!(slots[slot as usize], 42);
     }
 
     #[test]
@@ -2072,9 +2075,9 @@ mod tests {
         let slot = compiler.compile_expr(&expr, &mut ops);
 
         let mut state = State::default();
-        let mut slots = vec![0.0; compiler.next_slot as usize];
+        let mut slots = vec![0i32; compiler.next_slot as usize];
         exec_ops(&ops, &[], &mut state, &mut slots);
-        assert_eq!(slots[slot as usize], 15.0);
+        assert_eq!(slots[slot as usize], 15);
     }
 
     #[test]
@@ -2132,9 +2135,9 @@ mod tests {
         let slot = compiler.compile_expr(&expr, &mut ops);
 
         let mut state = State::default();
-        let mut slots = vec![0.0; compiler.next_slot as usize];
+        let mut slots = vec![0i32; compiler.next_slot as usize];
         exec_ops(&ops, &[], &mut state, &mut slots);
-        assert_eq!(slots[slot as usize], 42.0);
+        assert_eq!(slots[slot as usize], 42);
     }
 
     #[test]
