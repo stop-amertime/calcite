@@ -87,7 +87,6 @@ pub mod addr {
     pub const DL: i32 = -33;
     /// BL — low byte of BX.
     pub const BL: i32 = -34;
-
 }
 
 /// Default memory size for x86CSS (0x600 bytes = 1,536).
@@ -295,8 +294,6 @@ impl State {
         }
     }
 }
-
-
 
 impl Default for State {
     fn default() -> Self {

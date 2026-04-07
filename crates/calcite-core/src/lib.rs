@@ -5,11 +5,11 @@
 //! operations. The primary target is running x86CSS faster than Chrome's native style
 //! resolver.
 
+/// CSS expression compiler — flattens Expr trees into flat bytecode.
+pub mod compile;
 /// Chrome conformance comparison utilities (requires `conformance` feature).
 #[cfg(feature = "conformance")]
 pub mod conformance;
-/// CSS expression compiler — flattens Expr trees into flat bytecode.
-pub mod compile;
 /// Error types.
 pub mod error;
 /// Expression evaluator — runs compiled programs against flat state.

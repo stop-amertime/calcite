@@ -425,8 +425,8 @@ fn chrome_conformance_steady_state() {
     /// and reaches external function stubs + the readInput handler.
     const EXPECTED_IPS: &[i32] = &[
         292, 295, 302, 303, 307, 310, 313, // inner loop
-        901, 907, 911, 913, 915,            // outer loop
-        0x2004, 0x2006,                     // external functions (writeChar8, readInput)
+        901, 907, 911, 913, 915, // outer loop
+        0x2004, 0x2006, // external functions (writeChar8, readInput)
     ];
 
     // Print comparison for diagnostics
@@ -459,9 +459,7 @@ fn chrome_conformance_steady_state() {
     });
 
     // IP should hit expected addresses (steady-state loop + external functions)
-    let calcite_hits_expected = EXPECTED_IPS
-        .iter()
-        .any(|ip| calcite_ip_values.contains(ip));
+    let calcite_hits_expected = EXPECTED_IPS.iter().any(|ip| calcite_ip_values.contains(ip));
     assert!(
         calcite_hits_expected,
         "IP should hit expected addresses, got: {:?}",
@@ -487,7 +485,9 @@ fn chrome_conformance_steady_state() {
 
     // SI should be in a reasonable range (Chrome shows 1120-1152)
     assert!(
-        calcite_si_values.iter().all(|&si| (1100..=1300).contains(&si)),
+        calcite_si_values
+            .iter()
+            .all(|&si| (1100..=1300).contains(&si)),
         "SI should be in range 1100-1300, got: {:?}",
         calcite_si_values
     );
@@ -513,8 +513,12 @@ fn execution_trace() {
         .filter_level(log::LevelFilter::Warn)
         .try_init();
 
-    eprintln!("tick | IP   | instId | instLen | destA | destB | valA  | valB  | AX   | SP   | flags");
-    eprintln!("-----|------|--------|---------|-------|-------|-------|-------|------|------|------");
+    eprintln!(
+        "tick | IP   | instId | instLen | destA | destB | valA  | valB  | AX   | SP   | flags"
+    );
+    eprintln!(
+        "-----|------|--------|---------|-------|-------|-------|-------|------|------|------"
+    );
 
     for tick in 0..50 {
         evaluator.tick(&mut state);
@@ -528,7 +532,14 @@ fn execution_trace() {
 
         eprintln!(
             "{:4} | {:4} | {:6} | {:7} | {:5} | {:5} | {:5} | {:5} | {:4} | {:4} | {:5}",
-            tick, ip, inst_id, inst_len, dest_a, dest_b, val_a, val_b,
+            tick,
+            ip,
+            inst_id,
+            inst_len,
+            dest_a,
+            dest_b,
+            val_a,
+            val_b,
             state.registers[state::reg::AX],
             state.registers[state::reg::SP],
             state.registers[state::reg::FLAGS],
@@ -580,8 +591,16 @@ fn compiled_vs_interpreted_benchmark() {
     let speedup = interp_elapsed.as_secs_f64() / compiled_elapsed.as_secs_f64();
 
     println!("\n=== Compiled vs Interpreted Benchmark ({ticks} ticks) ===");
-    println!("  Interpreted: {:.1}ms ({:.0} ticks/sec)", interp_elapsed.as_secs_f64() * 1000.0, interp_tps);
-    println!("  Compiled:    {:.1}ms ({:.0} ticks/sec)", compiled_elapsed.as_secs_f64() * 1000.0, compiled_tps);
+    println!(
+        "  Interpreted: {:.1}ms ({:.0} ticks/sec)",
+        interp_elapsed.as_secs_f64() * 1000.0,
+        interp_tps
+    );
+    println!(
+        "  Compiled:    {:.1}ms ({:.0} ticks/sec)",
+        compiled_elapsed.as_secs_f64() * 1000.0,
+        compiled_tps
+    );
     println!("  Speedup:     {:.1}x", speedup);
 
     // Verify both paths reach same state
@@ -627,16 +646,42 @@ fn fibonacci_benchmark() {
         evaluator.tick(&mut state);
 
         // Check if text output contains the full Fibonacci sequence
-        if keyboard_set && state.string_properties.get("textBuffer").cloned().unwrap_or_default().contains("89") {
+        if keyboard_set
+            && state
+                .string_properties
+                .get("textBuffer")
+                .cloned()
+                .unwrap_or_default()
+                .contains("89")
+        {
             let elapsed = start.elapsed();
-            eprintln!("Fibonacci completed: {} ticks in {elapsed:?} ({:.0} ticks/sec)",
-                tick + 1, (tick + 1) as f64 / elapsed.as_secs_f64());
-            eprintln!("Output: {:?}", state.string_properties.get("textBuffer").cloned().unwrap_or_default());
+            eprintln!(
+                "Fibonacci completed: {} ticks in {elapsed:?} ({:.0} ticks/sec)",
+                tick + 1,
+                (tick + 1) as f64 / elapsed.as_secs_f64()
+            );
+            eprintln!(
+                "Output: {:?}",
+                state
+                    .string_properties
+                    .get("textBuffer")
+                    .cloned()
+                    .unwrap_or_default()
+            );
 
             assert!(
-                state.string_properties.get("textBuffer").cloned().unwrap_or_default().contains("Fibonacci sequence:\n0 1 1 2 3 5 8 13 21 34 55 89"),
+                state
+                    .string_properties
+                    .get("textBuffer")
+                    .cloned()
+                    .unwrap_or_default()
+                    .contains("Fibonacci sequence:\n0 1 1 2 3 5 8 13 21 34 55 89"),
                 "Expected Fibonacci sequence in output, got: {:?}",
-                state.string_properties.get("textBuffer").cloned().unwrap_or_default()
+                state
+                    .string_properties
+                    .get("textBuffer")
+                    .cloned()
+                    .unwrap_or_default()
             );
             return;
         }
@@ -644,7 +689,11 @@ fn fibonacci_benchmark() {
 
     panic!(
         "Fibonacci did not complete in {max_ticks} ticks. Output so far: {:?}",
-        state.string_properties.get("textBuffer").cloned().unwrap_or_default()
+        state
+            .string_properties
+            .get("textBuffer")
+            .cloned()
+            .unwrap_or_default()
     );
 }
 
@@ -815,8 +864,7 @@ fn compiled_vs_interpreted() {
     // Compare all registers
     for i in 0..state::reg::COUNT {
         assert_eq!(
-            state_compiled.registers[i],
-            state_interp.registers[i],
+            state_compiled.registers[i], state_interp.registers[i],
             "register {} diverged: compiled={}, interpreted={}",
             i, state_compiled.registers[i], state_interp.registers[i]
         );

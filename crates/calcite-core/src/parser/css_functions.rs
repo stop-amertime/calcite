@@ -60,25 +60,31 @@ pub fn parse_expr_list<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Expr> {
         // Try to parse another expression after whitespace.
         // Stop if we hit a delimiter or keyword that ends the list.
         let state = input.state();
-        let next = input.try_parse(|i: &mut Parser<'i, 't>| -> std::result::Result<Expr, CssParseError<'i>> {
-            // peek: is the next non-whitespace token a new expression?
-            let inner_state = i.state();
-            match i.next() {
-                Ok(Token::Ident(ref s)) if &**s == "else" || &**s == "and" || &**s == "or" => {
-                    i.reset(&inner_state);
-                    Err(i.new_custom_error(crate::CalciteError::Parse("end of expr list".into())))
+        let next = input.try_parse(
+            |i: &mut Parser<'i, 't>| -> std::result::Result<Expr, CssParseError<'i>> {
+                // peek: is the next non-whitespace token a new expression?
+                let inner_state = i.state();
+                match i.next() {
+                    Ok(Token::Ident(ref s)) if &**s == "else" || &**s == "and" || &**s == "or" => {
+                        i.reset(&inner_state);
+                        Err(i.new_custom_error(crate::CalciteError::Parse(
+                            "end of expr list".into(),
+                        )))
+                    }
+                    Ok(Token::Function(ref s)) if &**s == "style" => {
+                        i.reset(&inner_state);
+                        Err(i.new_custom_error(crate::CalciteError::Parse(
+                            "end of expr list".into(),
+                        )))
+                    }
+                    Ok(_) => {
+                        i.reset(&inner_state);
+                        parse_expr(i).map_err(|e| wrap_err(e, i.current_source_location()))
+                    }
+                    Err(e) => Err(e.into()),
                 }
-                Ok(Token::Function(ref s)) if &**s == "style" => {
-                    i.reset(&inner_state);
-                    Err(i.new_custom_error(crate::CalciteError::Parse("end of expr list".into())))
-                }
-                Ok(_) => {
-                    i.reset(&inner_state);
-                    parse_expr(i).map_err(|e| wrap_err(e, i.current_source_location()))
-                }
-                Err(e) => Err(e.into()),
-            }
-        });
+            },
+        );
         match next {
             Ok(expr) => parts.push(expr),
             Err(_) => {

@@ -8,9 +8,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::compile::{self, CompiledProgram,
-    is_var_ref, is_mod_pow2, is_right_shift, is_left_shift,
-    is_mul_refs, is_pow2_dispatch, is_bit_extract, is_dispatch_identity_read,
+use crate::compile::{
+    self, is_bit_extract, is_dispatch_identity_read, is_left_shift, is_mod_pow2, is_mul_refs,
+    is_pow2_dispatch, is_right_shift, is_var_ref, CompiledProgram,
 };
 use crate::pattern::broadcast_write::{self, BroadcastWrite};
 use crate::pattern::dispatch_table::{self, DispatchTable};
@@ -142,7 +142,10 @@ impl Evaluator {
         // Only override if we found actual mappings (preserves any pre-installed test map).
         let address_map = build_address_map(&dispatch_tables);
         if !address_map.is_empty() {
-            log::info!("Derived {} property→address mappings from CSS structure", address_map.len());
+            log::info!(
+                "Derived {} property→address mappings from CSS structure",
+                address_map.len()
+            );
             set_address_map(address_map);
         }
 
@@ -160,8 +163,9 @@ impl Evaluator {
         let mut string_property_names: HashSet<String> = HashSet::new();
         for prop in &program.properties {
             if matches!(&prop.syntax, PropertySyntax::Custom(s) if
-                s.contains("content-list") || s.contains("string")) ||
-               matches!(&prop.syntax, PropertySyntax::Any) && matches!(&prop.initial_value, Some(CssValue::String(_)))
+                s.contains("content-list") || s.contains("string"))
+                || matches!(&prop.syntax, PropertySyntax::Any)
+                    && matches!(&prop.initial_value, Some(CssValue::String(_)))
             {
                 let bare = to_bare_name(&prop.name);
                 string_property_names.insert(bare.to_string());
@@ -188,8 +192,14 @@ impl Evaluator {
             .partition(|a| string_property_names.contains(to_bare_name(&a.property)));
 
         if !string_assignments.is_empty() {
-            log::info!("String assignments (interpreter path): {}",
-                string_assignments.iter().map(|a| a.property.as_str()).collect::<Vec<_>>().join(", "));
+            log::info!(
+                "String assignments (interpreter path): {}",
+                string_assignments
+                    .iter()
+                    .map(|a| a.property.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
 
         // Topological sort: reorder assignments by data dependencies.
@@ -287,7 +297,8 @@ impl Evaluator {
             // can read intermediate computed values (e.g., --instId, --instArg1).
             for (name, &slot) in &self.compiled.property_slots {
                 if (slot as usize) < self.slots.len() {
-                    self.properties.insert(name.clone(), Value::Number(self.slots[slot as usize]));
+                    self.properties
+                        .insert(name.clone(), Value::Number(self.slots[slot as usize]));
                 }
             }
             for i in 0..self.string_assignments.len() {
@@ -306,8 +317,8 @@ impl Evaluator {
         // Detect register changes
         let mut changes = Vec::new();
         let reg_names = [
-            "--AX", "--CX", "--DX", "--BX", "--SP", "--BP", "--SI", "--DI",
-            "--IP", "--ES", "--CS", "--SS", "--DS", "--flags",
+            "--AX", "--CX", "--DX", "--BX", "--SP", "--BP", "--SI", "--DI", "--IP", "--ES", "--CS",
+            "--SS", "--DS", "--flags",
         ];
         for (i, name) in reg_names.iter().enumerate() {
             if state.registers[i] != prev_regs[i] {
@@ -541,13 +552,20 @@ fn topological_sort_assignments(
             .filter(|(pos, &orig)| pos != &orig)
             .map(|(_, &orig)| &assignments[orig].property)
             .collect();
-        log::info!("Topological sort reordered {} assignments: {:?}",
-            moved.len(), moved);
+        log::info!(
+            "Topological sort reordered {} assignments: {:?}",
+            moved.len(),
+            moved
+        );
         if log::log_enabled!(log::Level::Info) {
             for (new_pos, &orig_idx) in result.iter().enumerate() {
                 if new_pos != orig_idx {
-                    log::info!("Topological sort: {} moved from position {} to {}",
-                        assignments[orig_idx].property, orig_idx, new_pos);
+                    log::info!(
+                        "Topological sort: {} moved from position {} to {}",
+                        assignments[orig_idx].property,
+                        orig_idx,
+                        new_pos
+                    );
                 }
             }
         }
@@ -593,32 +611,34 @@ fn collect_style_deps(
                 collect_style_deps(part, defined, functions, out);
             }
         }
-        Expr::Calc(op) => {
-            match op {
-                CalcOp::Add(a, b) | CalcOp::Sub(a, b) | CalcOp::Mul(a, b)
-                | CalcOp::Div(a, b) | CalcOp::Mod(a, b) | CalcOp::Pow(a, b) => {
+        Expr::Calc(op) => match op {
+            CalcOp::Add(a, b)
+            | CalcOp::Sub(a, b)
+            | CalcOp::Mul(a, b)
+            | CalcOp::Div(a, b)
+            | CalcOp::Mod(a, b)
+            | CalcOp::Pow(a, b) => {
+                collect_style_deps(a, defined, functions, out);
+                collect_style_deps(b, defined, functions, out);
+            }
+            CalcOp::Negate(a) | CalcOp::Abs(a) | CalcOp::Sign(a) => {
+                collect_style_deps(a, defined, functions, out);
+            }
+            CalcOp::Clamp(a, b, c) => {
+                collect_style_deps(a, defined, functions, out);
+                collect_style_deps(b, defined, functions, out);
+                collect_style_deps(c, defined, functions, out);
+            }
+            CalcOp::Round(_, a, b) => {
+                collect_style_deps(a, defined, functions, out);
+                collect_style_deps(b, defined, functions, out);
+            }
+            CalcOp::Min(args) | CalcOp::Max(args) => {
+                for a in args {
                     collect_style_deps(a, defined, functions, out);
-                    collect_style_deps(b, defined, functions, out);
-                }
-                CalcOp::Negate(a) | CalcOp::Abs(a) | CalcOp::Sign(a) => {
-                    collect_style_deps(a, defined, functions, out);
-                }
-                CalcOp::Clamp(a, b, c) => {
-                    collect_style_deps(a, defined, functions, out);
-                    collect_style_deps(b, defined, functions, out);
-                    collect_style_deps(c, defined, functions, out);
-                }
-                CalcOp::Round(_, a, b) => {
-                    collect_style_deps(a, defined, functions, out);
-                    collect_style_deps(b, defined, functions, out);
-                }
-                CalcOp::Min(args) | CalcOp::Max(args) => {
-                    for a in args {
-                        collect_style_deps(a, defined, functions, out);
-                    }
                 }
             }
-        }
+        },
         Expr::StyleCondition { branches, fallback } => {
             for branch in branches {
                 collect_style_test_deps(&branch.condition, defined, functions, out);
@@ -871,8 +891,7 @@ fn detect_function_patterns(
         let params = &func.parameters;
 
         // Identity: 1 param, no locals, result = var(param)
-        if params.len() == 1 && func.locals.is_empty()
-            && is_var_ref(&func.result, &params[0].name)
+        if params.len() == 1 && func.locals.is_empty() && is_var_ref(&func.result, &params[0].name)
         {
             patterns.insert(name.clone(), FunctionPattern::Identity);
             continue;
@@ -907,9 +926,7 @@ fn detect_function_patterns(
             let p1 = &params[1].name;
             let local = &func.locals[0];
 
-            if is_mul_refs(&func.result, p0, &local.name)
-                && is_pow2_dispatch(&local.value, p1)
-            {
+            if is_mul_refs(&func.result, p0, &local.name) && is_pow2_dispatch(&local.value, p1) {
                 patterns.insert(name.clone(), FunctionPattern::LeftShift);
                 continue;
             }
@@ -959,8 +976,12 @@ fn calls_identity_read(expr: &Expr, identity_read_names: &[String]) -> bool {
         }
         Expr::Calc(op) => {
             return match op {
-                CalcOp::Add(a, b) | CalcOp::Sub(a, b) | CalcOp::Mul(a, b)
-                | CalcOp::Div(a, b) | CalcOp::Mod(a, b) | CalcOp::Pow(a, b) => {
+                CalcOp::Add(a, b)
+                | CalcOp::Sub(a, b)
+                | CalcOp::Mul(a, b)
+                | CalcOp::Div(a, b)
+                | CalcOp::Mod(a, b)
+                | CalcOp::Pow(a, b) => {
                     calls_identity_read(a, identity_read_names)
                         || calls_identity_read(b, identity_read_names)
                 }
@@ -976,12 +997,14 @@ fn calls_identity_read(expr: &Expr, identity_read_names: &[String]) -> bool {
                     calls_identity_read(a, identity_read_names)
                         || calls_identity_read(b, identity_read_names)
                 }
-                CalcOp::Min(args) | CalcOp::Max(args) => {
-                    args.iter().any(|a| calls_identity_read(a, identity_read_names))
-                }
+                CalcOp::Min(args) | CalcOp::Max(args) => args
+                    .iter()
+                    .any(|a| calls_identity_read(a, identity_read_names)),
             };
         }
-        Expr::StyleCondition { branches, fallback, .. } => {
+        Expr::StyleCondition {
+            branches, fallback, ..
+        } => {
             if calls_identity_read(fallback, identity_read_names) {
                 return true;
             }
@@ -1079,9 +1102,15 @@ impl Evaluator {
     /// Evaluate a `CalcOp` (always numeric).
     fn eval_calc(&mut self, op: &CalcOp, state: &State) -> f64 {
         match op {
-            CalcOp::Add(a, b) => self.eval_expr(a, state).as_number() + self.eval_expr(b, state).as_number(),
-            CalcOp::Sub(a, b) => self.eval_expr(a, state).as_number() - self.eval_expr(b, state).as_number(),
-            CalcOp::Mul(a, b) => self.eval_expr(a, state).as_number() * self.eval_expr(b, state).as_number(),
+            CalcOp::Add(a, b) => {
+                self.eval_expr(a, state).as_number() + self.eval_expr(b, state).as_number()
+            }
+            CalcOp::Sub(a, b) => {
+                self.eval_expr(a, state).as_number() - self.eval_expr(b, state).as_number()
+            }
+            CalcOp::Mul(a, b) => {
+                self.eval_expr(a, state).as_number() * self.eval_expr(b, state).as_number()
+            }
             CalcOp::Div(a, b) => {
                 let divisor = self.eval_expr(b, state).as_number();
                 if divisor == 0.0 {
@@ -1125,7 +1154,10 @@ impl Evaluator {
                     RoundStrategy::ToZero => (v / i).trunc() * i,
                 }
             }
-            CalcOp::Pow(base, exp) => self.eval_expr(base, state).as_number().powf(self.eval_expr(exp, state).as_number()),
+            CalcOp::Pow(base, exp) => self
+                .eval_expr(base, state)
+                .as_number()
+                .powf(self.eval_expr(exp, state).as_number()),
             CalcOp::Sign(val) => {
                 let v = self.eval_expr(val, state).as_number();
                 if v > 0.0 {
@@ -1232,7 +1264,9 @@ impl Evaluator {
                     if args.len() >= 2 {
                         let a = self.eval_expr(&args[0], state).as_number() as i64;
                         let b = self.eval_expr(&args[1], state).as_number() as u32;
-                        if b >= 64 { return Value::Number(a as f64); }
+                        if b >= 64 {
+                            return Value::Number(a as f64);
+                        }
                         return Value::Number((a & ((1i64 << b) - 1)) as f64);
                     }
                     return Value::Number(0.0);
@@ -1241,7 +1275,9 @@ impl Evaluator {
                     if args.len() >= 2 {
                         let a = self.eval_expr(&args[0], state).as_number() as i64;
                         let b = self.eval_expr(&args[1], state).as_number() as u32;
-                        if b >= 64 { return Value::Number(0.0); }
+                        if b >= 64 {
+                            return Value::Number(0.0);
+                        }
                         return Value::Number((a >> b) as f64);
                     }
                     return Value::Number(0.0);
@@ -1250,7 +1286,9 @@ impl Evaluator {
                     if args.len() >= 2 {
                         let a = self.eval_expr(&args[0], state).as_number() as i64;
                         let b = self.eval_expr(&args[1], state).as_number() as u32;
-                        if b >= 64 { return Value::Number(0.0); }
+                        if b >= 64 {
+                            return Value::Number(0.0);
+                        }
                         return Value::Number((a << b) as f64);
                     }
                     return Value::Number(0.0);
@@ -1259,7 +1297,9 @@ impl Evaluator {
                     if args.len() >= 2 {
                         let val = self.eval_expr(&args[0], state).as_number() as i64;
                         let idx = self.eval_expr(&args[1], state).as_number() as u32;
-                        if idx >= 64 { return Value::Number(0.0); }
+                        if idx >= 64 {
+                            return Value::Number(0.0);
+                        }
                         return Value::Number(((val >> idx) & 1) as f64);
                     }
                     return Value::Number(0.0);
@@ -1304,7 +1344,10 @@ impl Evaluator {
             .enumerate()
             .map(|(i, param)| {
                 let old = self.properties.get(&param.name).cloned();
-                let val = args.get(i).map(|a| self.eval_expr(a, state)).unwrap_or(Value::Number(0.0));
+                let val = args
+                    .get(i)
+                    .map(|a| self.eval_expr(a, state))
+                    .unwrap_or(Value::Number(0.0));
                 self.properties.insert(param.name.clone(), val);
                 (param.name.clone(), old)
             })
@@ -1361,7 +1404,10 @@ impl Evaluator {
                 .enumerate()
                 .map(|(i, param)| {
                     let old = self.properties.get(&param.name).cloned();
-                    let val = args.get(i).map(|a| self.eval_expr(a, state)).unwrap_or(Value::Number(0.0));
+                    let val = args
+                        .get(i)
+                        .map(|a| self.eval_expr(a, state))
+                        .unwrap_or(Value::Number(0.0));
                     self.properties.insert(param.name.clone(), val);
                     (param.name.clone(), old)
                 })
@@ -1458,7 +1504,10 @@ mod tests {
     fn eval_literal() {
         let mut eval = test_evaluator(HashMap::new(), HashMap::new());
         let state = State::default();
-        assert_eq!(eval.eval_expr(&Expr::Literal(42.0), &state).as_number(), 42.0);
+        assert_eq!(
+            eval.eval_expr(&Expr::Literal(42.0), &state).as_number(),
+            42.0
+        );
     }
 
     #[test]
@@ -1720,28 +1769,32 @@ mod tests {
             eval.eval_expr(
                 &Expr::Calc(CalcOp::Sign(Box::new(Expr::Literal(42.0)))),
                 &state
-            ).as_number(),
+            )
+            .as_number(),
             1.0
         );
         assert_eq!(
             eval.eval_expr(
                 &Expr::Calc(CalcOp::Sign(Box::new(Expr::Literal(-5.0)))),
                 &state
-            ).as_number(),
+            )
+            .as_number(),
             -1.0
         );
         assert_eq!(
             eval.eval_expr(
                 &Expr::Calc(CalcOp::Sign(Box::new(Expr::Literal(0.0)))),
                 &state
-            ).as_number(),
+            )
+            .as_number(),
             0.0
         );
         assert_eq!(
             eval.eval_expr(
                 &Expr::Calc(CalcOp::Abs(Box::new(Expr::Literal(-99.0)))),
                 &state
-            ).as_number(),
+            )
+            .as_number(),
             99.0
         );
     }

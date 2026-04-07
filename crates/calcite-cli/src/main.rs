@@ -30,7 +30,6 @@ struct Cli {
     /// Memory is read in text-mode format (char+attribute byte pairs).
     #[arg(long, value_name = "ADDR WxH", num_args = 2)]
     screen: Option<Vec<String>>,
-
 }
 
 fn parse_screen_args(args: &[String]) -> (i32, usize, usize) {
@@ -54,7 +53,10 @@ fn parse_screen_args(args: &[String]) -> (i32, usize, usize) {
             return (addr, w, h);
         }
     }
-    eprintln!("Invalid screen dimensions '{}', expected WxH (e.g. 40x25)", args[1]);
+    eprintln!(
+        "Invalid screen dimensions '{}', expected WxH (e.g. 40x25)",
+        args[1]
+    );
     std::process::exit(1);
 }
 
@@ -113,7 +115,11 @@ fn main() {
                 let batch_count = cli.ticks.saturating_sub(20);
                 if batch_count > 0 {
                     evaluator.run_batch(&mut state, batch_count);
-                    eprintln!("(batch: {} ticks, IP={})", batch_count, state.registers[calcite_core::state::reg::IP]);
+                    eprintln!(
+                        "(batch: {} ticks, IP={})",
+                        batch_count,
+                        state.registers[calcite_core::state::reg::IP]
+                    );
                 }
                 for tick in batch_count..cli.ticks {
                     let result = evaluator.tick(&mut state);

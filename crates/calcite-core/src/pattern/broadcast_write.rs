@@ -69,7 +69,9 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
                         value_expr,
                     } => {
                         // Only store the value_expr once per dest_property group
-                        direct_value_exprs.entry(dest_property.clone()).or_insert(value_expr);
+                        direct_value_exprs
+                            .entry(dest_property.clone())
+                            .or_insert(value_expr);
                         direct_groups
                             .entry(dest_property)
                             .or_default()
@@ -367,7 +369,11 @@ mod tests {
             .map(|i| make_compound_broadcast_assignment(&format!("m{i}"), i))
             .collect();
         let result = recognise_broadcast(&assignments);
-        assert_eq!(result.writes.len(), 2, "Should have 2 write ports (A and B)");
+        assert_eq!(
+            result.writes.len(),
+            2,
+            "Should have 2 write ports (A and B)"
+        );
         let write_a = result
             .writes
             .iter()
