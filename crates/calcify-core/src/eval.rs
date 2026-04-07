@@ -95,6 +95,13 @@ impl Evaluator {
             .cloned()
             .collect();
 
+        // Reorder: move --modRm* assignments before --instId.
+        // In CSS, all properties are computed simultaneously, but our sequential
+        // evaluator processes them in declaration order. The --getInstId() function
+        // references --modRm_reg via compound conditions (e.g., opcode 0xFF group),
+        // so --modRm* must be computed before --instId.
+        let assignments = reorder_modrm_before_instid(assignments);
+
         let buffer_copies = program
             .assignments
             .iter()
@@ -126,6 +133,43 @@ impl Evaluator {
 
     /// Run a single tick: evaluate all assignments against the state.
     pub fn tick(&mut self, state: &mut State) -> TickResult {
+        // Handle external function calls BEFORE evaluation.
+        // When IP is at an external function address, the CSS has RET (0xC3) there.
+        // We capture the side effects (text output) before the tick processes the RET.
+        let prev_ip = state.registers[crate::state::reg::IP];
+        match prev_ip {
+            0x2000 => {
+                // writeChar1: output 1 char from stack argument at SP+2
+                let ch = state.read_mem(state.registers[crate::state::reg::SP] + 2);
+                if ch > 0 && ch < 128 {
+                    state.text_buffer.push(ch as u8 as char);
+                }
+            }
+            0x2002 => {
+                // writeChar4: output 4 chars from string pointer at SP+2
+                let ptr = state.read_mem16(state.registers[crate::state::reg::SP] + 2);
+                for off in 0..4 {
+                    let ch = state.read_mem(ptr + off);
+                    if ch == 0 { break; }
+                    if ch > 0 && ch < 128 {
+                        state.text_buffer.push(ch as u8 as char);
+                    }
+                }
+            }
+            0x2004 => {
+                // writeChar8: output 8 chars from string pointer at SP+2
+                let ptr = state.read_mem16(state.registers[crate::state::reg::SP] + 2);
+                for off in 0..8 {
+                    let ch = state.read_mem(ptr + off);
+                    if ch == 0 { break; }
+                    if ch > 0 && ch < 128 {
+                        state.text_buffer.push(ch as u8 as char);
+                    }
+                }
+            }
+            _ => {}
+        }
+
         // Reuse the properties map — clear() retains the allocated capacity.
         self.properties.clear();
         self.call_depth = 0;
@@ -196,8 +240,16 @@ impl Evaluator {
     /// see every register/memory change — not just the final tick's delta.
     pub fn run_batch(&mut self, state: &mut State, count: u32) -> TickResult {
         let snapshot = state.clone();
-        for _ in 0..count {
+        let mut ticks_done: u32 = 0;
+        while ticks_done < count {
+            // Check if IP points to a REP prefix — if so, batch-execute natively.
+            let skipped = self.try_rep_fast_path(state);
+            if skipped > 0 {
+                ticks_done += skipped;
+                continue;
+            }
             self.tick(state);
+            ticks_done += 1;
         }
 
         // Diff registers
@@ -214,8 +266,211 @@ impl Evaluator {
 
         TickResult {
             changes,
-            ticks_executed: count,
+            ticks_executed: ticks_done,
         }
+    }
+
+    /// Attempt to fast-path a REP-prefixed string instruction.
+    ///
+    /// If IP points to a REP/REPZ (0xF3) or REPNZ (0xF2) prefix followed by
+    /// a string operation (0xA4-0xAF), execute all CX iterations natively
+    /// and return the number of ticks consumed (1). Returns 0 if not applicable.
+    fn try_rep_fast_path(&self, state: &mut State) -> u32 {
+        let ip = state.registers[crate::state::reg::IP];
+        if ip < 0 || ip as usize + 1 >= state.memory.len() {
+            return 0;
+        }
+        let prefix = state.memory[ip as usize];
+        if prefix != 0xF3 && prefix != 0xF2 {
+            return 0;
+        }
+        let opcode = state.memory[ip as usize + 1];
+        if !matches!(opcode, 0xA4..=0xAF) {
+            return 0;
+        }
+
+        let cx = state.registers[crate::state::reg::CX] & 0xFFFF;
+        if cx == 0 {
+            state.registers[crate::state::reg::IP] = ip + 2;
+            state.frame_counter += 1;
+            return 1;
+        }
+
+        let ds = state.registers[crate::state::reg::DS];
+        let es = state.registers[crate::state::reg::ES];
+        let flags = state.registers[crate::state::reg::FLAGS];
+        let df = (flags >> 10) & 1;
+
+        let is_repnz = prefix == 0xF2;
+        let is_repz = prefix == 0xF3;
+
+        let mut si = state.registers[crate::state::reg::SI] & 0xFFFF;
+        let mut di = state.registers[crate::state::reg::DI] & 0xFFFF;
+        let mut remaining = cx;
+        let mut last_flags = flags;
+        let mem_len = state.memory.len();
+
+        match opcode {
+            // STOSB: store AL to ES:DI
+            0xAA => {
+                let al = (state.registers[crate::state::reg::AX] & 0xFF) as u8;
+                for _ in 0..remaining {
+                    let addr = ((es * 16 + di) & 0xFFFFF) as usize;
+                    if addr < mem_len { state.memory[addr] = al; }
+                    di = if df == 0 { (di + 1) & 0xFFFF } else { (di - 1) & 0xFFFF };
+                }
+                remaining = 0;
+            }
+            // STOSW: store AX to ES:DI
+            0xAB => {
+                let ax = state.registers[crate::state::reg::AX] & 0xFFFF;
+                let lo = (ax & 0xFF) as u8;
+                let hi = ((ax >> 8) & 0xFF) as u8;
+                for _ in 0..remaining {
+                    let addr = ((es * 16 + di) & 0xFFFFF) as usize;
+                    if addr < mem_len { state.memory[addr] = lo; }
+                    if addr + 1 < mem_len { state.memory[addr + 1] = hi; }
+                    di = if df == 0 { (di + 2) & 0xFFFF } else { (di - 2) & 0xFFFF };
+                }
+                remaining = 0;
+            }
+            // MOVSB: copy byte DS:SI to ES:DI
+            0xA4 => {
+                for _ in 0..remaining {
+                    let src = ((ds * 16 + si) & 0xFFFFF) as usize;
+                    let dst = ((es * 16 + di) & 0xFFFFF) as usize;
+                    let byte = if src < mem_len { state.memory[src] } else { 0 };
+                    if dst < mem_len { state.memory[dst] = byte; }
+                    si = if df == 0 { (si + 1) & 0xFFFF } else { (si - 1) & 0xFFFF };
+                    di = if df == 0 { (di + 1) & 0xFFFF } else { (di - 1) & 0xFFFF };
+                }
+                remaining = 0;
+            }
+            // MOVSW: copy word DS:SI to ES:DI
+            0xA5 => {
+                for _ in 0..remaining {
+                    let src = ((ds * 16 + si) & 0xFFFFF) as usize;
+                    let dst = ((es * 16 + di) & 0xFFFFF) as usize;
+                    let lo = if src < mem_len { state.memory[src] } else { 0 };
+                    let hi = if src + 1 < mem_len { state.memory[src + 1] } else { 0 };
+                    if dst < mem_len { state.memory[dst] = lo; }
+                    if dst + 1 < mem_len { state.memory[dst + 1] = hi; }
+                    si = if df == 0 { (si + 2) & 0xFFFF } else { (si - 2) & 0xFFFF };
+                    di = if df == 0 { (di + 2) & 0xFFFF } else { (di - 2) & 0xFFFF };
+                }
+                remaining = 0;
+            }
+            // SCASB: compare AL with ES:DI byte
+            0xAE => {
+                let al = state.registers[crate::state::reg::AX] & 0xFF;
+                while remaining > 0 {
+                    let addr = ((es * 16 + di) & 0xFFFFF) as usize;
+                    let byte = if addr < mem_len { state.memory[addr] as i32 } else { 0 };
+                    di = if df == 0 { (di + 1) & 0xFFFF } else { (di - 1) & 0xFFFF };
+                    remaining -= 1;
+                    let diff = (al - byte) & 0xFF;
+                    let zf = if diff == 0 { 1 } else { 0 };
+                    last_flags = (last_flags & !0xC5) | (zf << 6)
+                        | (if diff & 0x80 != 0 { 0x80 } else { 0 })
+                        | (if al < byte { 1 } else { 0 });
+                    if is_repnz && zf == 1 { break; }
+                    if is_repz && zf == 0 { break; }
+                }
+            }
+            // SCASW: compare AX with ES:DI word
+            0xAF => {
+                let ax = state.registers[crate::state::reg::AX] & 0xFFFF;
+                while remaining > 0 {
+                    let addr = ((es * 16 + di) & 0xFFFFF) as usize;
+                    let lo = if addr < mem_len { state.memory[addr] as i32 } else { 0 };
+                    let hi = if addr + 1 < mem_len { state.memory[addr + 1] as i32 } else { 0 };
+                    let word = lo + hi * 256;
+                    di = if df == 0 { (di + 2) & 0xFFFF } else { (di - 2) & 0xFFFF };
+                    remaining -= 1;
+                    let diff = (ax - word) & 0xFFFF;
+                    let zf = if diff == 0 { 1 } else { 0 };
+                    last_flags = (last_flags & !0xC5) | (zf << 6)
+                        | (if diff & 0x8000 != 0 { 0x80 } else { 0 })
+                        | (if ax < word { 1 } else { 0 });
+                    if is_repnz && zf == 1 { break; }
+                    if is_repz && zf == 0 { break; }
+                }
+            }
+            // CMPSB: compare DS:SI byte with ES:DI byte
+            0xA6 => {
+                while remaining > 0 {
+                    let src = ((ds * 16 + si) & 0xFFFFF) as usize;
+                    let dst = ((es * 16 + di) & 0xFFFFF) as usize;
+                    let a = if src < mem_len { state.memory[src] as i32 } else { 0 };
+                    let b = if dst < mem_len { state.memory[dst] as i32 } else { 0 };
+                    si = if df == 0 { (si + 1) & 0xFFFF } else { (si - 1) & 0xFFFF };
+                    di = if df == 0 { (di + 1) & 0xFFFF } else { (di - 1) & 0xFFFF };
+                    remaining -= 1;
+                    let diff = (a - b) & 0xFF;
+                    let zf = if diff == 0 { 1 } else { 0 };
+                    last_flags = (last_flags & !0xC5) | (zf << 6)
+                        | (if diff & 0x80 != 0 { 0x80 } else { 0 })
+                        | (if a < b { 1 } else { 0 });
+                    if is_repnz && zf == 1 { break; }
+                    if is_repz && zf == 0 { break; }
+                }
+            }
+            // CMPSW: compare DS:SI word with ES:DI word
+            0xA7 => {
+                while remaining > 0 {
+                    let src = ((ds * 16 + si) & 0xFFFFF) as usize;
+                    let dst = ((es * 16 + di) & 0xFFFFF) as usize;
+                    let a = if src < mem_len { state.memory[src] as i32 } else { 0 };
+                    let a_hi = if src + 1 < mem_len { state.memory[src + 1] as i32 } else { 0 };
+                    let b = if dst < mem_len { state.memory[dst] as i32 } else { 0 };
+                    let b_hi = if dst + 1 < mem_len { state.memory[dst + 1] as i32 } else { 0 };
+                    let a_word = a + a_hi * 256;
+                    let b_word = b + b_hi * 256;
+                    si = if df == 0 { (si + 2) & 0xFFFF } else { (si - 2) & 0xFFFF };
+                    di = if df == 0 { (di + 2) & 0xFFFF } else { (di - 2) & 0xFFFF };
+                    remaining -= 1;
+                    let diff = (a_word - b_word) & 0xFFFF;
+                    let zf = if diff == 0 { 1 } else { 0 };
+                    last_flags = (last_flags & !0xC5) | (zf << 6)
+                        | (if diff & 0x8000 != 0 { 0x80 } else { 0 })
+                        | (if a_word < b_word { 1 } else { 0 });
+                    if is_repnz && zf == 1 { break; }
+                    if is_repz && zf == 0 { break; }
+                }
+            }
+            // LODSB: load byte from DS:SI into AL
+            0xAC => {
+                for _ in 0..remaining {
+                    let src = ((ds * 16 + si) & 0xFFFFF) as usize;
+                    let byte = if src < mem_len { state.memory[src] as i32 } else { 0 };
+                    state.registers[crate::state::reg::AX] =
+                        (state.registers[crate::state::reg::AX] & 0xFF00) | (byte & 0xFF);
+                    si = if df == 0 { (si + 1) & 0xFFFF } else { (si - 1) & 0xFFFF };
+                }
+                remaining = 0;
+            }
+            // LODSW: load word from DS:SI into AX
+            0xAD => {
+                for _ in 0..remaining {
+                    let src = ((ds * 16 + si) & 0xFFFFF) as usize;
+                    let lo = if src < mem_len { state.memory[src] as i32 } else { 0 };
+                    let hi = if src + 1 < mem_len { state.memory[src + 1] as i32 } else { 0 };
+                    state.registers[crate::state::reg::AX] = lo + hi * 256;
+                    si = if df == 0 { (si + 2) & 0xFFFF } else { (si - 2) & 0xFFFF };
+                }
+                remaining = 0;
+            }
+            // 0xA8/0xA9 are TEST, not string ops — shouldn't match
+            _ => return 0,
+        }
+
+        state.registers[crate::state::reg::CX] = remaining;
+        state.registers[crate::state::reg::SI] = si;
+        state.registers[crate::state::reg::DI] = di;
+        state.registers[crate::state::reg::FLAGS] = last_flags;
+        state.registers[crate::state::reg::IP] = ip + 2;
+        state.frame_counter += 1;
+        1
     }
 
     /// Apply computed property values to state and return the changes.
@@ -232,6 +487,18 @@ impl Evaluator {
             if name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2") {
                 continue;
             }
+            // Skip byte-half properties (AL/AH/BL/BH/CL/CH/DL/DH).
+            // In CSS, these are read-only views of the full register: e.g.
+            //   --AL: --lowerBytes(var(--__1AX), 8)
+            //   --AH: --rightShift(var(--__1AX), 8)
+            // The full register formulas (--AX, etc.) already handle byte
+            // merging when a byte write occurs: e.g. destA==-31 (AL) triggers
+            //   --AX: floor(AX/256)*256 + lowerBytes(valA, 8)
+            // Writing the byte halves back would clobber the updated full
+            // register with stale values from the OLD tick.
+            if is_byte_half(name) {
+                continue;
+            }
             let int_val = value as i32;
             // Map well-known property names to state addresses
             if let Some(addr) = property_to_address(name) {
@@ -245,6 +512,62 @@ impl Evaluator {
 
         changes
     }
+}
+
+/// Reorder assignments so `--modRm*` properties are computed before `--instId`.
+///
+/// CSS evaluates all custom properties simultaneously, but our sequential evaluator
+/// processes them in declaration order. The `--getInstId()` function references
+/// `--modRm_reg` in compound conditions to distinguish instruction group encodings
+/// (e.g., opcode 0xFF can be INC, DEC, CALL, JMP, or PUSH depending on the ModR/M
+/// reg field). Without reordering, `--modRm_reg` defaults to 0 and all 0xFF group
+/// instructions are incorrectly decoded as INC.
+fn reorder_modrm_before_instid(mut assignments: Vec<Assignment>) -> Vec<Assignment> {
+    // Find the position of --instId
+    let inst_id_pos = assignments.iter().position(|a| a.property == "--instId");
+    if inst_id_pos.is_none() {
+        return assignments;
+    }
+    let inst_id_pos = inst_id_pos.unwrap();
+
+    // Find all --modRm* assignments that come AFTER --instId
+    let modrm_names = ["--modRm", "--modRm_rm", "--modRm_reg", "--modRm_mod"];
+    let mut to_move = Vec::new();
+    let mut i = assignments.len();
+    while i > inst_id_pos + 1 {
+        i -= 1;
+        if modrm_names.contains(&assignments[i].property.as_str()) {
+            to_move.push(assignments.remove(i));
+        }
+    }
+    if to_move.is_empty() {
+        return assignments;
+    }
+
+    // Re-find instId position (may have shifted after removals)
+    let inst_id_pos = assignments
+        .iter()
+        .position(|a| a.property == "--instId")
+        .unwrap();
+
+    // Insert the modRm assignments before --instId, in their original relative order
+    to_move.reverse();
+    for (offset, a) in to_move.into_iter().enumerate() {
+        log::info!("Reordering {} before --instId", a.property);
+        assignments.insert(inst_id_pos + offset, a);
+    }
+
+    assignments
+}
+
+/// Check if a property names a byte-half register (AL, AH, BL, BH, etc.).
+///
+/// In CSS, these are read-only views computed from the full register each tick.
+/// The full register formula (e.g. `--AX`) handles byte merging on writes,
+/// so byte halves must NOT write back to state (they'd clobber with stale values).
+fn is_byte_half(name: &str) -> bool {
+    let bare = to_bare_name(name);
+    matches!(bare, "AL" | "AH" | "BL" | "BH" | "CL" | "CH" | "DL" | "DH")
 }
 
 /// Check if a property is a triple-buffer copy (`--__0*`, `--__1*`, `--__2*`).
@@ -494,16 +817,90 @@ impl Evaluator {
             return 0.0;
         }
 
+        // Fast paths for common x86CSS helper functions.
+        // These replace dispatch table lookups and CSS expression evaluation
+        // with direct native operations.
+        match name {
+            // --readMem(addr) → direct state memory/register read.
+            "--readMem" => {
+                if let Some(arg) = args.first() {
+                    let addr = self.eval_expr(arg, state) as i32;
+                    return state.read_mem(addr) as f64;
+                }
+                return 0.0;
+            }
+            // --read2(addr) → 16-bit little-endian word read.
+            "--read2" => {
+                if let Some(arg) = args.first() {
+                    let addr = self.eval_expr(arg, state) as i32;
+                    if addr < 0 {
+                        // Negative addresses are registers — read as single value
+                        return state.read_mem(addr) as f64;
+                    }
+                    return state.read_mem16(addr) as f64;
+                }
+                return 0.0;
+            }
+            // --lowerBytes(a, b) → a % 2^b = a & ((1 << b) - 1)
+            "--lowerBytes" => {
+                if args.len() >= 2 {
+                    let a = self.eval_expr(&args[0], state) as i64;
+                    let b = self.eval_expr(&args[1], state) as u32;
+                    if b >= 64 { return a as f64; }
+                    return (a & ((1i64 << b) - 1)) as f64;
+                }
+                return 0.0;
+            }
+            // --rightShift(a, b) → floor(a / 2^b)
+            "--rightShift" => {
+                if args.len() >= 2 {
+                    let a = self.eval_expr(&args[0], state) as i64;
+                    let b = self.eval_expr(&args[1], state) as u32;
+                    if b >= 64 { return 0.0; }
+                    return (a >> b) as f64;
+                }
+                return 0.0;
+            }
+            // --leftShift(a, b) → a * 2^b
+            "--leftShift" => {
+                if args.len() >= 2 {
+                    let a = self.eval_expr(&args[0], state) as i64;
+                    let b = self.eval_expr(&args[1], state) as u32;
+                    if b >= 64 { return 0.0; }
+                    return (a << b) as f64;
+                }
+                return 0.0;
+            }
+            // --bit(val, idx) → (val >> idx) & 1
+            "--bit" => {
+                if args.len() >= 2 {
+                    let val = self.eval_expr(&args[0], state) as i64;
+                    let idx = self.eval_expr(&args[1], state) as u32;
+                    if idx >= 64 { return 0.0; }
+                    return ((val >> idx) & 1) as f64;
+                }
+                return 0.0;
+            }
+            // --int(i) → identity (no-op)
+            "--int" => {
+                if let Some(arg) = args.first() {
+                    return self.eval_expr(arg, state);
+                }
+                return 0.0;
+            }
+            _ => {}
+        }
+
         // Check for a dispatch table optimisation.
         if let Some(table) = self.dispatch_tables.get(name) {
-            let table_key = table.key_property.clone();
+            let table_key = &table.key_property as *const String;
             let table_entries = &table.entries as *const HashMap<i64, Expr>;
             let table_fallback = &table.fallback as *const Expr;
             // SAFETY: dispatch_tables is not modified during evaluation.
             return unsafe {
                 self.eval_dispatch_raw(
                     name,
-                    &table_key,
+                    &*table_key,
                     &*table_entries,
                     &*table_fallback,
                     args,
@@ -550,6 +947,7 @@ impl Evaluator {
             .collect();
 
         let result = self.eval_expr(&func.result, state);
+
 
         // Restore previous property values
         for (name, old) in old_props.into_iter().chain(old_locals) {

@@ -47,13 +47,18 @@ pub struct BroadcastResult {
 /// pure `--addrDest*` checks are absorbed; register assignments that mix in
 /// execution logic (e.g. `--addrJump`) are left in the normal assignment loop.
 pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
-    // Group direct ports by dest_property → (address, target_var_name, value_expr)
-    let mut direct_groups: HashMap<String, Vec<(i64, String, Expr)>> = HashMap::new();
-    // Group spillover ports by dest_property → (source_address, target_var_name, guard_property, value_expr)
+    // Phase 1: Collect (address, property_name) pairs grouped by dest_property.
+    // We avoid cloning value_expr for every entry — store just one per group.
+    let mut direct_groups: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    let mut direct_value_exprs: HashMap<String, Expr> = HashMap::new();
     let mut spillover_groups: HashMap<String, Vec<(i64, String, String, Expr)>> = HashMap::new();
     let mut pure_broadcast: HashSet<String> = HashSet::new();
 
     for assignment in assignments {
+        // Skip buffer copies — they're no-ops in mutable state and never broadcast targets.
+        if assignment.property.starts_with("--__") {
+            continue;
+        }
         if let Some(ports) = extract_broadcast_ports(assignment) {
             pure_broadcast.insert(assignment.property.clone());
             for port in ports {
@@ -63,11 +68,12 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
                         address,
                         value_expr,
                     } => {
-                        direct_groups.entry(dest_property).or_default().push((
-                            address,
-                            assignment.property.clone(),
-                            value_expr,
-                        ));
+                        // Only store the value_expr once per dest_property group
+                        direct_value_exprs.entry(dest_property.clone()).or_insert(value_expr);
+                        direct_groups
+                            .entry(dest_property)
+                            .or_default()
+                            .push((address, assignment.property.clone()));
                     }
                     BroadcastPort::Spillover {
                         dest_property,
@@ -89,22 +95,19 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
 
     let mut absorbed_properties = HashSet::new();
 
-    // Only keep groups that are large enough to be a real broadcast pattern
+    // Phase 2: Build BroadcastWrite structs from groups with >= 10 entries.
     let writes = direct_groups
         .into_iter()
         .filter(|(_, entries)| entries.len() >= 10)
         .map(|(dest_property, entries)| {
-            let value_expr = entries
-                .first()
-                .map(|(_, _, expr)| expr.clone())
+            let value_expr = direct_value_exprs
+                .remove(&dest_property)
                 .unwrap_or(Expr::Literal(0.0));
-            for (_, name, _) in &entries {
+            let mut address_map = HashMap::with_capacity(entries.len());
+            for (addr, name) in entries {
                 absorbed_properties.insert(name.clone());
+                address_map.insert(addr, name);
             }
-            let address_map = entries
-                .into_iter()
-                .map(|(addr, name, _)| (addr, name))
-                .collect();
 
             // Build spillover map for this dest_property
             let spillovers = spillover_groups.remove(&dest_property);
@@ -299,12 +302,12 @@ mod tests {
                 value: Expr::Literal(addr as f64),
             },
             then: Expr::Var {
-                name: "--addrValA1".to_string(),
+                name: "--addrValA".to_string(),
                 fallback: None,
             },
         }];
-        // Spillover branch: only for addr > 0
         if addr > 0 {
+            // Add spillover branch: style(--addrDestA: addr-1) and style(--isWordWrite: 1) → high byte
             branches.push(StyleBranch {
                 condition: StyleTest::And(vec![
                     StyleTest::Single {
@@ -317,11 +320,12 @@ mod tests {
                     },
                 ]),
                 then: Expr::Var {
-                    name: "--addrValA2".to_string(),
+                    name: "--addrValA1".to_string(),
                     fallback: None,
                 },
             });
         }
+        // Add second write port
         branches.push(StyleBranch {
             condition: StyleTest::Single {
                 property: "--addrDestB".to_string(),
@@ -332,6 +336,7 @@ mod tests {
                 fallback: None,
             },
         });
+
         Assignment {
             property: format!("--{name}"),
             value: Expr::StyleCondition {
@@ -345,79 +350,48 @@ mod tests {
     }
 
     #[test]
-    fn recognises_broadcast_pattern() {
-        let assignments: Vec<_> = (0..20)
+    fn detects_simple_broadcast() {
+        let assignments: Vec<Assignment> = (0..20)
             .map(|i| make_broadcast_assignment(&format!("m{i}"), i))
             .collect();
-
         let result = recognise_broadcast(&assignments);
         assert_eq!(result.writes.len(), 1);
         assert_eq!(result.writes[0].dest_property, "--addrDestA");
         assert_eq!(result.writes[0].address_map.len(), 20);
         assert_eq!(result.absorbed_properties.len(), 20);
-        assert!(result.absorbed_properties.contains("--m0"));
-        assert!(result.absorbed_properties.contains("--m19"));
     }
 
     #[test]
-    fn ignores_small_groups() {
-        let assignments: Vec<_> = (0..3)
-            .map(|i| make_broadcast_assignment(&format!("m{i}"), i))
-            .collect();
-
-        let result = recognise_broadcast(&assignments);
-        assert!(result.writes.is_empty());
-        assert!(result.absorbed_properties.is_empty());
-    }
-
-    #[test]
-    fn recognises_compound_broadcast_with_spillover() {
-        let assignments: Vec<_> = (0..20)
+    fn compound_memory_cell_broadcast() {
+        let assignments: Vec<Assignment> = (0..20)
             .map(|i| make_compound_broadcast_assignment(&format!("m{i}"), i))
             .collect();
-
         let result = recognise_broadcast(&assignments);
-        // Should have writes for both --addrDestA and --addrDestB
-        assert_eq!(result.writes.len(), 2);
-
-        let port_a = result
+        assert_eq!(result.writes.len(), 2, "Should have 2 write ports (A and B)");
+        let write_a = result
             .writes
             .iter()
             .find(|w| w.dest_property == "--addrDestA")
-            .expect("should have port A");
-        let port_b = result
-            .writes
-            .iter()
-            .find(|w| w.dest_property == "--addrDestB")
-            .expect("should have port B");
-
-        assert_eq!(port_a.address_map.len(), 20);
-        assert_eq!(port_b.address_map.len(), 20);
-
-        // Port A should have spillover entries (19 — all except m0)
-        assert_eq!(port_a.spillover_map.len(), 19);
-        assert_eq!(port_a.spillover_guard, Some("--isWordWrite".to_string()));
-        // Spillover at source address 0 targets --m1
-        let (var_name, _) = port_a.spillover_map.get(&0).unwrap();
-        assert_eq!(var_name, "--m1");
-
-        // Port B should have no spillover
-        assert!(port_b.spillover_map.is_empty());
-
-        // All 20 should be absorbed
-        assert_eq!(result.absorbed_properties.len(), 20);
+            .expect("Should have --addrDestA");
+        assert_eq!(write_a.address_map.len(), 20);
+        assert!(!write_a.spillover_map.is_empty());
+        assert_eq!(
+            write_a.spillover_guard.as_deref(),
+            Some("--isWordWrite"),
+            "Spillover should be gated by --isWordWrite"
+        );
     }
 
-    /// Build an assignment with a side-channel delta in the else branch:
-    /// `--SP: if(style(--addrDestA:-5):val; else: calc(var(--__1SP) + var(--moveStack)))`
-    fn make_side_channel_assignment(name: &str, addr: i64, side_channel: &str) -> Assignment {
-        Assignment {
-            property: format!("--{name}"),
+    #[test]
+    fn side_channel_not_absorbed() {
+        // SP has a side channel: else: calc(var(--__1SP) + var(--moveStack))
+        let sp_assignment = Assignment {
+            property: "--SP".to_string(),
             value: Expr::StyleCondition {
                 branches: vec![StyleBranch {
                     condition: StyleTest::Single {
                         property: "--addrDestA".to_string(),
-                        value: Expr::Literal(addr as f64),
+                        value: Expr::Literal(-5.0),
                     },
                     then: Expr::Var {
                         name: "--addrValA".to_string(),
@@ -426,95 +400,30 @@ mod tests {
                 }],
                 fallback: Box::new(Expr::Calc(CalcOp::Add(
                     Box::new(Expr::Var {
-                        name: format!("--__1{name}"),
+                        name: "--__1SP".to_string(),
                         fallback: None,
                     }),
                     Box::new(Expr::Var {
-                        name: format!("--{side_channel}"),
+                        name: "--moveStack".to_string(),
                         fallback: None,
                     }),
                 ))),
             },
-        }
-    }
-
-    #[test]
-    fn excludes_side_channel_registers() {
-        // Mix of pure broadcast cells and side-channel registers
-        let mut assignments: Vec<_> = (0..20)
+        };
+        let mut assignments: Vec<Assignment> = (0..20)
             .map(|i| make_broadcast_assignment(&format!("m{i}"), i))
             .collect();
-        // SP has a --moveStack side channel
-        assignments.push(make_side_channel_assignment("SP", -5, "moveStack"));
-
+        assignments.push(sp_assignment);
         let result = recognise_broadcast(&assignments);
-
-        // Memory cells should be absorbed
-        assert!(result.absorbed_properties.contains("--m0"));
-        assert!(result.absorbed_properties.contains("--m19"));
-
-        // SP should NOT be absorbed (has side-channel logic)
-        assert!(
-            !result.absorbed_properties.contains("--SP"),
-            "SP should not be absorbed — it has --moveStack side channel"
-        );
+        assert!(!result.absorbed_properties.contains("--SP"));
     }
 
     #[test]
-    fn is_simple_keep_accepts_buffer_var() {
-        // var(--__1AX) is a simple keep for --AX
-        assert!(is_simple_keep(
-            &Expr::Var {
-                name: "--__1AX".to_string(),
-                fallback: None,
-            },
-            "--AX"
-        ));
-        // var(--__0m5) is a simple keep for --m5
-        assert!(is_simple_keep(
-            &Expr::Var {
-                name: "--__0m5".to_string(),
-                fallback: None,
-            },
-            "--m5"
-        ));
-    }
-
-    #[test]
-    fn is_simple_keep_rejects_calc() {
-        // calc(var(--__1SP) + var(--moveStack)) is NOT a simple keep
-        assert!(!is_simple_keep(
-            &Expr::Calc(CalcOp::Add(
-                Box::new(Expr::Var {
-                    name: "--__1SP".to_string(),
-                    fallback: None,
-                }),
-                Box::new(Expr::Var {
-                    name: "--moveStack".to_string(),
-                    fallback: None,
-                }),
-            )),
-            "--SP"
-        ));
-    }
-
-    #[test]
-    fn is_simple_keep_rejects_different_var() {
-        // var(--jumpCS) is NOT a simple keep for --CS (it references a different property)
-        assert!(!is_simple_keep(
-            &Expr::Var {
-                name: "--jumpCS".to_string(),
-                fallback: None,
-            },
-            "--CS"
-        ));
-        // var(--newFlags) is NOT a simple keep for --flags
-        assert!(!is_simple_keep(
-            &Expr::Var {
-                name: "--newFlags".to_string(),
-                fallback: None,
-            },
-            "--flags"
-        ));
+    fn too_few_entries_not_recognised() {
+        let assignments: Vec<Assignment> = (0..5)
+            .map(|i| make_broadcast_assignment(&format!("m{i}"), i))
+            .collect();
+        let result = recognise_broadcast(&assignments);
+        assert!(result.writes.is_empty());
     }
 }

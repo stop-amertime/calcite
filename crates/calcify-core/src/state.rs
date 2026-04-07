@@ -88,13 +88,14 @@ pub mod addr {
     /// BL — low byte of BX.
     pub const BL: i32 = -34;
 
-    /// Base address for external function addresses (0x2000–0x200F).
-    pub const EXT_BASE: i32 = 0x2000;
-    /// BIOS write character function (INT 10h AH=0Eh).
-    pub const EXT_WRITE_CHAR: i32 = 0x2006;
-
-    /// Base address for external I/O (0x2100–0x210F).
-    pub const EXT_IO_BASE: i32 = 0x2100;
+    /// writeChar1: output 1 character from stack.
+    pub const EXT_WRITE_CHAR1: i32 = 0x2000;
+    /// writeChar4: output 4 characters from string pointer.
+    pub const EXT_WRITE_CHAR4: i32 = 0x2002;
+    /// writeChar8: output 8 characters from string pointer.
+    pub const EXT_WRITE_CHAR8: i32 = 0x2004;
+    /// readInput: read keyboard input into AX.
+    pub const EXT_READ_INPUT: i32 = 0x2006;
 }
 
 /// Default memory size for x86CSS (0x600 bytes = 1,536).
@@ -189,7 +190,10 @@ impl State {
                 let lo = Self::lo8(self.registers[reg_idx]);
                 self.registers[reg_idx] = (value & 0xFF) * 256 + lo;
             }
-            // Write to full register (mask to 16 bits — x86 8088 registers are 16-bit)
+            // Write to full 16-bit register — mask to 16 bits.
+            // x86 registers are 16-bit unsigned; CSS uses --lowerBytes() for
+            // truncation but intermediate values can overflow. Masking here
+            // ensures register values stay in 0..65535 range.
             -14..=-1 => {
                 let reg_idx = (-addr - 1) as usize;
                 self.registers[reg_idx] = value & 0xFFFF;
@@ -220,6 +224,20 @@ impl State {
     pub fn load_properties(&mut self, properties: &[crate::types::PropertyDef]) {
         use crate::types::CssValue;
 
+        // First pass: find the maximum memory address to size the array
+        let mut max_addr: usize = 0;
+        for prop in properties {
+            if let Some(addr) = super::eval::property_to_address(&prop.name) {
+                if addr >= 0 {
+                    max_addr = max_addr.max(addr as usize + 1);
+                }
+            }
+        }
+        if max_addr > self.memory.len() {
+            self.memory.resize(max_addr, 0);
+        }
+
+        // Second pass: load values
         for prop in properties {
             let value = match &prop.initial_value {
                 Some(CssValue::Integer(v)) => *v as i32,
@@ -324,16 +342,16 @@ mod tests {
     }
 
     #[test]
-    fn register_write_masks_to_16_bits() {
+    fn register_write_stores_full_value() {
         let mut state = State::default();
-        // Values exceeding 16 bits should be masked
+        // Full register writes are masked to 16 bits (x86 registers are 16-bit).
         state.write_mem(addr::AX, 0x1_ABCD);
         assert_eq!(state.registers[reg::AX], 0xABCD);
 
-        state.write_mem(addr::SP, 0xFFFF_FFFF_u32 as i32);
-        assert_eq!(state.registers[reg::SP], 0xFFFF);
+        state.write_mem(addr::SP, -2);
+        assert_eq!(state.registers[reg::SP], 0xFFFE);
 
         state.write_mem(addr::FLAGS, 0x10000);
-        assert_eq!(state.registers[reg::FLAGS], 0);
+        assert_eq!(state.registers[reg::FLAGS], 0); // masked to 16 bits
     }
 }

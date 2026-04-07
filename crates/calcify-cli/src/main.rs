@@ -43,28 +43,49 @@ fn main() {
         cli.input.display()
     );
 
+    let t0 = std::time::Instant::now();
     match calcify_core::parser::parse_css(&css) {
         Ok(parsed) => {
+            let parse_time = t0.elapsed();
             println!(
-                "Parsed: {} @property, {} @function, {} assignments",
+                "Parsed: {} @property, {} @function, {} assignments ({:.2}s)",
                 parsed.properties.len(),
                 parsed.functions.len(),
                 parsed.assignments.len(),
+                parse_time.as_secs_f64(),
             );
 
             if cli.parse_only {
                 return;
             }
 
+            let t1 = std::time::Instant::now();
             let mut evaluator = calcify_core::Evaluator::from_parsed(&parsed);
+            let compile_time = t1.elapsed();
+
             let mut state = calcify_core::State::default();
             state.load_properties(&parsed.properties);
 
-            for tick in 0..cli.ticks {
-                let result = evaluator.tick(&mut state);
-                if cli.verbose {
+            eprintln!(
+                "Compiled: {:.2}s (parse {:.2}s + compile {:.2}s)",
+                (parse_time + compile_time).as_secs_f64(),
+                parse_time.as_secs_f64(),
+                compile_time.as_secs_f64(),
+            );
+
+            let t2 = std::time::Instant::now();
+            if cli.verbose {
+                // In verbose mode, use run_batch for the first 90% of ticks,
+                // then switch to per-tick output for the last 10%.
+                let batch_count = cli.ticks.saturating_sub(20);
+                if batch_count > 0 {
+                    evaluator.run_batch(&mut state, batch_count);
+                    eprintln!("(batch: {} ticks, IP={})", batch_count, state.registers[calcify_core::state::reg::IP]);
+                }
+                for tick in batch_count..cli.ticks {
+                    let result = evaluator.tick(&mut state);
                     println!(
-                        "Tick {tick}: {} changes | AX={} CX={} DX={} BX={} SP={} BP={} SI={} DI={} IP={} flags={}",
+                        "Tick {tick}: {} changes | AX={} CX={} DX={} BX={} SP={} BP={} SI={} DI={} IP={} ES={} CS={} SS={} DS={} flags={}",
                         result.changes.len(),
                         state.registers[calcify_core::state::reg::AX],
                         state.registers[calcify_core::state::reg::CX],
@@ -75,10 +96,17 @@ fn main() {
                         state.registers[calcify_core::state::reg::SI],
                         state.registers[calcify_core::state::reg::DI],
                         state.registers[calcify_core::state::reg::IP],
+                        state.registers[calcify_core::state::reg::ES],
+                        state.registers[calcify_core::state::reg::CS],
+                        state.registers[calcify_core::state::reg::SS],
+                        state.registers[calcify_core::state::reg::DS],
                         state.registers[calcify_core::state::reg::FLAGS],
                     );
                 }
+            } else {
+                evaluator.run_batch(&mut state, cli.ticks);
             }
+            let tick_time = t2.elapsed();
 
             if !cli.verbose {
                 println!(
@@ -89,6 +117,11 @@ fn main() {
                     state.registers[calcify_core::state::reg::IP],
                 );
             }
+            eprintln!(
+                "Ticks: {:.3}s ({:.0} ticks/sec)",
+                tick_time.as_secs_f64(),
+                cli.ticks as f64 / tick_time.as_secs_f64(),
+            );
         }
         Err(e) => {
             eprintln!("Parse error: {e}");
