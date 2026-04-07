@@ -1469,24 +1469,27 @@ fn compact_sub_ops(
     let mut alloc = SlotAllocator::with_base(base_slot);
     let (_last_use, dying_at) = compute_liveness(ops);
 
-    // Pre-seed with parent mappings for slots that originated in the main stream.
-    // These slots already have their final indices from the parent pass.
-    let mut slot_map: HashMap<Slot, Slot> = parent_slot_map.clone();
+    // Use a small local map for sub-op slots, falling back to parent map.
+    // Avoids cloning the (potentially huge) parent map for each entry.
+    let mut local_map: HashMap<Slot, Slot> = HashMap::new();
 
     // Pre-assign the result slot (if not already mapped from parent)
     let orig_result = *result_slot;
-    if let std::collections::hash_map::Entry::Vacant(e) = slot_map.entry(orig_result) {
+    if !parent_slot_map.contains_key(&orig_result) {
         alloc.assign(orig_result);
-        e.insert(alloc.get(orig_result));
+        local_map.insert(orig_result, alloc.get(orig_result));
     }
 
     for (i, op) in ops.iter_mut().enumerate() {
-        map_op_slots(op, &mut slot_map, &mut alloc);
+        // Seed local map from parent for any slots referenced by this op
+        // that we haven't seen yet. This avoids cloning the entire parent map.
+        seed_from_parent(op, &mut local_map, parent_slot_map);
+        map_op_slots(op, &mut local_map, &mut alloc);
         // Free dead slots that are NOT from the parent scope
         if let Some(dying) = dying_at.get(&i) {
             for &orig_slot in dying {
                 if orig_slot != orig_result && !parent_slot_map.contains_key(&orig_slot) {
-                    if let Some(&mapped) = slot_map.get(&orig_slot) {
+                    if let Some(&mapped) = local_map.get(&orig_slot) {
                         alloc.free(mapped);
                     }
                 }
@@ -1494,7 +1497,11 @@ fn compact_sub_ops(
         }
     }
 
-    *result_slot = slot_map[&orig_result];
+    *result_slot = local_map
+        .get(&orig_result)
+        .or_else(|| parent_slot_map.get(&orig_result))
+        .copied()
+        .unwrap_or(orig_result);
     alloc.high_water
 }
 
@@ -1736,6 +1743,45 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
             *addr_slot = alloc.get_or_alloc(*addr_slot, slot_map);
             *src = alloc.get_or_alloc(*src, slot_map);
         }
+    }
+}
+
+/// Seed a local slot map from a parent map for all slots referenced by an op.
+/// This avoids cloning the entire parent map — only slots actually used get copied.
+fn seed_from_parent(
+    op: &Op,
+    local_map: &mut HashMap<Slot, Slot>,
+    parent_map: &HashMap<Slot, Slot>,
+) {
+    let mut seed = |s: Slot| {
+        if !local_map.contains_key(&s) {
+            if let Some(&mapped) = parent_map.get(&s) {
+                local_map.insert(s, mapped);
+            }
+        }
+    };
+    match op {
+        Op::LoadLit { dst, .. } => { seed(*dst); }
+        Op::LoadSlot { dst, src } => { seed(*dst); seed(*src); }
+        Op::LoadState { dst, .. } => { seed(*dst); }
+        Op::LoadMem { dst, addr_slot } | Op::LoadMem16 { dst, addr_slot } => { seed(*dst); seed(*addr_slot); }
+        Op::LoadKeyboard { dst } => { seed(*dst); }
+        Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b }
+        | Op::Div { dst, a, b } | Op::Mod { dst, a, b } | Op::And { dst, a, b }
+        | Op::Shr { dst, a, b } | Op::Shl { dst, a, b } => { seed(*dst); seed(*a); seed(*b); }
+        Op::Neg { dst, src } | Op::Abs { dst, src } | Op::Sign { dst, src }
+        | Op::Floor { dst, src } => { seed(*dst); seed(*src); }
+        Op::Pow { dst, base, exp } => { seed(*dst); seed(*base); seed(*exp); }
+        Op::Bit { dst, val, idx } => { seed(*dst); seed(*val); seed(*idx); }
+        Op::CmpEq { dst, a, b } => { seed(*dst); seed(*a); seed(*b); }
+        Op::Min { dst, args } | Op::Max { dst, args } => { seed(*dst); for a in args { seed(*a); } }
+        Op::Clamp { dst, min, val, max } => { seed(*dst); seed(*min); seed(*val); seed(*max); }
+        Op::Round { dst, val, interval, .. } => { seed(*dst); seed(*val); seed(*interval); }
+        Op::BranchIfZero { cond, .. } => { seed(*cond); }
+        Op::Jump { .. } => {}
+        Op::Dispatch { dst, key, .. } => { seed(*dst); seed(*key); }
+        Op::StoreState { src, .. } => { seed(*src); }
+        Op::StoreMem { addr_slot, src } => { seed(*addr_slot); seed(*src); }
     }
 }
 
