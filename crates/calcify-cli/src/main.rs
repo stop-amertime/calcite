@@ -24,21 +24,36 @@ struct Cli {
     #[arg(long)]
     parse_only: bool,
 
-    /// Render video memory after execution.
+    /// Render a region of memory as a text-mode screen after execution.
     ///
-    /// Format: WIDTHxHEIGHT (e.g. "40x25" for text mode, "320x200" for VGA).
-    /// Video memory is read from 0xB8000 in text-mode format (char+attr pairs).
-    #[arg(long, value_name = "WxH")]
-    screen: Option<String>,
+    /// Format: ADDR WIDTHxHEIGHT (e.g. "0xB8000 40x25").
+    /// Memory is read in text-mode format (char+attribute byte pairs).
+    #[arg(long, value_name = "ADDR WxH", num_args = 2)]
+    screen: Option<Vec<String>>,
 }
 
-fn parse_screen_dims(s: &str) -> (usize, usize) {
-    if let Some((w, h)) = s.split_once('x') {
+fn parse_screen_args(args: &[String]) -> (i32, usize, usize) {
+    if args.len() != 2 {
+        eprintln!("--screen requires ADDR WxH (e.g. --screen 0xB8000 40x25)");
+        std::process::exit(1);
+    }
+    let addr = if args[0].starts_with("0x") || args[0].starts_with("0X") {
+        i32::from_str_radix(&args[0][2..], 16).unwrap_or_else(|_| {
+            eprintln!("Invalid address '{}', expected hex (e.g. 0xB8000)", args[0]);
+            std::process::exit(1);
+        })
+    } else {
+        args[0].parse().unwrap_or_else(|_| {
+            eprintln!("Invalid address '{}', expected integer or hex", args[0]);
+            std::process::exit(1);
+        })
+    };
+    if let Some((w, h)) = args[1].split_once('x') {
         if let (Ok(w), Ok(h)) = (w.parse(), h.parse()) {
-            return (w, h);
+            return (addr, w, h);
         }
     }
-    eprintln!("Invalid screen dimensions '{s}', expected WxH (e.g. 40x25)");
+    eprintln!("Invalid screen dimensions '{}', expected WxH (e.g. 40x25)", args[1]);
     std::process::exit(1);
 }
 
@@ -78,6 +93,7 @@ fn main() {
 
             let t1 = std::time::Instant::now();
             let mut evaluator = calcify_core::Evaluator::from_parsed(&parsed);
+            evaluator.add_pre_tick_hook(calcify_core::state::x86css_text_output_hook());
             let compile_time = t1.elapsed();
 
             let mut state = calcify_core::State::default();
@@ -140,9 +156,9 @@ fn main() {
                 cli.ticks as f64 / tick_time.as_secs_f64(),
             );
 
-            if let Some(ref dims) = cli.screen {
-                let (width, height) = parse_screen_dims(dims);
-                let screen = state.render_screen(0xB8000, width, height);
+            if let Some(ref args) = cli.screen {
+                let (addr, width, height) = parse_screen_args(args);
+                let screen = state.render_screen(addr as usize, width, height);
                 println!("\n┌{}┐", "─".repeat(width));
                 for line in screen.lines() {
                     println!("│{line}│");

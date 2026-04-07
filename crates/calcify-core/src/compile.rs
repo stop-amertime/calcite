@@ -146,6 +146,161 @@ pub struct CompiledDispatchTable {
 }
 
 // ---------------------------------------------------------------------------
+// Body-pattern analysis — detect mathematical patterns in function bodies
+// ---------------------------------------------------------------------------
+
+/// Check if an expression is `var(name)`.
+pub(crate) fn is_var_ref(expr: &Expr, param_name: &str) -> bool {
+    matches!(expr, Expr::Var { name, .. } if name == param_name)
+}
+
+/// Check if an expression is `mod(var(a), pow(2, var(b)))` — bitmask pattern.
+pub(crate) fn is_mod_pow2(expr: &Expr, a: &str, b: &str) -> bool {
+    if let Expr::Calc(CalcOp::Mod(lhs, rhs)) = expr {
+        if is_var_ref(lhs, a) {
+            if let Expr::Calc(CalcOp::Pow(base, exp)) = rhs.as_ref() {
+                return matches!(base.as_ref(), Expr::Literal(v) if (*v - 2.0).abs() < f64::EPSILON)
+                    && is_var_ref(exp, b);
+            }
+        }
+    }
+    false
+}
+
+/// Check if an expression is `round(down, var(a) / pow(2, var(b)), 1)` — right shift.
+pub(crate) fn is_right_shift(expr: &Expr, a: &str, b: &str) -> bool {
+    if let Expr::Calc(CalcOp::Round(RoundStrategy::Down, val, interval)) = expr {
+        // interval must be 1
+        if !matches!(interval.as_ref(), Expr::Literal(v) if (*v - 1.0).abs() < f64::EPSILON) {
+            return false;
+        }
+        // val must be var(a) / pow(2, var(b))
+        if let Expr::Calc(CalcOp::Div(num, den)) = val.as_ref() {
+            if is_var_ref(num, a) {
+                if let Expr::Calc(CalcOp::Pow(base, exp)) = den.as_ref() {
+                    return matches!(base.as_ref(), Expr::Literal(v) if (*v - 2.0).abs() < f64::EPSILON)
+                        && is_var_ref(exp, b);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if an expression is `var(a) * pow(2, var(b))` — left shift.
+pub(crate) fn is_left_shift(expr: &Expr, a: &str, b: &str) -> bool {
+    if let Expr::Calc(CalcOp::Mul(lhs, rhs)) = expr {
+        if is_var_ref(lhs, a) {
+            if let Expr::Calc(CalcOp::Pow(base, exp)) = rhs.as_ref() {
+                return matches!(base.as_ref(), Expr::Literal(v) if (*v - 2.0).abs() < f64::EPSILON)
+                    && is_var_ref(exp, b);
+            }
+        }
+    }
+    false
+}
+
+/// Check if an expression is `var(a) * var(local_name)` (in either order).
+pub(crate) fn is_mul_refs(expr: &Expr, a: &str, local_name: &str) -> bool {
+    if let Expr::Calc(CalcOp::Mul(lhs, rhs)) = expr {
+        return (is_var_ref(lhs, a) && is_var_ref(rhs, local_name))
+            || (is_var_ref(lhs, local_name) && is_var_ref(rhs, a));
+    }
+    false
+}
+
+/// Check if an expression is a power-of-2 dispatch table on `param`.
+///
+/// Pattern: `if(style(param:0): 1; style(param:1): 2; style(param:2): 4; ...)`
+/// where entry K maps to 2^K.
+pub(crate) fn is_pow2_dispatch(expr: &Expr, param: &str) -> bool {
+    if let Expr::StyleCondition { branches, .. } = expr {
+        if branches.len() < 4 {
+            return false;
+        }
+        for branch in branches {
+            if let StyleTest::Single { property, value } = &branch.condition {
+                if property != param {
+                    return false;
+                }
+                if let Expr::Literal(key_val) = value {
+                    let k = *key_val as u32;
+                    if let Expr::Literal(then_val) = &branch.then {
+                        let expected = if k < 32 { (1u64 << k) as f64 } else { return false };
+                        if (*then_val - expected).abs() > f64::EPSILON {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Check if an expression is a bit-extract pattern: `mod(shift_body, 2)`.
+///
+/// Where `shift_body` is either:
+/// - Directly `round(down, var(a) / pow(2, var(b)), 1)` (inline right-shift), or
+/// - A function call to a function whose body IS a right-shift pattern.
+pub(crate) fn is_bit_extract(expr: &Expr, a: &str, b: &str, functions: &HashMap<String, FunctionDef>) -> bool {
+    if let Expr::Calc(CalcOp::Mod(inner, modulus)) = expr {
+        // modulus must be 2
+        if !matches!(modulus.as_ref(), Expr::Literal(v) if (*v - 2.0).abs() < f64::EPSILON) {
+            return false;
+        }
+        // inner is an inline right-shift?
+        if is_right_shift(inner, a, b) {
+            return true;
+        }
+        // inner is a function call whose body is a right-shift pattern?
+        if let Expr::FunctionCall { name, args } = inner.as_ref() {
+            if args.len() == 2 && is_var_ref(&args[0], a) && is_var_ref(&args[1], b) {
+                if let Some(func) = functions.get(name.as_str()) {
+                    if func.parameters.len() == 2 && func.locals.is_empty() {
+                        return is_right_shift(
+                            &func.result,
+                            &func.parameters[0].name,
+                            &func.parameters[1].name,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if a dispatch table is an identity-read: every entry maps key K → state[K].
+pub(crate) fn is_dispatch_identity_read(table: &DispatchTable) -> bool {
+    if table.entries.len() < 4 {
+        return false;
+    }
+    for (&key, expr) in &table.entries {
+        match expr {
+            Expr::Var { name, .. } => {
+                if let Some(addr) = property_to_address(name) {
+                    if addr as i64 != key {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Compiler — translates Evaluator data into CompiledProgram
 // ---------------------------------------------------------------------------
 
@@ -463,98 +618,125 @@ impl Compiler {
         }
     }
 
-    /// Compile a function call — inlines known functions.
+    /// Compile a function call — uses body-pattern analysis for optimisation.
+    ///
+    /// Instead of matching function names, this analyses the function's body
+    /// structure to detect mathematical patterns that can be compiled to
+    /// efficient native operations. This is fully generic — it works for
+    /// any CSS function with the right shape.
     fn compile_function_call(&mut self, name: &str, args: &[Expr], ops: &mut Vec<Op>) -> u16 {
-        // Fast-path builtins: compile directly to native ops
-        match name {
-            "--readMem" => {
-                if let Some(arg) = args.first() {
-                    let addr_slot = self.compile_expr(arg, ops);
-                    let dst = self.alloc();
-                    ops.push(Op::LoadMem { dst, addr_slot });
-                    return dst;
-                }
-                let dst = self.alloc();
-                ops.push(Op::LoadLit { dst, val: 0.0 });
-                return dst;
+        // Try body-pattern analysis on the function definition.
+        if let Some(func) = self.functions.get(name).cloned() {
+            if let Some(slot) = self.try_compile_by_body_pattern(&func, args, ops) {
+                return slot;
             }
-            "--read2" => {
-                if let Some(arg) = args.first() {
-                    let addr_slot = self.compile_expr(arg, ops);
-                    let dst = self.alloc();
-                    ops.push(Op::LoadMem16 { dst, addr_slot });
-                    return dst;
-                }
-                let dst = self.alloc();
-                ops.push(Op::LoadLit { dst, val: 0.0 });
-                return dst;
-            }
-            "--lowerBytes" => {
-                if args.len() >= 2 {
-                    let sa = self.compile_expr(&args[0], ops);
-                    let sb = self.compile_expr(&args[1], ops);
-                    let dst = self.alloc();
-                    ops.push(Op::And { dst, a: sa, b: sb });
-                    return dst;
-                }
-                let dst = self.alloc();
-                ops.push(Op::LoadLit { dst, val: 0.0 });
-                return dst;
-            }
-            "--rightShift" => {
-                if args.len() >= 2 {
-                    let sa = self.compile_expr(&args[0], ops);
-                    let sb = self.compile_expr(&args[1], ops);
-                    let dst = self.alloc();
-                    ops.push(Op::Shr { dst, a: sa, b: sb });
-                    return dst;
-                }
-                let dst = self.alloc();
-                ops.push(Op::LoadLit { dst, val: 0.0 });
-                return dst;
-            }
-            "--leftShift" => {
-                if args.len() >= 2 {
-                    let sa = self.compile_expr(&args[0], ops);
-                    let sb = self.compile_expr(&args[1], ops);
-                    let dst = self.alloc();
-                    ops.push(Op::Shl { dst, a: sa, b: sb });
-                    return dst;
-                }
-                let dst = self.alloc();
-                ops.push(Op::LoadLit { dst, val: 0.0 });
-                return dst;
-            }
-            "--bit" => {
-                if args.len() >= 2 {
-                    let sv = self.compile_expr(&args[0], ops);
-                    let si = self.compile_expr(&args[1], ops);
-                    let dst = self.alloc();
-                    ops.push(Op::Bit { dst, val: sv, idx: si });
-                    return dst;
-                }
-                let dst = self.alloc();
-                ops.push(Op::LoadLit { dst, val: 0.0 });
-                return dst;
-            }
-            "--int" => {
-                if let Some(arg) = args.first() {
-                    return self.compile_expr(arg, ops);
-                }
-                let dst = self.alloc();
-                ops.push(Op::LoadLit { dst, val: 0.0 });
-                return dst;
-            }
-            _ => {}
         }
 
-        // Dispatch table: compile the key lookup and each entry
+        // Dispatch table: check for identity-read pattern, then fall back to
+        // compiled dispatch lookup.
         if self.dispatch_tables.contains_key(name) {
+            // Identity-read: every entry maps key K → state[K] — direct memory read
+            if args.len() == 1 && self.check_dispatch_identity_read(name) {
+                let addr_slot = self.compile_expr(&args[0], ops);
+                let dst = self.alloc();
+                ops.push(Op::LoadMem { dst, addr_slot });
+                return dst;
+            }
             return self.compile_dispatch_call(name, args, ops);
         }
 
         // General function: inline the body
         self.compile_general_function(name, args, ops)
+    }
+
+    /// Try to compile a function call by analysing its body pattern.
+    ///
+    /// Returns `Some(result_slot)` if the body matches a known mathematical
+    /// pattern that can be compiled to efficient native ops.
+    fn try_compile_by_body_pattern(
+        &mut self,
+        func: &FunctionDef,
+        args: &[Expr],
+        ops: &mut Vec<Op>,
+    ) -> Option<u16> {
+        let params = &func.parameters;
+
+        // Identity: 1 param, no locals, result = var(param)
+        if params.len() == 1 && func.locals.is_empty()
+            && is_var_ref(&func.result, &params[0].name)
+        {
+            return args.first().map(|a| self.compile_expr(a, ops));
+        }
+
+        // 2-param patterns with no locals
+        if params.len() == 2 && func.locals.is_empty() {
+            let p0 = &params[0].name;
+            let p1 = &params[1].name;
+
+            // Bitmask: mod(a, pow(2, b)) → And
+            if is_mod_pow2(&func.result, p0, p1) {
+                let sa = self.compile_expr(&args[0], ops);
+                let sb = self.compile_expr(&args[1], ops);
+                let dst = self.alloc();
+                ops.push(Op::And { dst, a: sa, b: sb });
+                return Some(dst);
+            }
+
+            // Right shift: round(down, a / pow(2, b), 1) → Shr
+            if is_right_shift(&func.result, p0, p1) {
+                let sa = self.compile_expr(&args[0], ops);
+                let sb = self.compile_expr(&args[1], ops);
+                let dst = self.alloc();
+                ops.push(Op::Shr { dst, a: sa, b: sb });
+                return Some(dst);
+            }
+
+            // Left shift: a * pow(2, b) → Shl
+            if is_left_shift(&func.result, p0, p1) {
+                let sa = self.compile_expr(&args[0], ops);
+                let sb = self.compile_expr(&args[1], ops);
+                let dst = self.alloc();
+                ops.push(Op::Shl { dst, a: sa, b: sb });
+                return Some(dst);
+            }
+
+            // Bit extract: mod(rightShift_body(a, b), 2) → Bit
+            // i.e. mod(round(down, a / pow(2, b), 1), 2)
+            if is_bit_extract(&func.result, p0, p1, &self.functions) {
+                let sv = self.compile_expr(&args[0], ops);
+                let si = self.compile_expr(&args[1], ops);
+                let dst = self.alloc();
+                ops.push(Op::Bit { dst, val: sv, idx: si });
+                return Some(dst);
+            }
+        }
+
+        // 2-param with 1 local: left-shift via power-of-2 dispatch table
+        // Pattern: local = dispatch_on(b) {0→1, 1→2, 2→4, ...}, result = a * local
+        if params.len() == 2 && func.locals.len() == 1 {
+            let p0 = &params[0].name;
+            let p1 = &params[1].name;
+            let local = &func.locals[0];
+
+            if is_mul_refs(&func.result, p0, &local.name)
+                && is_pow2_dispatch(&local.value, p1)
+            {
+                let sa = self.compile_expr(&args[0], ops);
+                let sb = self.compile_expr(&args[1], ops);
+                let dst = self.alloc();
+                ops.push(Op::Shl { dst, a: sa, b: sb });
+                return Some(dst);
+            }
+        }
+
+        None
+    }
+
+    /// Check if a dispatch table is an identity-read pattern.
+    fn check_dispatch_identity_read(&self, name: &str) -> bool {
+        self.dispatch_tables
+            .get(name)
+            .is_some_and(is_dispatch_identity_read)
     }
 
     /// Compile a dispatch table function call.
@@ -996,14 +1178,10 @@ fn is_buffer_copy(name: &str) -> bool {
 }
 
 fn is_byte_half(name: &str) -> bool {
-    let bare = if name.starts_with("--__") && name.len() > 5 {
-        &name[5..]
-    } else if let Some(stripped) = name.strip_prefix("--") {
-        stripped
-    } else {
-        name
-    };
-    matches!(bare, "AL" | "AH" | "BL" | "BH" | "CL" | "CH" | "DL" | "DH")
+    if let Some(addr) = property_to_address(name) {
+        return addr < -14;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,6 +1192,24 @@ fn is_byte_half(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::state;
+    use crate::eval;
+
+    /// Install a test address map so property_to_address works for --AX etc.
+    fn setup() {
+        use crate::state::addr;
+        let mut map = std::collections::HashMap::new();
+        for (name, a) in [
+            ("AX", addr::AX), ("CX", addr::CX), ("DX", addr::DX), ("BX", addr::BX),
+            ("SP", addr::SP), ("BP", addr::BP), ("SI", addr::SI), ("DI", addr::DI),
+            ("IP", addr::IP), ("ES", addr::ES), ("CS", addr::CS), ("SS", addr::SS),
+            ("DS", addr::DS), ("flags", addr::FLAGS),
+            ("AH", addr::AH), ("CH", addr::CH), ("DH", addr::DH), ("BH", addr::BH),
+            ("AL", addr::AL), ("CL", addr::CL), ("DL", addr::DL), ("BL", addr::BL),
+        ] {
+            map.insert(name.to_string(), a);
+        }
+        crate::eval::set_address_map(map);
+    }
 
     #[test]
     fn compile_literal() {
@@ -1047,6 +1243,7 @@ mod tests {
 
     #[test]
     fn compile_var_from_state() {
+        setup();
         let expr = Expr::Var {
             name: "--AX".to_string(),
             fallback: None,
@@ -1064,6 +1261,7 @@ mod tests {
 
     #[test]
     fn compile_style_condition() {
+        setup();
         let expr = Expr::StyleCondition {
             branches: vec![
                 StyleBranch {
@@ -1096,29 +1294,65 @@ mod tests {
 
     #[test]
     fn compile_readmem() {
+        setup();
+        // Build a dispatch table that maps key K → Var at state address K
+        // (identity-read pattern, detected generically).
+        use crate::pattern::dispatch_table::DispatchTable;
+        let mut entries = HashMap::new();
+        entries.insert(-1, Expr::Var { name: "--AX".to_string(), fallback: None });
+        entries.insert(-2, Expr::Var { name: "--CX".to_string(), fallback: None });
+        entries.insert(-3, Expr::Var { name: "--DX".to_string(), fallback: None });
+        entries.insert(-4, Expr::Var { name: "--BX".to_string(), fallback: None });
+        entries.insert(0, Expr::Var { name: "--m0".to_string(), fallback: None });
+        let mut dispatch_tables = HashMap::new();
+        dispatch_tables.insert("--readMem".to_string(), DispatchTable {
+            key_property: "--at".to_string(),
+            entries,
+            fallback: Expr::Literal(0.0),
+        });
+        let functions = HashMap::new();
+
         let expr = Expr::FunctionCall {
             name: "--readMem".to_string(),
             args: vec![Expr::Literal(-1.0)], // AX register
         };
-        let mut compiler = Compiler::new(&HashMap::new(), &HashMap::new());
+        let mut compiler = Compiler::new(&functions, &dispatch_tables);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
         let mut state = State::default();
         state.registers[state::reg::AX] = 42;
         let mut slots = vec![0.0; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &mut state, &mut slots);
+        exec_ops(&ops, &compiler.compiled_dispatches, &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42.0);
     }
 
     #[test]
     fn compile_bitwise_ops() {
+        // Build a function with body mod(a, pow(2, b)) — bitmask pattern.
+        let mut functions = HashMap::new();
+        functions.insert("--lowerBytes".to_string(), FunctionDef {
+            name: "--lowerBytes".to_string(),
+            parameters: vec![
+                FunctionParam { name: "--a".to_string(), syntax: PropertySyntax::Integer },
+                FunctionParam { name: "--b".to_string(), syntax: PropertySyntax::Integer },
+            ],
+            locals: vec![],
+            result: Expr::Calc(CalcOp::Mod(
+                Box::new(Expr::Var { name: "--a".to_string(), fallback: None }),
+                Box::new(Expr::Calc(CalcOp::Pow(
+                    Box::new(Expr::Literal(2.0)),
+                    Box::new(Expr::Var { name: "--b".to_string(), fallback: None }),
+                ))),
+            )),
+        });
+
         // --lowerBytes(0xFF, 4) → 0xF
         let expr = Expr::FunctionCall {
             name: "--lowerBytes".to_string(),
             args: vec![Expr::Literal(0xFF as f64), Expr::Literal(4.0)],
         };
-        let mut compiler = Compiler::new(&HashMap::new(), &HashMap::new());
+        let mut compiler = Compiler::new(&functions, &HashMap::new());
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
@@ -1130,6 +1364,7 @@ mod tests {
 
     #[test]
     fn compile_full_program() {
+        setup();
         let assignments = vec![
             Assignment {
                 property: "--AX".to_string(),
@@ -1189,6 +1424,7 @@ mod tests {
 
     #[test]
     fn compile_value_forwarding() {
+        setup();
         // Assignment A computes --AX = 10
         // Assignment B computes --CX = var(--AX) + 5
         // B should see A's value without a state lookup

@@ -555,6 +555,7 @@ fn compiled_vs_interpreted_benchmark() {
 
     // Interpreted path
     let mut eval_interp = Evaluator::from_parsed(&parsed);
+    eval_interp.add_pre_tick_hook(calcify_core::state::x86css_text_output_hook());
     let mut state_interp = State::default();
     state_interp.load_properties(&parsed.properties);
 
@@ -566,6 +567,7 @@ fn compiled_vs_interpreted_benchmark() {
 
     // Compiled path
     let mut eval_compiled = Evaluator::from_parsed(&parsed);
+    eval_compiled.add_pre_tick_hook(calcify_core::state::x86css_text_output_hook());
     let mut state_compiled = State::default();
     state_compiled.load_properties(&parsed.properties);
 
@@ -603,6 +605,7 @@ fn fibonacci_benchmark() {
 
     let parsed = parse_css(&css).expect("should parse demo CSS");
     let mut evaluator = Evaluator::from_parsed(&parsed);
+    evaluator.add_pre_tick_hook(calcify_core::state::x86css_text_output_hook());
     let mut state = State::default();
     state.load_properties(&parsed.properties);
 

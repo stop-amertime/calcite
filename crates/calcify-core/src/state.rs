@@ -88,14 +88,6 @@ pub mod addr {
     /// BL — low byte of BX.
     pub const BL: i32 = -34;
 
-    /// writeChar1: output 1 character from stack.
-    pub const EXT_WRITE_CHAR1: i32 = 0x2000;
-    /// writeChar4: output 4 characters from string pointer.
-    pub const EXT_WRITE_CHAR4: i32 = 0x2002;
-    /// writeChar8: output 8 characters from string pointer.
-    pub const EXT_WRITE_CHAR8: i32 = 0x2004;
-    /// readInput: read keyboard input into AX.
-    pub const EXT_READ_INPUT: i32 = 0x2006;
 }
 
 /// Default memory size for x86CSS (0x600 bytes = 1,536).
@@ -302,6 +294,52 @@ impl State {
             }
         }
     }
+}
+
+/// Create a pre-tick hook that handles x86CSS external function stubs.
+///
+/// When IP is at a stub address, this hook captures text output by reading
+/// characters from the stack/memory. The hook addresses and calling convention
+/// are specific to x86CSS's generated CSS.
+///
+/// This function exists so callers (CLI, WASM, tests) can opt into x86CSS
+/// text output handling. The evaluator core has no x86 knowledge.
+pub fn x86css_text_output_hook() -> Box<dyn Fn(&mut State)> {
+    Box::new(|state: &mut State| {
+        let ip = state.registers[reg::IP];
+        match ip {
+            0x2000 => {
+                // writeChar1: output 1 char from stack argument at SP+2
+                let ch = state.read_mem(state.registers[reg::SP] + 2);
+                if ch > 0 && ch < 128 {
+                    state.text_buffer.push(ch as u8 as char);
+                }
+            }
+            0x2002 => {
+                // writeChar4: output 4 chars from string pointer at SP+2
+                let ptr = state.read_mem16(state.registers[reg::SP] + 2);
+                for off in 0..4 {
+                    let ch = state.read_mem(ptr + off);
+                    if ch == 0 { break; }
+                    if ch > 0 && ch < 128 {
+                        state.text_buffer.push(ch as u8 as char);
+                    }
+                }
+            }
+            0x2004 => {
+                // writeChar8: output 8 chars from string pointer at SP+2
+                let ptr = state.read_mem16(state.registers[reg::SP] + 2);
+                for off in 0..8 {
+                    let ch = state.read_mem(ptr + off);
+                    if ch == 0 { break; }
+                    if ch > 0 && ch < 128 {
+                        state.text_buffer.push(ch as u8 as char);
+                    }
+                }
+            }
+            _ => {}
+        }
+    })
 }
 
 impl Default for State {

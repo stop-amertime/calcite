@@ -8,11 +8,37 @@
 
 use std::collections::HashMap;
 
-use crate::compile::{self, CompiledProgram};
+use crate::compile::{self, CompiledProgram,
+    is_var_ref, is_mod_pow2, is_right_shift, is_left_shift,
+    is_mul_refs, is_pow2_dispatch, is_bit_extract, is_dispatch_identity_read,
+};
 use crate::pattern::broadcast_write::{self, BroadcastWrite};
 use crate::pattern::dispatch_table::{self, DispatchTable};
 use crate::state::State;
 use crate::types::*;
+
+/// A precomputed function body pattern for the interpreter fast-path.
+///
+/// Detected at construction time by analysing function body structure,
+/// so no per-call overhead. These are generic mathematical patterns —
+/// no function names are matched.
+#[derive(Debug, Clone, Copy)]
+enum FunctionPattern {
+    /// result = var(param) — identity, return arg directly.
+    Identity,
+    /// mod(a, pow(2, b)) — bitmask.
+    Bitmask,
+    /// round(down, a / pow(2, b), 1) — right shift.
+    RightShift,
+    /// a * pow(2, b) or dispatch-table variant — left shift.
+    LeftShift,
+    /// mod(right_shift(a, b), 2) — bit extract.
+    BitExtract,
+    /// Dispatch table where key K → state[K] — direct memory read.
+    IdentityRead,
+    /// 16-bit word read (identity-read dispatch + word construction).
+    IdentityRead16,
+}
 
 /// The main evaluator.
 ///
@@ -20,7 +46,6 @@ use crate::types::*;
 /// broadcast writes, assignments) and mutable per-tick evaluation state
 /// (properties map, call depth). The properties map is allocated once and
 /// reused across ticks via `clear()` to avoid per-tick allocation overhead.
-#[derive(Debug)]
 pub struct Evaluator {
     /// Parsed @function definitions, keyed by name.
     pub functions: HashMap<String, FunctionDef>,
@@ -30,10 +55,17 @@ pub struct Evaluator {
     pub dispatch_tables: HashMap<String, DispatchTable>,
     /// Recognised broadcast write patterns.
     pub broadcast_writes: Vec<BroadcastWrite>,
+    /// Precomputed function body patterns for the interpreter fast-path.
+    function_patterns: HashMap<String, FunctionPattern>,
     /// Property values computed during the current tick. Reused across ticks.
     properties: HashMap<String, f64>,
     /// Call depth for recursion protection.
     call_depth: usize,
+    /// Pre-tick hooks: called before each tick to handle external side effects.
+    /// The evaluator has no knowledge of what hooks do — they are registered
+    /// by the caller (CLI, WASM, etc.).
+    #[allow(clippy::type_complexity)]
+    pre_tick_hooks: Vec<Box<dyn Fn(&mut State)>>,
     /// Compiled bytecode program (flat ops over indexed slots).
     compiled: CompiledProgram,
     /// Slot array reused across ticks (avoids per-tick allocation).
@@ -77,6 +109,14 @@ impl Evaluator {
             }
         }
 
+        // Build and install the CSS-derived address map from identity-read dispatch tables.
+        // Only override if we found actual mappings (preserves any pre-installed test map).
+        let address_map = build_address_map(&dispatch_tables);
+        if !address_map.is_empty() {
+            log::info!("Derived {} property→address mappings from CSS structure", address_map.len());
+            set_address_map(address_map);
+        }
+
         // Recognise broadcast write patterns in assignments
         let broadcast_result = broadcast_write::recognise_broadcast(&program.assignments);
         for bw in &broadcast_result.writes {
@@ -100,12 +140,11 @@ impl Evaluator {
             .cloned()
             .collect();
 
-        // Reorder: move --modRm* assignments before --instId.
-        // In CSS, all properties are computed simultaneously, but our sequential
-        // evaluator processes them in declaration order. The --getInstId() function
-        // references --modRm_reg via compound conditions (e.g., opcode 0xFF group),
-        // so --modRm* must be computed before --instId.
-        let assignments = reorder_modrm_before_instid(assignments);
+        // Topological sort: reorder assignments by data dependencies.
+        // CSS evaluates all properties simultaneously, but our sequential evaluator
+        // must process them in dependency order. Only style() test references
+        // (non-buffer-prefixed) create ordering constraints.
+        let assignments = topological_sort_assignments(assignments, &functions);
 
         let buffer_copies = program
             .assignments
@@ -140,6 +179,12 @@ impl Evaluator {
             compiled.broadcast_writes.len(),
         );
 
+        // Precompute function body patterns for the interpreter fast-path.
+        let function_patterns = detect_function_patterns(&functions, &dispatch_tables);
+        for (name, pattern) in &function_patterns {
+            log::info!("Detected body pattern {:?} in {}", pattern, name);
+        }
+
         let slot_count = compiled.slot_count as usize;
         let properties_capacity = assignments.len();
         Evaluator {
@@ -147,6 +192,8 @@ impl Evaluator {
             assignments,
             dispatch_tables,
             broadcast_writes: broadcast_result.writes,
+            function_patterns,
+            pre_tick_hooks: Vec::new(),
             properties: HashMap::with_capacity(properties_capacity),
             call_depth: 0,
             compiled,
@@ -154,43 +201,23 @@ impl Evaluator {
         }
     }
 
+    /// Register a pre-tick hook that is called before each tick.
+    ///
+    /// Hooks inspect and modify state to implement external side effects
+    /// (e.g., text output, keyboard input). The evaluator itself has no
+    /// knowledge of what the hook does.
+    pub fn add_pre_tick_hook(&mut self, hook: Box<dyn Fn(&mut State)>) {
+        self.pre_tick_hooks.push(hook);
+    }
+
     /// Run a single tick: evaluate all assignments against the state.
     pub fn tick(&mut self, state: &mut State) -> TickResult {
-        // Handle external function calls BEFORE evaluation.
-        // When IP is at an external function address, the CSS has RET (0xC3) there.
-        // We capture the side effects (text output) before the tick processes the RET.
-        let prev_ip = state.registers[crate::state::reg::IP];
-        match prev_ip {
-            0x2000 => {
-                // writeChar1: output 1 char from stack argument at SP+2
-                let ch = state.read_mem(state.registers[crate::state::reg::SP] + 2);
-                if ch > 0 && ch < 128 {
-                    state.text_buffer.push(ch as u8 as char);
-                }
-            }
-            0x2002 => {
-                // writeChar4: output 4 chars from string pointer at SP+2
-                let ptr = state.read_mem16(state.registers[crate::state::reg::SP] + 2);
-                for off in 0..4 {
-                    let ch = state.read_mem(ptr + off);
-                    if ch == 0 { break; }
-                    if ch > 0 && ch < 128 {
-                        state.text_buffer.push(ch as u8 as char);
-                    }
-                }
-            }
-            0x2004 => {
-                // writeChar8: output 8 chars from string pointer at SP+2
-                let ptr = state.read_mem16(state.registers[crate::state::reg::SP] + 2);
-                for off in 0..8 {
-                    let ch = state.read_mem(ptr + off);
-                    if ch == 0 { break; }
-                    if ch > 0 && ch < 128 {
-                        state.text_buffer.push(ch as u8 as char);
-                    }
-                }
-            }
-            _ => {}
+        // Run pre-tick hooks (e.g., external function dispatch).
+        // Hooks are registered by the caller and inspect state to perform
+        // side effects like text output. The evaluator itself has no knowledge
+        // of what the hooks do.
+        for hook in &self.pre_tick_hooks {
+            hook(state);
         }
 
         // Snapshot registers for change detection
@@ -221,36 +248,9 @@ impl Evaluator {
 
     /// Run a single tick using the interpreted path (for comparison testing).
     pub fn tick_interpreted(&mut self, state: &mut State) -> TickResult {
-        // Same external function handling
-        let prev_ip = state.registers[crate::state::reg::IP];
-        match prev_ip {
-            0x2000 => {
-                let ch = state.read_mem(state.registers[crate::state::reg::SP] + 2);
-                if ch > 0 && ch < 128 {
-                    state.text_buffer.push(ch as u8 as char);
-                }
-            }
-            0x2002 => {
-                let ptr = state.read_mem16(state.registers[crate::state::reg::SP] + 2);
-                for off in 0..4 {
-                    let ch = state.read_mem(ptr + off);
-                    if ch == 0 { break; }
-                    if ch > 0 && ch < 128 {
-                        state.text_buffer.push(ch as u8 as char);
-                    }
-                }
-            }
-            0x2004 => {
-                let ptr = state.read_mem16(state.registers[crate::state::reg::SP] + 2);
-                for off in 0..8 {
-                    let ch = state.read_mem(ptr + off);
-                    if ch == 0 { break; }
-                    if ch > 0 && ch < 128 {
-                        state.text_buffer.push(ch as u8 as char);
-                    }
-                }
-            }
-            _ => {}
+        // Run pre-tick hooks
+        for hook in &self.pre_tick_hooks {
+            hook(state);
         }
 
         self.properties.clear();
@@ -373,60 +373,228 @@ impl Evaluator {
     }
 }
 
-/// Reorder assignments so `--modRm*` properties are computed before `--instId`.
+/// Reorder assignments by data dependencies.
 ///
 /// CSS evaluates all custom properties simultaneously, but our sequential evaluator
-/// processes them in declaration order. The `--getInstId()` function references
-/// `--modRm_reg` in compound conditions to distinguish instruction group encodings
-/// (e.g., opcode 0xFF can be INC, DEC, CALL, JMP, or PUSH depending on the ModR/M
-/// reg field). Without reordering, `--modRm_reg` defaults to 0 and all 0xFF group
-/// instructions are incorrectly decoded as INC.
-fn reorder_modrm_before_instid(mut assignments: Vec<Assignment>) -> Vec<Assignment> {
-    // Find the position of --instId
-    let inst_id_pos = assignments.iter().position(|a| a.property == "--instId");
-    if inst_id_pos.is_none() {
+/// processes them in declaration order. If assignment B's expression references
+/// property A (via `var(--A)` or `style(--A: ...)`), then A must be computed
+/// before B. This performs a topological sort on the dependency graph while
+/// preserving original order where there are no constraints.
+fn topological_sort_assignments(
+    assignments: Vec<Assignment>,
+    functions: &HashMap<String, FunctionDef>,
+) -> Vec<Assignment> {
+    if assignments.len() <= 1 {
         return assignments;
     }
-    let inst_id_pos = inst_id_pos.unwrap();
 
-    // Find all --modRm* assignments that come AFTER --instId
-    let modrm_names = ["--modRm", "--modRm_rm", "--modRm_reg", "--modRm_mod"];
-    let mut to_move = Vec::new();
-    let mut i = assignments.len();
-    while i > inst_id_pos + 1 {
-        i -= 1;
-        if modrm_names.contains(&assignments[i].property.as_str()) {
-            to_move.push(assignments.remove(i));
+    // Build a set of properties defined in this tick
+    let defined: HashMap<String, usize> = assignments
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.property.clone(), i))
+        .collect();
+
+    // For each assignment, collect which defined properties it references
+    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(assignments.len());
+    for a in &assignments {
+        let mut refs = Vec::new();
+        collect_style_deps(&a.value, &defined, functions, &mut refs);
+        refs.sort_unstable();
+        refs.dedup();
+        // Remove self-references (e.g., --IP: calc(var(--IP) + 1))
+        let self_idx = defined[&a.property];
+        refs.retain(|&idx| idx != self_idx);
+        deps.push(refs);
+    }
+
+    // Topological sort via Kahn's algorithm, breaking ties by original order.
+    // We track ALL dependency edges — even those that are already in the right
+    // order — because moving one node can invalidate previously-correct ordering.
+    let n = assignments.len();
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, dep_list) in deps.iter().enumerate() {
+        for &dep in dep_list {
+            // dep must come before i
+            in_degree[i] += 1;
+            dependents[dep].push(i);
         }
     }
-    if to_move.is_empty() {
+
+    // Use a min-heap keyed on original index to preserve order where possible
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> =
+        std::collections::BinaryHeap::new();
+    for (i, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            ready.push(std::cmp::Reverse(i));
+        }
+    }
+
+    let mut result = Vec::with_capacity(n);
+    while let Some(std::cmp::Reverse(idx)) = ready.pop() {
+        result.push(idx);
+        for &dependent in &dependents[idx] {
+            in_degree[dependent] -= 1;
+            if in_degree[dependent] == 0 {
+                ready.push(std::cmp::Reverse(dependent));
+            }
+        }
+    }
+
+    // If there's a cycle, fall back to original order
+    if result.len() != n {
+        log::warn!("Dependency cycle detected, keeping original assignment order");
         return assignments;
     }
 
-    // Re-find instId position (may have shifted after removals)
-    let inst_id_pos = assignments
-        .iter()
-        .position(|a| a.property == "--instId")
-        .unwrap();
-
-    // Insert the modRm assignments before --instId, in their original relative order
-    to_move.reverse();
-    for (offset, a) in to_move.into_iter().enumerate() {
-        log::info!("Reordering {} before --instId", a.property);
-        assignments.insert(inst_id_pos + offset, a);
+    // Check if any reordering actually happened
+    let reordered = result.iter().enumerate().any(|(pos, &orig)| pos != orig);
+    if reordered {
+        let moved: Vec<_> = result
+            .iter()
+            .enumerate()
+            .filter(|(pos, &orig)| pos != &orig)
+            .map(|(_, &orig)| &assignments[orig].property)
+            .collect();
+        log::info!("Topological sort reordered {} assignments: {:?}",
+            moved.len(), moved);
+        if log::log_enabled!(log::Level::Info) {
+            for (new_pos, &orig_idx) in result.iter().enumerate() {
+                if new_pos != orig_idx {
+                    log::info!("Topological sort: {} moved from position {} to {}",
+                        assignments[orig_idx].property, orig_idx, new_pos);
+                }
+            }
+        }
     }
 
-    assignments
+    // Reconstruct in sorted order
+    let mut indexed: Vec<_> = assignments.into_iter().enumerate().collect();
+    let mut sorted_assignments = Vec::with_capacity(n);
+    // Create a position map: original_index → new_position
+    let mut pos_map = vec![0usize; n];
+    for (new_pos, &orig_idx) in result.iter().enumerate() {
+        pos_map[orig_idx] = new_pos;
+    }
+    indexed.sort_by_key(|(orig_idx, _)| pos_map[*orig_idx]);
+    for (_, a) in indexed {
+        sorted_assignments.push(a);
+    }
+    sorted_assignments
 }
 
-/// Check if a property names a byte-half register (AL, AH, BL, BH, etc.).
+/// Collect indices of defined properties that are referenced by `style()` tests
+/// within an expression.
+///
+/// Only `style(--prop: ...)` comparisons create ordering dependencies — `var(--prop)`
+/// references naturally fall back to the previous tick's state value. This conservative
+/// approach preserves the original declaration order except where intra-tick evaluation
+/// is required for correct branching.
+fn collect_style_deps(
+    expr: &Expr,
+    defined: &HashMap<String, usize>,
+    functions: &HashMap<String, FunctionDef>,
+    out: &mut Vec<usize>,
+) {
+    match expr {
+        Expr::Var { fallback, .. } => {
+            if let Some(fb) = fallback {
+                collect_style_deps(fb, defined, functions, out);
+            }
+        }
+        Expr::Literal(_) | Expr::StringLiteral(_) => {}
+        Expr::Calc(op) => {
+            match op {
+                CalcOp::Add(a, b) | CalcOp::Sub(a, b) | CalcOp::Mul(a, b)
+                | CalcOp::Div(a, b) | CalcOp::Mod(a, b) | CalcOp::Pow(a, b) => {
+                    collect_style_deps(a, defined, functions, out);
+                    collect_style_deps(b, defined, functions, out);
+                }
+                CalcOp::Negate(a) | CalcOp::Abs(a) | CalcOp::Sign(a) => {
+                    collect_style_deps(a, defined, functions, out);
+                }
+                CalcOp::Clamp(a, b, c) => {
+                    collect_style_deps(a, defined, functions, out);
+                    collect_style_deps(b, defined, functions, out);
+                    collect_style_deps(c, defined, functions, out);
+                }
+                CalcOp::Round(_, a, b) => {
+                    collect_style_deps(a, defined, functions, out);
+                    collect_style_deps(b, defined, functions, out);
+                }
+                CalcOp::Min(args) | CalcOp::Max(args) => {
+                    for a in args {
+                        collect_style_deps(a, defined, functions, out);
+                    }
+                }
+            }
+        }
+        Expr::StyleCondition { branches, fallback } => {
+            for branch in branches {
+                collect_style_test_deps(&branch.condition, defined, functions, out);
+                collect_style_deps(&branch.then, defined, functions, out);
+            }
+            collect_style_deps(fallback, defined, functions, out);
+        }
+        Expr::FunctionCall { name, args } => {
+            for a in args {
+                collect_style_deps(a, defined, functions, out);
+            }
+            // Recurse into function body to find style() test dependencies
+            if let Some(func) = functions.get(name) {
+                collect_style_deps(&func.result, defined, functions, out);
+                for local in &func.locals {
+                    collect_style_deps(&local.value, defined, functions, out);
+                }
+            }
+        }
+    }
+}
+
+/// Collect property references from `style()` test conditions.
+///
+/// These are the dependencies that create ordering requirements — a `style(--X: val)`
+/// comparison must see the current tick's value of `--X`.
+fn collect_style_test_deps(
+    test: &StyleTest,
+    defined: &HashMap<String, usize>,
+    functions: &HashMap<String, FunctionDef>,
+    out: &mut Vec<usize>,
+) {
+    match test {
+        StyleTest::Single { property, value } => {
+            // Only track dependencies on non-buffer-prefixed properties.
+            // Buffer-prefixed names (--__0*, --__1*, --__2*) explicitly read
+            // from previous frames and are NOT same-tick dependencies.
+            if !property.starts_with("--__") {
+                if let Some(&idx) = defined.get(property) {
+                    out.push(idx);
+                }
+            }
+            collect_style_deps(value, defined, functions, out);
+        }
+        StyleTest::And(tests) | StyleTest::Or(tests) => {
+            for t in tests {
+                collect_style_test_deps(t, defined, functions, out);
+            }
+        }
+    }
+}
+
+/// Check if a property names a byte-half register (a split-register view).
 ///
 /// In CSS, these are read-only views computed from the full register each tick.
-/// The full register formula (e.g. `--AX`) handles byte merging on writes,
-/// so byte halves must NOT write back to state (they'd clobber with stale values).
+/// The full register formula handles byte merging on writes, so byte halves
+/// must NOT write back to state (they'd clobber with stale values).
+///
+/// Detection: byte-half addresses have values < -14 (below the full register
+/// range). This is derived from the CSS structure, not hardcoded names.
 fn is_byte_half(name: &str) -> bool {
-    let bare = to_bare_name(name);
-    matches!(bare, "AL" | "AH" | "BL" | "BH" | "CL" | "CH" | "DL" | "DH")
+    if let Some(addr) = property_to_address(name) {
+        return addr < -14;
+    }
+    false
 }
 
 /// Check if a property is a triple-buffer copy (`--__0*`, `--__1*`, `--__2*`).
@@ -460,15 +628,48 @@ fn to_bare_name(name: &str) -> &str {
 
 /// Map a CSS custom property name to a state address.
 ///
-/// Uses x86CSS's naming convention:
-/// - `--AX`, `--CX`, ..., `--flags` → register addresses
-/// - `--m0`, `--m1`, ... → memory addresses
+/// Uses a CSS-derived address map (from identity-read dispatch tables) when
+/// available. Falls back to:
+/// 1. `--m{N}` memory address parsing (generic).
+/// 2. Register name heuristic (when no CSS-derived map is available).
 ///
 /// Automatically strips triple-buffer prefixes (`--__0`, `--__1`, `--__2`).
 pub fn property_to_address(name: &str) -> Option<i32> {
-    use crate::state::addr;
     let canonical = to_bare_name(name);
-    match canonical {
+
+    // Check the CSS-derived address map first.
+    let (found, map_empty) = ADDRESS_MAP.with(|map| {
+        let m = map.borrow();
+        (m.get(canonical).copied(), m.is_empty())
+    });
+    if found.is_some() {
+        return found;
+    }
+
+    // Generic fallback: --m{N} → memory address N
+    if let Some(rest) = canonical.strip_prefix('m') {
+        return parse_mem_address(rest);
+    }
+
+    // Heuristic fallback: if no CSS-derived map was installed, try to infer
+    // register addresses from standard naming. This is used by simple test CSS
+    // that doesn't include dispatch tables.
+    if map_empty {
+        return register_name_heuristic(canonical);
+    }
+
+    None
+}
+
+/// Heuristic: infer register addresses from standard CSS naming patterns.
+///
+/// This fallback is only used when no CSS-derived address map has been
+/// installed (i.e., for CSS that lacks dispatch tables). When a real CSS
+/// program is loaded, the dispatch table analysis provides the definitive
+/// mapping and this heuristic is not consulted.
+fn register_name_heuristic(name: &str) -> Option<i32> {
+    use crate::state::addr;
+    match name {
         "AX" => Some(addr::AX),
         "CX" => Some(addr::CX),
         "DX" => Some(addr::DX),
@@ -483,9 +684,71 @@ pub fn property_to_address(name: &str) -> Option<i32> {
         "SS" => Some(addr::SS),
         "DS" => Some(addr::DS),
         "flags" => Some(addr::FLAGS),
-        _ if canonical.starts_with('m') => parse_mem_address(&canonical[1..]),
+        "AH" => Some(addr::AH),
+        "CH" => Some(addr::CH),
+        "DH" => Some(addr::DH),
+        "BH" => Some(addr::BH),
+        "AL" => Some(addr::AL),
+        "CL" => Some(addr::CL),
+        "DL" => Some(addr::DL),
+        "BL" => Some(addr::BL),
         _ => None,
     }
+}
+
+// Thread-local address map, populated from CSS analysis.
+// Maps bare property names (e.g., "AX", "flags") to state addresses.
+// Populated by `set_address_map()` during `Evaluator::from_parsed()`.
+thread_local! {
+    static ADDRESS_MAP: std::cell::RefCell<HashMap<String, i32>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Install an address map derived from CSS structure for the current thread.
+///
+/// Called during `Evaluator::from_parsed()` so that all subsequent
+/// `property_to_address()` calls use the CSS-derived mapping.
+pub fn set_address_map(map: HashMap<String, i32>) {
+    ADDRESS_MAP.with(|m| {
+        *m.borrow_mut() = map;
+    });
+}
+
+/// Build an address map by extracting property→address pairs from
+/// identity-read dispatch tables in the CSS.
+///
+/// An identity-read dispatch table maps key K → `Var("--{name}")` where
+/// the property at `--{name}` is at address K. Reversing this gives us
+/// the property→address mapping without any hardcoded knowledge.
+pub fn build_address_map(dispatch_tables: &HashMap<String, DispatchTable>) -> HashMap<String, i32> {
+    let mut map = HashMap::new();
+    for table in dispatch_tables.values() {
+        // We need to check identity-read without recursing into property_to_address
+        // (which depends on this map). Do a structural check: each entry's Var name
+        // should parse to a bare name, and we record the key→bare_name association.
+        if table.entries.len() < 4 {
+            continue;
+        }
+        // Verify this is an identity-read table by checking consistency:
+        // Each entry maps an integer key to a Var whose bare name is unique.
+        let mut is_identity = true;
+        let mut candidates: Vec<(String, i32)> = Vec::new();
+        for (&key, expr) in &table.entries {
+            if let Expr::Var { name, .. } = expr {
+                let bare = to_bare_name(name).to_string();
+                candidates.push((bare, key as i32));
+            } else {
+                is_identity = false;
+                break;
+            }
+        }
+        if is_identity {
+            for (bare, addr) in candidates {
+                map.insert(bare, addr);
+            }
+        }
+    }
+    map
 }
 
 /// Parse a memory address from digit chars without allocating (replaces `str::parse::<i32>()`).
@@ -502,6 +765,146 @@ fn parse_mem_address(s: &str) -> Option<i32> {
         }
     }
     Some(result)
+}
+
+/// Detect body patterns for all functions, returning a map of name → pattern.
+///
+/// Analyses function body structure to find mathematical patterns that can
+/// be compiled to efficient native operations. Also checks dispatch tables
+/// for identity-read patterns.
+fn detect_function_patterns(
+    functions: &HashMap<String, FunctionDef>,
+    dispatch_tables: &HashMap<String, DispatchTable>,
+) -> HashMap<String, FunctionPattern> {
+    let mut patterns = HashMap::new();
+
+    for (name, func) in functions {
+        let params = &func.parameters;
+
+        // Identity: 1 param, no locals, result = var(param)
+        if params.len() == 1 && func.locals.is_empty()
+            && is_var_ref(&func.result, &params[0].name)
+        {
+            patterns.insert(name.clone(), FunctionPattern::Identity);
+            continue;
+        }
+
+        // 2-param patterns with no locals
+        if params.len() == 2 && func.locals.is_empty() {
+            let p0 = &params[0].name;
+            let p1 = &params[1].name;
+
+            if is_mod_pow2(&func.result, p0, p1) {
+                patterns.insert(name.clone(), FunctionPattern::Bitmask);
+                continue;
+            }
+            if is_right_shift(&func.result, p0, p1) {
+                patterns.insert(name.clone(), FunctionPattern::RightShift);
+                continue;
+            }
+            if is_left_shift(&func.result, p0, p1) {
+                patterns.insert(name.clone(), FunctionPattern::LeftShift);
+                continue;
+            }
+            if is_bit_extract(&func.result, p0, p1, functions) {
+                patterns.insert(name.clone(), FunctionPattern::BitExtract);
+                continue;
+            }
+        }
+
+        // 2-param with 1 local: left-shift via power-of-2 dispatch table
+        if params.len() == 2 && func.locals.len() == 1 {
+            let p0 = &params[0].name;
+            let p1 = &params[1].name;
+            let local = &func.locals[0];
+
+            if is_mul_refs(&func.result, p0, &local.name)
+                && is_pow2_dispatch(&local.value, p1)
+            {
+                patterns.insert(name.clone(), FunctionPattern::LeftShift);
+                continue;
+            }
+        }
+
+        // Dispatch table identity-read
+        if let Some(table) = dispatch_tables.get(name) {
+            if is_dispatch_identity_read(table) {
+                patterns.insert(name.clone(), FunctionPattern::IdentityRead);
+                continue;
+            }
+        }
+    }
+
+    // Second pass: detect 16-bit read pattern.
+    // A function that calls an identity-read function and constructs a word
+    // (lo + hi*256) is a 16-bit read. We detect this by checking if the function
+    // calls an IdentityRead function in its body.
+    let identity_read_names: Vec<String> = patterns
+        .iter()
+        .filter(|(_, p)| matches!(p, FunctionPattern::IdentityRead))
+        .map(|(n, _)| n.clone())
+        .collect();
+
+    for (name, func) in functions {
+        if patterns.contains_key(name) {
+            continue;
+        }
+        // Check: does the function body call an identity-read function?
+        // Pattern: result involves read_fn(addr) + read_fn(addr+1) * 256
+        // or uses a sign check to differentiate register (single) vs memory (word).
+        if func.parameters.len() == 1 && calls_identity_read(&func.result, &identity_read_names) {
+            patterns.insert(name.clone(), FunctionPattern::IdentityRead16);
+        }
+    }
+
+    patterns
+}
+
+/// Check if an expression tree calls any of the named identity-read functions.
+fn calls_identity_read(expr: &Expr, identity_read_names: &[String]) -> bool {
+    match expr {
+        Expr::FunctionCall { name, .. } => {
+            if identity_read_names.contains(name) {
+                return true;
+            }
+        }
+        Expr::Calc(op) => {
+            return match op {
+                CalcOp::Add(a, b) | CalcOp::Sub(a, b) | CalcOp::Mul(a, b)
+                | CalcOp::Div(a, b) | CalcOp::Mod(a, b) | CalcOp::Pow(a, b) => {
+                    calls_identity_read(a, identity_read_names)
+                        || calls_identity_read(b, identity_read_names)
+                }
+                CalcOp::Negate(a) | CalcOp::Abs(a) | CalcOp::Sign(a) => {
+                    calls_identity_read(a, identity_read_names)
+                }
+                CalcOp::Clamp(a, b, c) => {
+                    calls_identity_read(a, identity_read_names)
+                        || calls_identity_read(b, identity_read_names)
+                        || calls_identity_read(c, identity_read_names)
+                }
+                CalcOp::Round(_, a, b) => {
+                    calls_identity_read(a, identity_read_names)
+                        || calls_identity_read(b, identity_read_names)
+                }
+                CalcOp::Min(args) | CalcOp::Max(args) => {
+                    args.iter().any(|a| calls_identity_read(a, identity_read_names))
+                }
+            };
+        }
+        Expr::StyleCondition { branches, fallback, .. } => {
+            if calls_identity_read(fallback, identity_read_names) {
+                return true;
+            }
+            for branch in branches {
+                if calls_identity_read(&branch.then, identity_read_names) {
+                    return true;
+                }
+            }
+        }
+        _ => {}
+    }
+    false
 }
 
 const MAX_CALL_DEPTH: usize = 64;
@@ -676,78 +1079,70 @@ impl Evaluator {
             return 0.0;
         }
 
-        // Fast paths for common x86CSS helper functions.
-        // These replace dispatch table lookups and CSS expression evaluation
-        // with direct native operations.
-        match name {
-            // --readMem(addr) → direct state memory/register read.
-            "--readMem" => {
-                if let Some(arg) = args.first() {
-                    let addr = self.eval_expr(arg, state) as i32;
-                    return state.read_mem(addr) as f64;
+        // Fast paths based on precomputed body-pattern analysis.
+        // These match mathematical patterns in function bodies, not names.
+        if let Some(&pattern) = self.function_patterns.get(name) {
+            match pattern {
+                FunctionPattern::Identity => {
+                    if let Some(arg) = args.first() {
+                        return self.eval_expr(arg, state);
+                    }
+                    return 0.0;
                 }
-                return 0.0;
-            }
-            // --read2(addr) → 16-bit little-endian word read.
-            "--read2" => {
-                if let Some(arg) = args.first() {
-                    let addr = self.eval_expr(arg, state) as i32;
-                    if addr < 0 {
-                        // Negative addresses are registers — read as single value
+                FunctionPattern::IdentityRead => {
+                    if let Some(arg) = args.first() {
+                        let addr = self.eval_expr(arg, state) as i32;
                         return state.read_mem(addr) as f64;
                     }
-                    return state.read_mem16(addr) as f64;
+                    return 0.0;
                 }
-                return 0.0;
-            }
-            // --lowerBytes(a, b) → a % 2^b = a & ((1 << b) - 1)
-            "--lowerBytes" => {
-                if args.len() >= 2 {
-                    let a = self.eval_expr(&args[0], state) as i64;
-                    let b = self.eval_expr(&args[1], state) as u32;
-                    if b >= 64 { return a as f64; }
-                    return (a & ((1i64 << b) - 1)) as f64;
+                FunctionPattern::IdentityRead16 => {
+                    if let Some(arg) = args.first() {
+                        let addr = self.eval_expr(arg, state) as i32;
+                        if addr < 0 {
+                            return state.read_mem(addr) as f64;
+                        }
+                        return state.read_mem16(addr) as f64;
+                    }
+                    return 0.0;
                 }
-                return 0.0;
-            }
-            // --rightShift(a, b) → floor(a / 2^b)
-            "--rightShift" => {
-                if args.len() >= 2 {
-                    let a = self.eval_expr(&args[0], state) as i64;
-                    let b = self.eval_expr(&args[1], state) as u32;
-                    if b >= 64 { return 0.0; }
-                    return (a >> b) as f64;
+                FunctionPattern::Bitmask => {
+                    if args.len() >= 2 {
+                        let a = self.eval_expr(&args[0], state) as i64;
+                        let b = self.eval_expr(&args[1], state) as u32;
+                        if b >= 64 { return a as f64; }
+                        return (a & ((1i64 << b) - 1)) as f64;
+                    }
+                    return 0.0;
                 }
-                return 0.0;
-            }
-            // --leftShift(a, b) → a * 2^b
-            "--leftShift" => {
-                if args.len() >= 2 {
-                    let a = self.eval_expr(&args[0], state) as i64;
-                    let b = self.eval_expr(&args[1], state) as u32;
-                    if b >= 64 { return 0.0; }
-                    return (a << b) as f64;
+                FunctionPattern::RightShift => {
+                    if args.len() >= 2 {
+                        let a = self.eval_expr(&args[0], state) as i64;
+                        let b = self.eval_expr(&args[1], state) as u32;
+                        if b >= 64 { return 0.0; }
+                        return (a >> b) as f64;
+                    }
+                    return 0.0;
                 }
-                return 0.0;
-            }
-            // --bit(val, idx) → (val >> idx) & 1
-            "--bit" => {
-                if args.len() >= 2 {
-                    let val = self.eval_expr(&args[0], state) as i64;
-                    let idx = self.eval_expr(&args[1], state) as u32;
-                    if idx >= 64 { return 0.0; }
-                    return ((val >> idx) & 1) as f64;
+                FunctionPattern::LeftShift => {
+                    if args.len() >= 2 {
+                        let a = self.eval_expr(&args[0], state) as i64;
+                        let b = self.eval_expr(&args[1], state) as u32;
+                        if b >= 64 { return 0.0; }
+                        return (a << b) as f64;
+                    }
+                    return 0.0;
                 }
-                return 0.0;
-            }
-            // --int(i) → identity (no-op)
-            "--int" => {
-                if let Some(arg) = args.first() {
-                    return self.eval_expr(arg, state);
+                FunctionPattern::BitExtract => {
+                    if args.len() >= 2 {
+                        let val = self.eval_expr(&args[0], state) as i64;
+                        let idx = self.eval_expr(&args[1], state) as u32;
+                        if idx >= 64 { return 0.0; }
+                        return ((val >> idx) & 1) as f64;
+                    }
+                    return 0.0;
                 }
-                return 0.0;
             }
-            _ => {}
         }
 
         // Check for a dispatch table optimisation.
@@ -882,17 +1277,53 @@ mod tests {
     use super::*;
     use crate::state;
 
+    /// Install a test address map with standard register mappings.
+    ///
+    /// Tests that reference `--AX`, `--CX`, etc. must call this to set up the
+    /// CSS-derived address mapping that the evaluator and compiler depend on.
+    fn install_test_address_map() {
+        use crate::state::addr;
+        let mut map = HashMap::new();
+        map.insert("AX".to_string(), addr::AX);
+        map.insert("CX".to_string(), addr::CX);
+        map.insert("DX".to_string(), addr::DX);
+        map.insert("BX".to_string(), addr::BX);
+        map.insert("SP".to_string(), addr::SP);
+        map.insert("BP".to_string(), addr::BP);
+        map.insert("SI".to_string(), addr::SI);
+        map.insert("DI".to_string(), addr::DI);
+        map.insert("IP".to_string(), addr::IP);
+        map.insert("ES".to_string(), addr::ES);
+        map.insert("CS".to_string(), addr::CS);
+        map.insert("SS".to_string(), addr::SS);
+        map.insert("DS".to_string(), addr::DS);
+        map.insert("flags".to_string(), addr::FLAGS);
+        map.insert("AH".to_string(), addr::AH);
+        map.insert("CH".to_string(), addr::CH);
+        map.insert("DH".to_string(), addr::DH);
+        map.insert("BH".to_string(), addr::BH);
+        map.insert("AL".to_string(), addr::AL);
+        map.insert("CL".to_string(), addr::CL);
+        map.insert("DL".to_string(), addr::DL);
+        map.insert("BL".to_string(), addr::BL);
+        set_address_map(map);
+    }
+
     /// Helper: create a minimal Evaluator for unit tests (no assignments/patterns).
     fn test_evaluator(
         functions: HashMap<String, FunctionDef>,
         dispatch_tables: HashMap<String, DispatchTable>,
     ) -> Evaluator {
+        install_test_address_map();
         let compiled = crate::compile::compile(&[], &[], &functions, &dispatch_tables);
+        let function_patterns = detect_function_patterns(&functions, &dispatch_tables);
         Evaluator {
             functions,
             assignments: vec![],
             dispatch_tables,
             broadcast_writes: vec![],
+            function_patterns,
+            pre_tick_hooks: Vec::new(),
             properties: HashMap::with_capacity(16),
             call_depth: 0,
             compiled,
@@ -1080,6 +1511,7 @@ mod tests {
 
     #[test]
     fn tick_applies_assignments() {
+        install_test_address_map();
         let program = ParsedProgram {
             properties: vec![],
             functions: vec![],
