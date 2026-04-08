@@ -316,6 +316,7 @@ impl Evaluator {
             }
         }
 
+        // Debug: print IVT-related slot values
         // Detect register changes
         let mut changes = Vec::new();
         let reg_names = [
@@ -823,6 +824,33 @@ pub fn set_address_map(map: HashMap<String, i32>) {
     ADDRESS_MAP.with(|m| {
         *m.borrow_mut() = map;
     });
+}
+
+/// Detect video memory region from the address map.
+///
+/// Returns `Some((base_addr, size))` if contiguous addresses starting at
+/// a VGA text-mode base (0xB8000) are found. Returns `None` otherwise.
+pub fn detect_video_memory() -> Option<(usize, usize)> {
+    ADDRESS_MAP.with(|m| {
+        let map = m.borrow();
+        // Find all addresses >= 0xB8000 (VGA text-mode segment)
+        let vga_base = 0xB8000i32;
+        let mut min_addr = i32::MAX;
+        let mut max_addr = i32::MIN;
+        let mut count = 0usize;
+        for &addr in map.values() {
+            if addr >= vga_base {
+                min_addr = min_addr.min(addr);
+                max_addr = max_addr.max(addr);
+                count += 1;
+            }
+        }
+        if count >= 100 && min_addr == vga_base {
+            Some((min_addr as usize, (max_addr - min_addr + 1) as usize))
+        } else {
+            None
+        }
+    })
 }
 
 /// Build an address map by extracting property→address pairs from

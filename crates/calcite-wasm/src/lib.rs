@@ -9,6 +9,17 @@ use wasm_bindgen::prelude::*;
 /// Initialise the WASM module (sets up logging, etc.).
 #[wasm_bindgen(start)]
 pub fn init() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        let loc = info.location().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default();
+        web_sys::console::error_1(&format!("WASM panic: {msg}{loc}").into());
+    }));
     console_log::init_with_level(log::Level::Info).ok();
     log::info!("calc(ite) WASM module initialised");
 }
@@ -37,9 +48,12 @@ impl CalciteEngine {
             parsed.assignments.len(),
         );
 
+        log::info!("Creating evaluator...");
         let evaluator = calcite_core::Evaluator::from_parsed(&parsed);
+        log::info!("Evaluator created, loading properties...");
         let mut state = calcite_core::State::default();
         state.load_properties(&parsed.properties);
+        log::info!("Properties loaded, memory size: {} bytes", state.memory.len());
 
         Ok(CalciteEngine { state, evaluator })
     }
@@ -60,7 +74,8 @@ impl CalciteEngine {
     }
 
     /// Set the keyboard input state.
-    pub fn set_keyboard(&mut self, key: u8) {
+    /// Pass (scancode << 8 | ascii), or 0 for no key.
+    pub fn set_keyboard(&mut self, key: i32) {
         self.state.keyboard = key;
     }
 
@@ -84,6 +99,23 @@ impl CalciteEngine {
     /// Render text-mode video memory as a string (for debugging).
     pub fn render_screen(&self, base_addr: usize, width: usize, height: usize) -> String {
         self.state.render_screen(base_addr, width, height)
+    }
+
+    /// Detect video memory region from the CSS structure.
+    ///
+    /// Returns a JSON string like `{"addr":753664,"size":4000,"width":80,"height":25}`
+    /// if video memory is detected, or `"null"` otherwise.
+    pub fn detect_video(&self) -> String {
+        match calcite_core::detect_video_memory() {
+            Some((addr, size)) => {
+                // Infer dimensions: size/2 cells (char+attr pairs)
+                // 80x25 = 4000 bytes is standard DOS text mode
+                let cells = size / 2;
+                let (w, h) = if cells == 2000 { (80, 25) } else if cells == 1000 { (40, 25) } else { (80, cells / 80) };
+                format!("{{\"addr\":{addr},\"size\":{size},\"width\":{w},\"height\":{h}}}")
+            }
+            None => "null".to_string(),
+        }
     }
 
     /// Return string properties as a JSON object string, e.g. `{"textBuffer":"Hello"}`.

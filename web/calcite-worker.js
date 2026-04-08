@@ -8,18 +8,17 @@
  *     { type: 'keyboard', key: number }    — update keyboard state
  *
  *   Worker → Main:
- *     { type: 'ready' }                    — engine initialised
- *     { type: 'tick-result', changes: [[name, value], ...], ticks: number }
+ *     { type: 'ready', video: {addr,size,width,height}|null }
+ *     { type: 'tick-result', changes, stringProperties, screen, ticks }
  *     { type: 'error', message: string }
  */
 
 let engine = null;
+let videoConfig = null;
 
-// The WASM module will be loaded dynamically
 async function loadWasm() {
-  // wasm-pack generates this module
   const wasm = await import('./pkg/calcite_wasm.js');
-  await wasm.default(); // init WASM
+  await wasm.default();
   return wasm;
 }
 
@@ -35,7 +34,12 @@ self.onmessage = async function (event) {
           wasmModule = await loadWasm();
         }
         engine = new wasmModule.CalciteEngine(data.css);
-        self.postMessage({ type: 'ready' });
+
+        // Auto-detect video memory from CSS structure
+        const videoJson = engine.detect_video();
+        videoConfig = JSON.parse(videoJson);
+
+        self.postMessage({ type: 'ready', video: videoConfig });
         break;
       }
 
@@ -46,10 +50,18 @@ self.onmessage = async function (event) {
         const changesJson = engine.tick_batch(data.count || 1);
         const changes = JSON.parse(changesJson);
         const stringProps = JSON.parse(engine.get_string_properties());
+
+        // Render video screen if video memory was detected
+        let screen = null;
+        if (videoConfig) {
+          screen = engine.render_screen(videoConfig.addr, videoConfig.width, videoConfig.height);
+        }
+
         self.postMessage({
           type: 'tick-result',
           changes,
           stringProperties: stringProps,
+          screen,
           ticks: data.count || 1,
         });
         break;

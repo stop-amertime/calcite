@@ -419,6 +419,35 @@ pub(crate) fn is_dispatch_identity_read(table: &DispatchTable) -> bool {
     true
 }
 
+/// Classify a dispatch table as "near-identity-read": most entries map key K → state[K],
+/// but a small number have non-identity expressions (e.g., computed values for special
+/// addresses like self-modifying code patches).
+///
+/// Returns `Some(exception_keys)` if the table is mostly identity reads (≥90%), with
+/// `exception_keys` listing the keys that are NOT identity reads. Returns `None` if the
+/// table doesn't qualify.
+fn classify_near_identity_read(table: &DispatchTable) -> Option<Vec<i64>> {
+    if table.entries.len() < 100 {
+        return None;
+    }
+    let mut exceptions = Vec::new();
+    for (&key, expr) in &table.entries {
+        let is_identity = matches!(expr, Expr::Var { name, .. } if {
+            property_to_address(name).is_some_and(|addr| addr as i64 == key)
+        });
+        if !is_identity {
+            exceptions.push(key);
+        }
+    }
+    // Must be at least 90% identity
+    let identity_count = table.entries.len() - exceptions.len();
+    if identity_count * 10 >= table.entries.len() * 9 {
+        Some(exceptions)
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constant folding — simplify Expr trees before compilation
 // ---------------------------------------------------------------------------
@@ -631,6 +660,10 @@ struct Compiler {
     dispatch_tables: HashMap<String, DispatchTable>,
     /// Compiled dispatch table data (populated during compilation).
     compiled_dispatches: Vec<CompiledDispatchTable>,
+    /// Cache: dispatch table name → compiled table_id.
+    /// Tables with context-independent entries (no parameter refs in entry ops)
+    /// can be compiled once and reused across call sites.
+    dispatch_cache: HashMap<String, Slot>,
 }
 
 impl Compiler {
@@ -644,6 +677,7 @@ impl Compiler {
             functions: functions.clone(),
             dispatch_tables: dispatch_tables.clone(),
             compiled_dispatches: Vec::new(),
+            dispatch_cache: HashMap::new(),
         }
     }
 
@@ -1005,6 +1039,13 @@ impl Compiler {
                 ops.push(Op::LoadMem { dst, addr_slot });
                 return dst;
             }
+            // Near-identity-read: mostly identity with a few exception entries.
+            // Compile as LoadMem + small exception dispatch instead of full 116K-entry table.
+            if args.len() == 1 {
+                if let Some(exception_keys) = self.dispatch_tables.get(name).and_then(classify_near_identity_read) {
+                    return self.compile_near_identity_dispatch(name, args, &exception_keys, ops);
+                }
+            }
             return self.compile_dispatch_call(name, args, ops);
         }
 
@@ -1103,9 +1144,113 @@ impl Compiler {
             .is_some_and(is_dispatch_identity_read)
     }
 
+    /// Compile a near-identity-read dispatch table.
+    ///
+    /// For tables where 99%+ of entries are identity reads (key K → state[K]),
+    /// we emit LoadMem as the default path and only compile a small dispatch table
+    /// for the exception entries. This avoids recompiling 116K+ entries on each call.
+    fn compile_near_identity_dispatch(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        exception_keys: &[i64],
+        ops: &mut Vec<Op>,
+    ) -> Slot {
+        let table = self.dispatch_tables.remove(name).unwrap();
+        let func = self.functions.get(name).cloned();
+
+        // Bind arguments to parameter slots
+        let saved: Vec<(String, Option<Slot>)> = if let Some(ref f) = func {
+            f.parameters
+                .iter()
+                .enumerate()
+                .map(|(i, param)| {
+                    let old = self.property_slots.get(&param.name).copied();
+                    let val_slot = args
+                        .get(i)
+                        .map(|a| self.compile_expr(a, ops))
+                        .unwrap_or_else(|| {
+                            let s = self.alloc();
+                            ops.push(Op::LoadLit { dst: s, val: 0 });
+                            s
+                        });
+                    self.property_slots.insert(param.name.clone(), val_slot);
+                    (param.name.clone(), old)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Compile the key (address) lookup
+        let key_slot = self.compile_var(&table.key_property, None, ops);
+
+        // Default path: LoadMem — works for all identity-read entries
+        let dst = self.alloc();
+        ops.push(Op::LoadMem {
+            dst,
+            addr_slot: key_slot,
+        });
+
+        // Build a small dispatch table for just the exception entries
+        if !exception_keys.is_empty() {
+            let mut compiled_entries = HashMap::new();
+            for &key_val in exception_keys {
+                if let Some(entry_expr) = table.entries.get(&key_val) {
+                    let mut entry_ops = Vec::new();
+                    let result = self.compile_expr(entry_expr, &mut entry_ops);
+                    compiled_entries.insert(key_val, (entry_ops, result));
+                }
+            }
+            let mut fallback_ops = Vec::new();
+            let fallback_slot = {
+                let s = self.alloc();
+                fallback_ops.push(Op::LoadSlot { dst: s, src: dst });
+                s
+            };
+            let table_id = self.compiled_dispatches.len() as Slot;
+            self.compiled_dispatches.push(CompiledDispatchTable {
+                entries: compiled_entries,
+                fallback_ops,
+                fallback_slot,
+            });
+            let override_dst = self.alloc();
+            ops.push(Op::Dispatch {
+                dst: override_dst,
+                key: key_slot,
+                table_id,
+                fallback_target: 0,
+            });
+            // Use the dispatch result (which falls back to LoadMem result for non-exceptions)
+            // Restore and return
+            self.dispatch_tables.insert(name.to_string(), table);
+            for (param_name, old) in saved {
+                match old {
+                    Some(s) => { self.property_slots.insert(param_name, s); }
+                    None => { self.property_slots.remove(&param_name); }
+                }
+            }
+            return override_dst;
+        }
+
+        // No exceptions — just LoadMem
+        self.dispatch_tables.insert(name.to_string(), table);
+        for (param_name, old) in saved {
+            match old {
+                Some(s) => { self.property_slots.insert(param_name, s); }
+                None => { self.property_slots.remove(&param_name); }
+            }
+        }
+        dst
+    }
+
     /// Compile a dispatch table function call.
+    ///
+    /// Large dispatch tables (≥100 entries) are compiled once and cached — subsequent
+    /// calls reuse the same `table_id`. This is safe because dispatch table entries
+    /// are keyed by the dispatch value (the parameter), not by parameter slots. The
+    /// parameter only appears as the key; entry bodies are context-independent.
     fn compile_dispatch_call(&mut self, name: &str, args: &[Expr], ops: &mut Vec<Op>) -> Slot {
-        // Take the dispatch table temporarily to avoid borrow conflicts
         let table = self.dispatch_tables.remove(name).unwrap();
         let func = self.functions.get(name).cloned();
 
@@ -1135,24 +1280,36 @@ impl Compiler {
         // Compile the key lookup
         let key_slot = self.compile_var(&table.key_property, None, ops);
 
-        // Compile each dispatch entry into its own op sequence
-        let mut compiled_entries = HashMap::new();
-        for (&key_val, entry_expr) in &table.entries {
-            let mut entry_ops = Vec::new();
-            let result = self.compile_expr(entry_expr, &mut entry_ops);
-            compiled_entries.insert(key_val, (entry_ops, result));
-        }
+        // Check cache for large tables — compile entries only once
+        let table_id = if let Some(&cached_id) = self.dispatch_cache.get(name) {
+            cached_id
+        } else {
+            // Compile each dispatch entry into its own op sequence
+            let mut compiled_entries = HashMap::new();
+            for (&key_val, entry_expr) in &table.entries {
+                let mut entry_ops = Vec::new();
+                let result = self.compile_expr(entry_expr, &mut entry_ops);
+                compiled_entries.insert(key_val, (entry_ops, result));
+            }
 
-        // Compile fallback
-        let mut fallback_ops = Vec::new();
-        let fallback_slot = self.compile_expr(&table.fallback, &mut fallback_ops);
+            // Compile fallback
+            let mut fallback_ops = Vec::new();
+            let fallback_slot = self.compile_expr(&table.fallback, &mut fallback_ops);
 
-        let table_id = self.compiled_dispatches.len() as Slot;
-        self.compiled_dispatches.push(CompiledDispatchTable {
-            entries: compiled_entries,
-            fallback_ops,
-            fallback_slot,
-        });
+            let id = self.compiled_dispatches.len() as Slot;
+            self.compiled_dispatches.push(CompiledDispatchTable {
+                entries: compiled_entries,
+                fallback_ops,
+                fallback_slot,
+            });
+
+            // Cache large tables for reuse
+            if table.entries.len() >= 100 {
+                self.dispatch_cache.insert(name.to_string(), id);
+            }
+
+            id
+        };
 
         // Restore the dispatch table and parameter bindings
         self.dispatch_tables.insert(name.to_string(), table);
@@ -1304,6 +1461,7 @@ pub fn compile(
 /// since only one entry executes per tick, all entries in a table can share the
 /// same slot range.
 fn compact_slots(program: &mut CompiledProgram) {
+    #[cfg(not(target_arch = "wasm32"))]
     let compact_start = std::time::Instant::now();
     let before = program.slot_count;
 
@@ -1353,6 +1511,9 @@ fn compact_slots(program: &mut CompiledProgram) {
         *val = slot_map[val];
     }
 
+    // Reusable scratch buffers — avoids repeated HashMap allocations
+    let mut scratch = SubOpScratch::new();
+
     // Phase 2: compact dispatch table entries
     // Each table's entries share slots starting from main_high (they never
     // execute simultaneously). Fallback ops are also compacted per-table.
@@ -1365,12 +1526,13 @@ fn compact_slots(program: &mut CompiledProgram) {
             &mut table.fallback_slot,
             main_high,
             &slot_map,
+            &mut scratch,
         );
         table_high = table_high.max(fb_high);
 
         // Compact each entry — all overlay from main_high
         for (entry_ops, result_slot) in table.entries.values_mut() {
-            let entry_high = compact_sub_ops(entry_ops, result_slot, main_high, &slot_map);
+            let entry_high = compact_sub_ops(entry_ops, result_slot, main_high, &slot_map, &mut scratch);
             table_high = table_high.max(entry_high);
         }
 
@@ -1385,7 +1547,7 @@ fn compact_slots(program: &mut CompiledProgram) {
         bw.dest_slot = slot_map.get(&bw.dest_slot).copied().unwrap_or(bw.dest_slot);
 
         // value_ops get their own compact range starting from main_high
-        let bw_high = compact_sub_ops(&mut bw.value_ops, &mut bw.value_slot, main_high, &slot_map);
+        let bw_high = compact_sub_ops(&mut bw.value_ops, &mut bw.value_slot, main_high, &slot_map, &mut scratch);
         alloc.high_water = alloc.high_water.max(bw_high);
 
         // Spillover entries
@@ -1395,7 +1557,7 @@ fn compact_slots(program: &mut CompiledProgram) {
                 .copied()
                 .unwrap_or(spillover.guard_slot);
             for (spill_ops, spill_slot) in spillover.entries.values_mut() {
-                let sp_high = compact_sub_ops(spill_ops, spill_slot, main_high, &slot_map);
+                let sp_high = compact_sub_ops(spill_ops, spill_slot, main_high, &slot_map, &mut scratch);
                 alloc.high_water = alloc.high_water.max(sp_high);
             }
         }
@@ -1403,12 +1565,20 @@ fn compact_slots(program: &mut CompiledProgram) {
 
     program.slot_count = alloc.high_water;
 
+    #[cfg(not(target_arch = "wasm32"))]
     log::info!(
         "Slot compaction: {} → {} slots ({:.1}% reduction, {:.2}s)",
         before,
         program.slot_count,
         (1.0 - program.slot_count as f64 / before.max(1) as f64) * 100.0,
         compact_start.elapsed().as_secs_f64(),
+    );
+    #[cfg(target_arch = "wasm32")]
+    log::info!(
+        "Slot compaction: {} → {} slots ({:.1}% reduction)",
+        before,
+        program.slot_count,
+        (1.0 - program.slot_count as f64 / before.max(1) as f64) * 100.0,
     );
 }
 
@@ -1453,43 +1623,66 @@ fn compute_liveness(ops: &[Op]) -> (HashMap<Slot, usize>, HashMap<usize, Vec<Slo
 /// Compact a sub-op stream (dispatch entry, broadcast value, spillover).
 /// These get a fresh allocator starting from `base_slot`, and return the
 /// high-water mark.
+///
+/// Reusable scratch buffers are passed in to avoid per-call allocation overhead
+/// (critical when called 40M+ times for large dispatch tables).
 fn compact_sub_ops(
     ops: &mut [Op],
     result_slot: &mut Slot,
     base_slot: Slot,
     parent_slot_map: &HashMap<Slot, Slot>,
+    scratch: &mut SubOpScratch,
 ) -> Slot {
     if ops.is_empty() {
-        // result_slot may reference a main-stream slot; remap it
         if let Some(&mapped) = parent_slot_map.get(result_slot) {
             *result_slot = mapped;
         }
         return base_slot;
     }
-    let mut alloc = SlotAllocator::with_base(base_slot);
-    let (_last_use, dying_at) = compute_liveness(ops);
 
-    // Use a small local map for sub-op slots, falling back to parent map.
-    // Avoids cloning the (potentially huge) parent map for each entry.
-    let mut local_map: HashMap<Slot, Slot> = HashMap::new();
+    // Ultra-fast path: single LoadLit (the overwhelming majority of dispatch entries).
+    // No parent slots, no HashMap lookups needed — just renumber the destination.
+    if ops.len() == 1 {
+        if let Op::LoadLit { dst, .. } = &mut ops[0] {
+            let orig = *dst;
+            *dst = base_slot;
+            // result_slot is the same as the LoadLit's dst
+            if *result_slot == orig {
+                *result_slot = base_slot;
+            } else if let Some(&mapped) = parent_slot_map.get(result_slot) {
+                *result_slot = mapped;
+            }
+            return base_slot + 1;
+        }
+    }
+
+    // Fast path for tiny sub-ops (1-2 ops): no liveness analysis needed.
+    // Just remap parent-scope slots and assign fresh locals sequentially.
+    if ops.len() <= 2 {
+        return compact_sub_ops_tiny(ops, result_slot, base_slot, parent_slot_map, scratch);
+    }
+
+    // General path: full liveness analysis with reusable scratch buffers
+    scratch.clear();
+    let mut alloc = SlotAllocator::with_base(base_slot);
+
+    // Compute liveness into scratch vectors
+    compute_liveness_into(ops, &mut scratch.last_use, &mut scratch.dying_at);
 
     // Pre-assign the result slot (if not already mapped from parent)
     let orig_result = *result_slot;
     if !parent_slot_map.contains_key(&orig_result) {
         alloc.assign(orig_result);
-        local_map.insert(orig_result, alloc.get(orig_result));
+        scratch.local_map.insert(orig_result, alloc.get(orig_result));
     }
 
     for (i, op) in ops.iter_mut().enumerate() {
-        // Seed local map from parent for any slots referenced by this op
-        // that we haven't seen yet. This avoids cloning the entire parent map.
-        seed_from_parent(op, &mut local_map, parent_slot_map);
-        map_op_slots(op, &mut local_map, &mut alloc);
-        // Free dead slots that are NOT from the parent scope
-        if let Some(dying) = dying_at.get(&i) {
+        seed_from_parent(op, &mut scratch.local_map, parent_slot_map);
+        map_op_slots(op, &mut scratch.local_map, &mut alloc);
+        if let Some(dying) = scratch.dying_at.get(&i) {
             for &orig_slot in dying {
                 if orig_slot != orig_result && !parent_slot_map.contains_key(&orig_slot) {
-                    if let Some(&mapped) = local_map.get(&orig_slot) {
+                    if let Some(&mapped) = scratch.local_map.get(&orig_slot) {
                         alloc.free(mapped);
                     }
                 }
@@ -1497,12 +1690,87 @@ fn compact_sub_ops(
         }
     }
 
-    *result_slot = local_map
+    *result_slot = scratch
+        .local_map
         .get(&orig_result)
         .or_else(|| parent_slot_map.get(&orig_result))
         .copied()
         .unwrap_or(orig_result);
     alloc.high_water
+}
+
+/// Fast-path compaction for sub-op streams with 1-2 ops.
+///
+/// With so few ops, liveness analysis is pointless — no slot can die before
+/// the end. We just remap parent-scope slots and assign sequential new slots
+/// for any locals.
+fn compact_sub_ops_tiny(
+    ops: &mut [Op],
+    result_slot: &mut Slot,
+    base_slot: Slot,
+    parent_slot_map: &HashMap<Slot, Slot>,
+    scratch: &mut SubOpScratch,
+) -> Slot {
+    scratch.local_map.clear();
+    let mut alloc = SlotAllocator::with_base(base_slot);
+
+    let orig_result = *result_slot;
+    if !parent_slot_map.contains_key(&orig_result) {
+        alloc.assign(orig_result);
+        scratch.local_map.insert(orig_result, alloc.get(orig_result));
+    }
+
+    for op in ops.iter_mut() {
+        seed_from_parent(op, &mut scratch.local_map, parent_slot_map);
+        map_op_slots(op, &mut scratch.local_map, &mut alloc);
+    }
+
+    *result_slot = scratch
+        .local_map
+        .get(&orig_result)
+        .or_else(|| parent_slot_map.get(&orig_result))
+        .copied()
+        .unwrap_or(orig_result);
+    alloc.high_water
+}
+
+/// Reusable scratch buffers for `compact_sub_ops` to avoid per-call allocation.
+struct SubOpScratch {
+    local_map: HashMap<Slot, Slot>,
+    last_use: HashMap<Slot, usize>,
+    dying_at: HashMap<usize, Vec<Slot>>,
+}
+
+impl SubOpScratch {
+    fn new() -> Self {
+        Self {
+            local_map: HashMap::new(),
+            last_use: HashMap::new(),
+            dying_at: HashMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.local_map.clear();
+        self.last_use.clear();
+        self.dying_at.clear();
+    }
+}
+
+/// Compute liveness into caller-provided maps (avoids allocation per call).
+fn compute_liveness_into(
+    ops: &[Op],
+    last_use: &mut HashMap<Slot, usize>,
+    dying_at: &mut HashMap<usize, Vec<Slot>>,
+) {
+    for (i, op) in ops.iter().enumerate() {
+        for s in op_slots_read(op).into_iter().chain(op_dst(op)) {
+            last_use.insert(s, i);
+        }
+    }
+    for (&slot, &idx) in last_use.iter() {
+        dying_at.entry(idx).or_default().push(slot);
+    }
 }
 
 /// Simple slot allocator with a free list.
@@ -1911,7 +2179,7 @@ fn exec_ops(
                 }
             }
             Op::LoadKeyboard { dst } => {
-                slots[*dst as usize] = state.keyboard as i32;
+                slots[*dst as usize] = state.keyboard;
             }
             Op::Add { dst, a, b } => {
                 slots[*dst as usize] = slots[*a as usize].wrapping_add(slots[*b as usize]);
@@ -2090,7 +2358,6 @@ fn is_byte_half(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval;
     use crate::state;
 
     /// Install a test address map so property_to_address works for --AX etc.

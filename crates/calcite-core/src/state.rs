@@ -99,10 +99,15 @@ pub struct State {
     pub registers: [i32; reg::COUNT],
     /// Flat memory (byte-addressable, default 1,536 bytes).
     pub memory: Vec<u8>,
+    /// Extended properties: full-width i32 storage for addresses above the byte
+    /// memory range (e.g., file I/O counters at 0xFFFF0+). Reads/writes bypass
+    /// the u8 truncation of the memory array.
+    pub extended: std::collections::HashMap<i32, i32>,
     /// String property values (e.g., `--textBuffer` for text output).
     pub string_properties: std::collections::HashMap<String, String>,
-    /// Last keyboard input (for INT 16h emulation).
-    pub keyboard: u8,
+    /// Last keyboard input (for INT 16h / INT 21h).
+    /// Packed as (scancode << 8 | ascii) matching DOS conventions.
+    pub keyboard: i32,
     /// Tick counter (incremented each evaluation cycle).
     pub frame_counter: u32,
 }
@@ -113,8 +118,9 @@ impl State {
         Self {
             registers: [0; reg::COUNT],
             memory: vec![0; mem_size],
+            extended: std::collections::HashMap::new(),
             string_properties: std::collections::HashMap::new(),
-            keyboard: 0,
+            keyboard: 0i32,
             frame_counter: 0,
         }
     }
@@ -145,6 +151,10 @@ impl State {
             }
             _ => {
                 let addr = addr as usize;
+                // High addresses (>= 0xF0000) use extended map for full-width i32 storage
+                if addr >= 0xF0000 {
+                    return self.extended.get(&(addr as i32)).copied().unwrap_or(0);
+                }
                 if addr < self.memory.len() {
                     self.memory[addr] as i32
                 } else {
@@ -181,18 +191,25 @@ impl State {
                 let lo = Self::lo8(self.registers[reg_idx]);
                 self.registers[reg_idx] = (value & 0xFF) * 256 + lo;
             }
-            // Write to full 16-bit register — mask to 16 bits.
-            // x86 registers are 16-bit unsigned; CSS uses --lowerBytes() for
-            // truncation but intermediate values can overflow. Masking here
-            // ensures register values stay in 0..65535 range.
+            // Write to register — mask to 16 bits, except IP which stores
+            // flat addresses (CS*16 + offset) that can exceed 0xFFFF.
             -14..=-1 => {
                 let reg_idx = (-addr - 1) as usize;
-                self.registers[reg_idx] = value & 0xFFFF;
+                if addr == crate::state::addr::IP {
+                    self.registers[reg_idx] = value;
+                } else {
+                    self.registers[reg_idx] = value & 0xFFFF;
+                }
             }
             _ => {
-                let addr = addr as usize;
-                if addr < self.memory.len() {
-                    self.memory[addr] = (value & 0xFF) as u8;
+                let addr_u = addr as usize;
+                // High addresses (>= 0xF0000) use extended map for full-width i32 storage
+                if addr_u >= 0xF0000 {
+                    self.extended.insert(addr, value);
+                    return;
+                }
+                if addr_u < self.memory.len() {
+                    self.memory[addr_u] = (value & 0xFF) as u8;
                 }
             }
         }
@@ -227,14 +244,7 @@ impl State {
                 } else {
                     b' '
                 };
-                // Map printable ASCII; replace control chars with '.'
-                row.push(if (0x20..0x7F).contains(&ch) {
-                    ch as char
-                } else if ch == 0 {
-                    ' '
-                } else {
-                    '.'
-                });
+                row.push(cp437_to_unicode(ch));
             }
             lines.push(row);
         }
@@ -267,16 +277,19 @@ impl State {
     pub fn load_properties(&mut self, properties: &[crate::types::PropertyDef]) {
         use crate::types::CssValue;
 
-        // First pass: find the maximum memory address to size the array
+        // First pass: find the maximum memory address to size the array.
+        // Skip extended addresses (>= 0xF0000) — they use the HashMap, not the byte array.
         let mut max_addr: usize = 0;
         for prop in properties {
             if let Some(addr) = super::eval::property_to_address(&prop.name) {
-                if addr >= 0 {
-                    max_addr = max_addr.max(addr as usize + 1);
+                let addr_u = addr as usize;
+                if addr >= 0 && addr_u < 0xF0000 {
+                    max_addr = max_addr.max(addr_u + 1);
                 }
             }
         }
         if max_addr > self.memory.len() {
+            log::info!("Auto-sizing memory: {} → {} bytes", self.memory.len(), max_addr);
             self.memory.resize(max_addr, 0);
         }
 
@@ -298,6 +311,42 @@ impl State {
 impl Default for State {
     fn default() -> Self {
         Self::new(DEFAULT_MEM_SIZE)
+    }
+}
+
+/// Map a CP437 byte to a Unicode character for terminal rendering.
+fn cp437_to_unicode(b: u8) -> char {
+    // CP437 low control range (0x00-0x1F) and 0x7F mapped to common glyphs
+    const LOW: [char; 32] = [
+        ' ', '\u{263A}', '\u{263B}', '\u{2665}', '\u{2666}', '\u{2663}', '\u{2660}', '\u{2022}',
+        '\u{25D8}', '\u{25CB}', '\u{25D9}', '\u{2642}', '\u{2640}', '\u{266A}', '\u{266B}', '\u{263C}',
+        '\u{25BA}', '\u{25C4}', '\u{2195}', '\u{203C}', '\u{00B6}', '\u{00A7}', '\u{25AC}', '\u{21A8}',
+        '\u{2191}', '\u{2193}', '\u{2192}', '\u{2190}', '\u{221F}', '\u{2194}', '\u{25B2}', '\u{25BC}',
+    ];
+    // CP437 high range (0x80-0xFF)
+    const HIGH: [char; 128] = [
+        '\u{00C7}', '\u{00FC}', '\u{00E9}', '\u{00E2}', '\u{00E4}', '\u{00E0}', '\u{00E5}', '\u{00E7}',
+        '\u{00EA}', '\u{00EB}', '\u{00E8}', '\u{00EF}', '\u{00EE}', '\u{00EC}', '\u{00C4}', '\u{00C5}',
+        '\u{00C9}', '\u{00E6}', '\u{00C6}', '\u{00F4}', '\u{00F6}', '\u{00F2}', '\u{00FB}', '\u{00F9}',
+        '\u{00FF}', '\u{00D6}', '\u{00DC}', '\u{00A2}', '\u{00A3}', '\u{00A5}', '\u{20A7}', '\u{0192}',
+        '\u{00E1}', '\u{00ED}', '\u{00F3}', '\u{00FA}', '\u{00F1}', '\u{00D1}', '\u{00AA}', '\u{00BA}',
+        '\u{00BF}', '\u{2310}', '\u{00AC}', '\u{00BD}', '\u{00BC}', '\u{00A1}', '\u{00AB}', '\u{00BB}',
+        '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+        '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255D}', '\u{255C}', '\u{255B}', '\u{2510}',
+        '\u{2514}', '\u{2534}', '\u{252C}', '\u{251C}', '\u{2500}', '\u{253C}', '\u{255E}', '\u{255F}',
+        '\u{255A}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256C}', '\u{2567}',
+        '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256B}',
+        '\u{256A}', '\u{2518}', '\u{250C}', '\u{2588}', '\u{2584}', '\u{258C}', '\u{2590}', '\u{2580}',
+        '\u{03B1}', '\u{00DF}', '\u{0393}', '\u{03C0}', '\u{03A3}', '\u{03C3}', '\u{00B5}', '\u{03C4}',
+        '\u{03A6}', '\u{0398}', '\u{03A9}', '\u{03B4}', '\u{221E}', '\u{03C6}', '\u{03B5}', '\u{2229}',
+        '\u{2261}', '\u{00B1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00F7}', '\u{2248}',
+        '\u{00B0}', '\u{2219}', '\u{00B7}', '\u{221A}', '\u{207F}', '\u{00B2}', '\u{25A0}', ' ',
+    ];
+    match b {
+        0x00..=0x1F => LOW[b as usize],
+        0x20..=0x7E => b as char,
+        0x7F => '\u{2302}',
+        _ => HIGH[(b - 0x80) as usize],
     }
 }
 

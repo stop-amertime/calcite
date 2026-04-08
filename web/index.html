@@ -34,7 +34,7 @@
       border-right: 2px solid #808080;
       border-bottom: 2px solid #808080;
       box-shadow: 1px 1px 0 #000;
-      width: 640px;
+      width: 720px;
       max-width: 100%;
       margin-bottom: 4px;
     }
@@ -48,30 +48,6 @@
       justify-content: space-between;
       align-items: center;
       user-select: none;
-    }
-
-    .title-bar-controls {
-      display: flex;
-      gap: 2px;
-    }
-
-    .title-btn {
-      background: #c0c0c0;
-      border-top: 1px solid #fff;
-      border-left: 1px solid #fff;
-      border-right: 1px solid #808080;
-      border-bottom: 1px solid #808080;
-      color: #000;
-      font-family: inherit;
-      font-size: 10px;
-      width: 18px;
-      height: 14px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      padding: 0;
-      line-height: 1;
     }
 
     .window-body {
@@ -112,18 +88,6 @@
     }
 
     /* ── Sunken fields ── */
-    .field {
-      border-top: 1px solid #808080;
-      border-left: 1px solid #808080;
-      border-right: 1px solid #fff;
-      border-bottom: 1px solid #fff;
-      background: #fff;
-      color: #000;
-      font-family: inherit;
-      font-size: 12px;
-      padding: 2px 4px;
-    }
-
     .field-dark {
       border-top: 1px solid #808080;
       border-left: 1px solid #808080;
@@ -134,20 +98,11 @@
       font-family: inherit;
       font-size: 14px;
       padding: 8px;
-      white-space: pre-wrap;
-      word-break: break-all;
+      white-space: pre;
+      line-height: 1.15;
       min-height: 200px;
       overflow-y: auto;
-      max-height: 400px;
-    }
-
-    .field-dark:empty::after {
-      content: 'C:\\>';
-      animation: blink 1s step-end infinite;
-    }
-
-    @keyframes blink {
-      50% { opacity: 0; }
+      max-height: none;
     }
 
     /* ── Layout helpers ── */
@@ -160,11 +115,23 @@
 
     .row:last-child { margin-bottom: 0; }
 
-    label {
-      font-size: 12px;
-    }
+    label { font-size: 12px; }
 
     .spacer { flex: 1; }
+
+    input[type="number"] { width: 60px; }
+
+    .field {
+      border-top: 1px solid #808080;
+      border-left: 1px solid #808080;
+      border-right: 1px solid #fff;
+      border-bottom: 1px solid #fff;
+      background: #fff;
+      color: #000;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 2px 4px;
+    }
 
     /* ── Status bar ── */
     .status-bar {
@@ -196,7 +163,6 @@
       font-size: 11px;
     }
 
-    /* ── Separator ── */
     hr.groove {
       border: none;
       border-top: 1px solid #808080;
@@ -206,77 +172,14 @@
 
     input[type="file"] { display: none; }
 
-    input[type="number"] {
-      width: 60px;
-    }
-
-    /* ── Source viewer ── */
-    .source-toggle {
-      cursor: pointer;
-      user-select: none;
-      font-size: 12px;
-    }
-
-    .source-toggle::before {
-      content: '\25BA ';
-    }
-
-    .source-toggle.open::before {
-      content: '\25BC ';
-    }
-
-    .source-body {
-      display: none;
-      margin-top: 6px;
-    }
-
-    .source-body.open {
-      display: block;
-    }
-
-    .source-view {
-      border-top: 1px solid #808080;
-      border-left: 1px solid #808080;
-      border-right: 1px solid #fff;
-      border-bottom: 1px solid #fff;
-      background: #fff;
-      color: #000;
-      font-family: inherit;
-      font-size: 11px;
-      padding: 4px;
-      height: 200px;
-      overflow-y: auto;
-      white-space: pre;
-      tab-size: 2;
-    }
-
-    .source-view .line-no {
-      color: #808080;
+    /* ── Mode badge ── */
+    .mode-badge {
       display: inline-block;
-      width: 5ch;
-      text-align: right;
-      margin-right: 1ch;
-      user-select: none;
-    }
-
-    .source-pager {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      margin-top: 4px;
-      font-size: 11px;
-    }
-
-    .source-pager .btn {
-      min-width: 30px;
-      font-size: 11px;
+      background: #000080;
+      color: #fff;
       padding: 1px 6px;
-    }
-
-    .source-info {
-      color: #808080;
-      font-size: 11px;
-      margin-top: 4px;
+      font-size: 10px;
+      margin-left: 6px;
     }
   </style>
 </head>
@@ -286,67 +189,38 @@
   <div class="window">
     <div class="title-bar">
       <span>calc(ite) - CSS Program Runner</span>
-      <div class="title-bar-controls">
-        <button class="title-btn">_</button>
-        <button class="title-btn">X</button>
-      </div>
     </div>
     <div class="window-body">
 
-      <!-- File group -->
+      <!-- File + controls -->
       <div class="group">
         <span class="group-label">Program</span>
         <div class="row">
           <label id="file-label" class="btn" style="display:inline-block; text-align:center;">
-            Open...
+            Open .css
             <input id="file-input" type="file" accept=".css,.html,.htm">
           </label>
-          <button id="btn-paste" class="btn">Paste CSS</button>
           <div class="spacer"></div>
           <span id="file-name" style="font-size:11px; color:#808080;">No file loaded</span>
+          <span id="mode-badge" class="mode-badge" style="display:none;"></span>
         </div>
-      </div>
-
-      <!-- Source viewer -->
-      <div class="group" id="source-group" style="display:none;">
-        <span class="group-label">Source</span>
-        <span class="source-toggle" id="source-toggle">View CSS source</span>
-        <div class="source-body" id="source-body">
-          <div class="source-view" id="source-view"></div>
-          <div class="source-pager">
-            <button class="btn" id="src-first" disabled>&lt;&lt;</button>
-            <button class="btn" id="src-prev" disabled>&lt;</button>
-            <span id="src-page-info">-</span>
-            <button class="btn" id="src-next" disabled>&gt;</button>
-            <button class="btn" id="src-last" disabled>&gt;&gt;</button>
-            <div class="spacer"></div>
-            <label>Lines/page:</label>
-            <input class="field" id="src-page-size" type="number" value="100" min="10" max="1000" style="width:50px;">
-          </div>
-          <div class="source-info" id="source-info"></div>
-        </div>
-      </div>
-
-      <!-- Execution controls -->
-      <div class="group">
-        <span class="group-label">Execution</span>
         <div class="row">
           <button id="btn-start" class="btn" disabled>Run</button>
           <button id="btn-stop" class="btn" disabled>Stop</button>
           <div class="spacer"></div>
           <label>Ticks/batch:</label>
-          <input id="batch-size" class="field" type="number" value="10" min="1" max="10000">
+          <input id="batch-size" class="field" type="number" value="100" min="1" max="10000">
         </div>
       </div>
 
       <hr class="groove">
 
-      <!-- Output area -->
-      <pre id="text-output" class="field-dark"></pre>
+      <!-- Output area — switches between screen and text automatically -->
+      <div id="output" class="field-dark"></div>
 
       <!-- Status bar -->
       <div class="status-bar">
-        <span id="status">Ready</span>
+        <span id="status">Drop a .css file to begin</span>
         <span style="float:right" id="stats"></span>
       </div>
 
@@ -356,53 +230,64 @@
   <script>
     const worker = new Worker('calcite-worker.js', { type: 'module' });
     const status = document.getElementById('status');
-    const textOutput = document.getElementById('text-output');
+    const output = document.getElementById('output');
     const stats = document.getElementById('stats');
     const btnStart = document.getElementById('btn-start');
     const btnStop = document.getElementById('btn-stop');
     const batchInput = document.getElementById('batch-size');
     const fileInput = document.getElementById('file-input');
-    const btnPaste = document.getElementById('btn-paste');
     const fileName = document.getElementById('file-name');
+    const modeBadge = document.getElementById('mode-badge');
 
     let running = false;
     let totalTicks = 0;
     let startTime = 0;
     let engineReady = false;
-
-    let targetElement = null;
+    let hasVideo = false;
 
     worker.onmessage = ({ data }) => {
       switch (data.type) {
         case 'ready':
-          status.textContent = 'Engine ready';
           engineReady = true;
           btnStart.disabled = false;
+
+          if (data.video) {
+            hasVideo = true;
+            modeBadge.textContent = `VIDEO ${data.video.width}x${data.video.height}`;
+            modeBadge.style.display = '';
+            output.style.minHeight = '0';
+            status.textContent = 'Ready — press Run (keyboard active when running)';
+          } else {
+            hasVideo = false;
+            modeBadge.textContent = 'TEXT';
+            modeBadge.style.display = '';
+            status.textContent = 'Ready — press Run';
+          }
           break;
 
         case 'tick-result':
           totalTicks += data.ticks;
           const elapsed = (performance.now() - startTime) / 1000;
-          stats.textContent = `${totalTicks} ticks | ${(totalTicks / elapsed).toFixed(0)} t/s`;
+          stats.textContent = `${totalTicks.toLocaleString()} ticks | ${(totalTicks / elapsed).toFixed(0)} t/s`;
 
-          if (targetElement && data.changes) {
-            for (const [name, value] of data.changes) {
-              targetElement.style.setProperty(name, value);
-            }
-          }
-
-          if (data.stringProperties) {
+          if (hasVideo && data.screen != null) {
+            output.textContent = data.screen;
+          } else if (data.stringProperties) {
             const parts = [];
             for (const [key, value] of Object.entries(data.stringProperties)) {
               if (value) parts.push(value);
             }
             if (parts.length > 0) {
-              textOutput.textContent = parts.join('\n');
+              const text = parts.join('\n');
+              // Only show the last 50 lines to prevent unbounded growth
+              const lines = text.split('\n');
+              output.textContent = lines.length > 50 ? lines.slice(-50).join('\n') : text;
+              output.scrollTop = output.scrollHeight;
             }
           }
 
           if (running) {
-            worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 10 });
+            worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 100 });
           }
           break;
 
@@ -422,7 +307,7 @@
       btnStart.disabled = true;
       btnStop.disabled = false;
       status.textContent = 'Running...';
-      worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 10 });
+      worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 100 });
     });
 
     btnStop.addEventListener('click', () => {
@@ -439,6 +324,7 @@
       return Array.from(styles).map(s => s.textContent).join('\n');
     }
 
+    window.loadCss = loadCss;
     function loadCss(cssText) {
       if (!cssText || cssText.trim().length === 0) {
         status.textContent = 'No CSS found in file';
@@ -446,13 +332,14 @@
       }
       running = false;
       engineReady = false;
+      hasVideo = false;
       totalTicks = 0;
       btnStart.disabled = true;
       btnStop.disabled = true;
-      textOutput.textContent = '';
+      output.textContent = '';
       stats.textContent = '';
+      modeBadge.style.display = 'none';
       status.textContent = `Compiling ${(cssText.length / 1024).toFixed(0)} KB...`;
-      loadSource(cssText);
       worker.postMessage({ type: 'init', css: cssText });
     }
 
@@ -471,90 +358,59 @@
       reader.readAsText(file);
     });
 
-    btnPaste.addEventListener('click', () => {
-      const css = prompt('Paste CSS source text:');
-      if (css) {
-        fileName.textContent = '(pasted)';
-        loadCss(css);
+    // ── Drag and drop ──
+    document.body.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    });
+
+    document.body.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const file = e.dataTransfer.files[0];
+      if (!file) return;
+      fileName.textContent = file.name;
+      const reader = new FileReader();
+      reader.onload = () => {
+        let text = reader.result;
+        if (file.name.endsWith('.html') || file.name.endsWith('.htm')) {
+          text = extractCssFromHtml(text);
+        }
+        loadCss(text);
+      };
+      reader.readAsText(file);
+    });
+
+    // ── Keyboard input ──
+    const dosKeyMap = {
+      'ArrowUp': 0x4800,    'ArrowDown': 0x5000,
+      'ArrowLeft': 0x4B00,  'ArrowRight': 0x4D00,
+      'Escape': 0x011B,     'Enter': 0x1C0D,
+      'Backspace': 0x0E08,  'Tab': 0x0F09,
+      ' ': 0x3920,
+    };
+
+    function keyToCode(e) {
+      if (dosKeyMap[e.key]) return dosKeyMap[e.key];
+      const c = e.key.length === 1 ? e.key.charCodeAt(0) : 0;
+      if (c >= 0x20 && c <= 0x7E) return c;
+      return 0;
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (!engineReady || !running) return;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      const code = keyToCode(e);
+      if (code) {
+        worker.postMessage({ type: 'keyboard', key: code });
+        e.preventDefault();
       }
     });
 
-    // ── Source viewer ──
-    const sourceGroup = document.getElementById('source-group');
-    const sourceToggle = document.getElementById('source-toggle');
-    const sourceBody = document.getElementById('source-body');
-    const sourceView = document.getElementById('source-view');
-    const sourceInfo = document.getElementById('source-info');
-    const srcFirst = document.getElementById('src-first');
-    const srcPrev = document.getElementById('src-prev');
-    const srcNext = document.getElementById('src-next');
-    const srcLast = document.getElementById('src-last');
-    const srcPageInfo = document.getElementById('src-page-info');
-    const srcPageSize = document.getElementById('src-page-size');
-
-    let cssLines = [];
-    let srcPage = 0;
-
-    function getSrcPageSize() {
-      return Math.max(10, parseInt(srcPageSize.value, 10) || 100);
-    }
-
-    function srcTotalPages() {
-      return Math.max(1, Math.ceil(cssLines.length / getSrcPageSize()));
-    }
-
-    function renderSourcePage() {
-      const pageSize = getSrcPageSize();
-      const totalPages = srcTotalPages();
-      srcPage = Math.max(0, Math.min(srcPage, totalPages - 1));
-      const start = srcPage * pageSize;
-      const end = Math.min(start + pageSize, cssLines.length);
-
-      const fragment = document.createDocumentFragment();
-      for (let i = start; i < end; i++) {
-        const lineEl = document.createElement('div');
-        const numSpan = document.createElement('span');
-        numSpan.className = 'line-no';
-        numSpan.textContent = i + 1;
-        lineEl.appendChild(numSpan);
-        lineEl.appendChild(document.createTextNode(cssLines[i]));
-        fragment.appendChild(lineEl);
-      }
-      sourceView.innerHTML = '';
-      sourceView.appendChild(fragment);
-
-      srcPageInfo.textContent = `${srcPage + 1} / ${totalPages}`;
-      srcFirst.disabled = srcPage === 0;
-      srcPrev.disabled = srcPage === 0;
-      srcNext.disabled = srcPage >= totalPages - 1;
-      srcLast.disabled = srcPage >= totalPages - 1;
-      sourceInfo.textContent = `${cssLines.length.toLocaleString()} lines | showing ${start + 1}\u2013${end}`;
-    }
-
-    function loadSource(cssText) {
-      cssLines = cssText.split('\n');
-      srcPage = 0;
-      sourceGroup.style.display = '';
-      if (sourceBody.classList.contains('open')) {
-        renderSourcePage();
-      }
-    }
-
-    sourceToggle.addEventListener('click', () => {
-      sourceToggle.classList.toggle('open');
-      sourceBody.classList.toggle('open');
-      if (sourceBody.classList.contains('open') && cssLines.length > 0) {
-        renderSourcePage();
-      }
+    document.addEventListener('keyup', (e) => {
+      if (!engineReady) return;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      worker.postMessage({ type: 'keyboard', key: 0 });
     });
-
-    srcFirst.addEventListener('click', () => { srcPage = 0; renderSourcePage(); });
-    srcPrev.addEventListener('click', () => { srcPage--; renderSourcePage(); });
-    srcNext.addEventListener('click', () => { srcPage++; renderSourcePage(); });
-    srcLast.addEventListener('click', () => { srcPage = srcTotalPages() - 1; renderSourcePage(); });
-    srcPageSize.addEventListener('change', () => { srcPage = 0; renderSourcePage(); });
-
-    document.querySelector('.cpu') && (targetElement = document.querySelector('.cpu'));
   </script>
 </body>
 </html>
