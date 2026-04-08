@@ -1,0 +1,157 @@
+/* ============================================================
+   CSS-DOS Screen Renderer — pure CSS character display
+
+   Each .cell element has --val set by the engine. The .cell is
+   a style container. The inner <i> uses @container style() to
+   map --val to a content character. No JS touches screen content.
+   ============================================================ */
+
+.css-screen {
+  background: #000;
+  font-family: 'DOS', 'Fixedsys', 'Terminal', 'Courier New', monospace;
+  font-size: 14px;
+  line-height: 1.15;
+  white-space: pre;
+  display: grid;
+  grid-template-columns: repeat(80, 1ch);
+  grid-template-rows: repeat(25, 1.15em);
+  width: 80ch;
+  overflow: hidden;
+  padding: 4px;
+  color: #aaa;
+  image-rendering: pixelated;
+}
+
+.cell {
+  display: block;
+  width: 1ch;
+  height: 1.15em;
+  overflow: hidden;
+  --val: 32;
+}
+
+.cv { display: contents; }
+.cv > i { font-style: normal; }
+.cv > i::after { content: " "; }
+
+/* Printable ASCII 32-126 mapped via @container style queries */
+@container style(--val: 33) { .cv > i::after { content: "!"; } }
+@container style(--val: 34) { .cv > i::after { content: "\""; } }
+@container style(--val: 35) { .cv > i::after { content: "#"; } }
+@container style(--val: 36) { .cv > i::after { content: "$"; } }
+@container style(--val: 37) { .cv > i::after { content: "%"; } }
+@container style(--val: 38) { .cv > i::after { content: "&"; } }
+@container style(--val: 39) { .cv > i::after { content: "'"; } }
+@container style(--val: 40) { .cv > i::after { content: "("; } }
+@container style(--val: 41) { .cv > i::after { content: ")"; } }
+@container style(--val: 42) { .cv > i::after { content: "*"; } }
+@container style(--val: 43) { .cv > i::after { content: "+"; } }
+@container style(--val: 44) { .cv > i::after { content: ","; } }
+@container style(--val: 45) { .cv > i::after { content: "-"; } }
+@container style(--val: 46) { .cv > i::after { content: "."; } }
+@container style(--val: 47) { .cv > i::after { content: "/"; } }
+@container style(--val: 48) { .cv > i::after { content: "0"; } }
+@container style(--val: 49) { .cv > i::after { content: "1"; } }
+@container style(--val: 50) { .cv > i::after { content: "2"; } }
+@container style(--val: 51) { .cv > i::after { content: "3"; } }
+@container style(--val: 52) { .cv > i::after { content: "4"; } }
+@container style(--val: 53) { .cv > i::after { content: "5"; } }
+@container style(--val: 54) { .cv > i::after { content: "6"; } }
+@container style(--val: 55) { .cv > i::after { content: "7"; } }
+@container style(--val: 56) { .cv > i::after { content: "8"; } }
+@container style(--val: 57) { .cv > i::after { content: "9"; } }
+@container style(--val: 58) { .cv > i::after { content: ":"; } }
+@container style(--val: 59) { .cv > i::after { content: ";"; } }
+@container style(--val: 60) { .cv > i::after { content: "<"; } }
+@container style(--val: 61) { .cv > i::after { content: "="; } }
+@container style(--val: 62) { .cv > i::after { content: ">"; } }
+@container style(--val: 63) { .cv > i::after { content: "?"; } }
+@container style(--val: 64) { .cv > i::after { content: "@"; } }
+@container style(--val: 65) { .cv > i::after { content: "A"; } }
+@container style(--val: 66) { .cv > i::after { content: "B"; } }
+@container style(--val: 67) { .cv > i::after { content: "C"; } }
+@container style(--val: 68) { .cv > i::after { content: "D"; } }
+@container style(--val: 69) { .cv > i::after { content: "E"; } }
+@container style(--val: 70) { .cv > i::after { content: "F"; } }
+@container style(--val: 71) { .cv > i::after { content: "G"; } }
+@container style(--val: 72) { .cv > i::after { content: "H"; } }
+@container style(--val: 73) { .cv > i::after { content: "I"; } }
+@container style(--val: 74) { .cv > i::after { content: "J"; } }
+@container style(--val: 75) { .cv > i::after { content: "K"; } }
+@container style(--val: 76) { .cv > i::after { content: "L"; } }
+@container style(--val: 77) { .cv > i::after { content: "M"; } }
+@container style(--val: 78) { .cv > i::after { content: "N"; } }
+@container style(--val: 79) { .cv > i::after { content: "O"; } }
+@container style(--val: 80) { .cv > i::after { content: "P"; } }
+@container style(--val: 81) { .cv > i::after { content: "Q"; } }
+@container style(--val: 82) { .cv > i::after { content: "R"; } }
+@container style(--val: 83) { .cv > i::after { content: "S"; } }
+@container style(--val: 84) { .cv > i::after { content: "T"; } }
+@container style(--val: 85) { .cv > i::after { content: "U"; } }
+@container style(--val: 86) { .cv > i::after { content: "V"; } }
+@container style(--val: 87) { .cv > i::after { content: "W"; } }
+@container style(--val: 88) { .cv > i::after { content: "X"; } }
+@container style(--val: 89) { .cv > i::after { content: "Y"; } }
+@container style(--val: 90) { .cv > i::after { content: "Z"; } }
+@container style(--val: 91) { .cv > i::after { content: "["; } }
+@container style(--val: 92) { .cv > i::after { content: "\\"; } }
+@container style(--val: 93) { .cv > i::after { content: "]"; } }
+@container style(--val: 94) { .cv > i::after { content: "^"; } }
+@container style(--val: 95) { .cv > i::after { content: "_"; } }
+@container style(--val: 96) { .cv > i::after { content: "\`"; } }
+@container style(--val: 97) { .cv > i::after { content: "a"; } }
+@container style(--val: 98) { .cv > i::after { content: "b"; } }
+@container style(--val: 99) { .cv > i::after { content: "c"; } }
+@container style(--val: 100) { .cv > i::after { content: "d"; } }
+@container style(--val: 101) { .cv > i::after { content: "e"; } }
+@container style(--val: 102) { .cv > i::after { content: "f"; } }
+@container style(--val: 103) { .cv > i::after { content: "g"; } }
+@container style(--val: 104) { .cv > i::after { content: "h"; } }
+@container style(--val: 105) { .cv > i::after { content: "i"; } }
+@container style(--val: 106) { .cv > i::after { content: "j"; } }
+@container style(--val: 107) { .cv > i::after { content: "k"; } }
+@container style(--val: 108) { .cv > i::after { content: "l"; } }
+@container style(--val: 109) { .cv > i::after { content: "m"; } }
+@container style(--val: 110) { .cv > i::after { content: "n"; } }
+@container style(--val: 111) { .cv > i::after { content: "o"; } }
+@container style(--val: 112) { .cv > i::after { content: "p"; } }
+@container style(--val: 113) { .cv > i::after { content: "q"; } }
+@container style(--val: 114) { .cv > i::after { content: "r"; } }
+@container style(--val: 115) { .cv > i::after { content: "s"; } }
+@container style(--val: 116) { .cv > i::after { content: "t"; } }
+@container style(--val: 117) { .cv > i::after { content: "u"; } }
+@container style(--val: 118) { .cv > i::after { content: "v"; } }
+@container style(--val: 119) { .cv > i::after { content: "w"; } }
+@container style(--val: 120) { .cv > i::after { content: "x"; } }
+@container style(--val: 121) { .cv > i::after { content: "y"; } }
+@container style(--val: 122) { .cv > i::after { content: "z"; } }
+@container style(--val: 123) { .cv > i::after { content: "{"; } }
+@container style(--val: 124) { .cv > i::after { content: "|"; } }
+@container style(--val: 125) { .cv > i::after { content: "}"; } }
+@container style(--val: 126) { .cv > i::after { content: "~"; } }
+
+/* CP437 box drawing and special characters */
+@container style(--val: 176) { .cv > i::after { content: "\2591"; } }
+@container style(--val: 177) { .cv > i::after { content: "\2592"; } }
+@container style(--val: 178) { .cv > i::after { content: "\2593"; } }
+@container style(--val: 179) { .cv > i::after { content: "\2502"; } }
+@container style(--val: 180) { .cv > i::after { content: "\2524"; } }
+@container style(--val: 186) { .cv > i::after { content: "\2551"; } }
+@container style(--val: 187) { .cv > i::after { content: "\2557"; } }
+@container style(--val: 188) { .cv > i::after { content: "\255D"; } }
+@container style(--val: 191) { .cv > i::after { content: "\2510"; } }
+@container style(--val: 192) { .cv > i::after { content: "\2514"; } }
+@container style(--val: 193) { .cv > i::after { content: "\2534"; } }
+@container style(--val: 194) { .cv > i::after { content: "\252C"; } }
+@container style(--val: 195) { .cv > i::after { content: "\251C"; } }
+@container style(--val: 196) { .cv > i::after { content: "\2500"; } }
+@container style(--val: 197) { .cv > i::after { content: "\253C"; } }
+@container style(--val: 200) { .cv > i::after { content: "\255A"; } }
+@container style(--val: 201) { .cv > i::after { content: "\2554"; } }
+@container style(--val: 205) { .cv > i::after { content: "\2550"; } }
+@container style(--val: 217) { .cv > i::after { content: "\2518"; } }
+@container style(--val: 218) { .cv > i::after { content: "\250C"; } }
+@container style(--val: 219) { .cv > i::after { content: "\2588"; } }
+@container style(--val: 220) { .cv > i::after { content: "\2584"; } }
+@container style(--val: 223) { .cv > i::after { content: "\2580"; } }
+@container style(--val: 254) { .cv > i::after { content: "\25A0"; } }
