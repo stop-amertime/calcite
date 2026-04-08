@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use crate::eval::property_to_address;
 use crate::pattern::broadcast_write::BroadcastWrite;
-use crate::pattern::dispatch_table::DispatchTable;
+use crate::pattern::dispatch_table::{self, DispatchTable};
 use crate::state::State;
 use crate::types::*;
 
@@ -724,14 +724,10 @@ impl Compiler {
     /// Compile a variable reference.
     fn compile_var(&mut self, name: &str, fallback: Option<&Expr>, ops: &mut Vec<Op>) -> Slot {
         // If it's a property we've already computed in this tick, use its slot directly.
-        if let Some(&s) = self.property_slots.get(name) {
-            return s;
-        }
-
-        // Buffer-prefixed name: --__0AX, --__1AX, --__2AX → canonical --AX
-        if name.starts_with("--__") && name.len() > 5 {
-            let canonical = format!("--{}", &name[5..]);
-            if let Some(&s) = self.property_slots.get(&canonical) {
+        // But NOT for buffer-prefixed names (--__0*, --__1*, --__2*) — those explicitly
+        // read the previous tick's state, not the current tick's computed value.
+        if !is_buffer_copy(name) {
+            if let Some(&s) = self.property_slots.get(name) {
                 return s;
             }
         }
@@ -868,7 +864,63 @@ impl Compiler {
     }
 
     /// Compile a StyleCondition (if/else chain) into branch ops.
+    ///
+    /// If all branches test the same property against integer literals (a dispatch
+    /// table pattern), compiles to a `Dispatch` op (O(1) HashMap lookup) instead of
+    /// a linear branch chain. This handles both function-body dispatch tables and
+    /// v2-style per-register opcode dispatches in assignments.
     fn compile_style_condition(
+        &mut self,
+        branches: &[StyleBranch],
+        fallback: &Expr,
+        ops: &mut Vec<Op>,
+    ) -> Slot {
+        // Try dispatch table optimization for large single-key chains
+        if let Some(table) = dispatch_table::recognise_dispatch(branches, fallback) {
+            return self.compile_inline_dispatch(&table, ops);
+        }
+
+        // Fall back to linear branch chain
+        self.compile_style_condition_linear(branches, fallback, ops)
+    }
+
+    /// Compile a recognised dispatch table directly (no function call wrapper).
+    fn compile_inline_dispatch(
+        &mut self,
+        table: &DispatchTable,
+        ops: &mut Vec<Op>,
+    ) -> Slot {
+        let key_slot = self.compile_var(&table.key_property, None, ops);
+
+        let mut compiled_entries = HashMap::new();
+        for (&key_val, entry_expr) in &table.entries {
+            let mut entry_ops = Vec::new();
+            let result = self.compile_expr(entry_expr, &mut entry_ops);
+            compiled_entries.insert(key_val, (entry_ops, result));
+        }
+
+        let mut fallback_ops = Vec::new();
+        let fallback_slot = self.compile_expr(&table.fallback, &mut fallback_ops);
+
+        let table_id = self.compiled_dispatches.len() as Slot;
+        self.compiled_dispatches.push(CompiledDispatchTable {
+            entries: compiled_entries,
+            fallback_ops,
+            fallback_slot,
+        });
+
+        let dst = self.alloc();
+        ops.push(Op::Dispatch {
+            dst,
+            key: key_slot,
+            table_id,
+            fallback_target: 0,
+        });
+        dst
+    }
+
+    /// Compile a StyleCondition as a linear branch chain (fallback path).
+    fn compile_style_condition_linear(
         &mut self,
         branches: &[StyleBranch],
         fallback: &Expr,
@@ -1254,9 +1306,10 @@ impl Compiler {
         let table = self.dispatch_tables.remove(name).unwrap();
         let func = self.functions.get(name).cloned();
 
-        // Bind arguments to parameter slots (if function definition exists)
+        // Bind arguments to parameter slots, then evaluate locals
+        // (the dispatch key may reference a local, e.g. --parity dispatches on --low8)
         let saved: Vec<(String, Option<Slot>)> = if let Some(ref f) = func {
-            f.parameters
+            let mut saved: Vec<(String, Option<Slot>)> = f.parameters
                 .iter()
                 .enumerate()
                 .map(|(i, param)| {
@@ -1272,7 +1325,15 @@ impl Compiler {
                     self.property_slots.insert(param.name.clone(), val_slot);
                     (param.name.clone(), old)
                 })
-                .collect()
+                .collect();
+            // Evaluate locals so the dispatch key can reference them
+            for local in &f.locals {
+                let old = self.property_slots.get(&local.name).copied();
+                let val_slot = self.compile_expr(&local.value, ops);
+                self.property_slots.insert(local.name.clone(), val_slot);
+                saved.push((local.name.clone(), old));
+            }
+            saved
         } else {
             Vec::new()
         };
@@ -1474,8 +1535,8 @@ fn compact_slots(program: &mut CompiledProgram) {
         alloc.assign(s);
     }
 
-    // Compute liveness for main ops
-    let (_last_use, dying_at) = compute_liveness(&program.ops);
+    // Compute liveness for main ops (includes dispatch sub-op references)
+    let (_last_use, dying_at) = compute_liveness(&program.ops, &program.dispatch_tables);
     let mut slot_map: HashMap<Slot, Slot> = HashMap::new();
 
     // Map pinned slots first
@@ -1605,11 +1666,37 @@ fn collect_main_pinned(program: &CompiledProgram) -> Vec<Slot> {
 
 /// Compute the last op index at which each slot is read or written,
 /// and build a reverse index from op index → slots that die after that op.
-fn compute_liveness(ops: &[Op]) -> (HashMap<Slot, usize>, HashMap<usize, Vec<Slot>>) {
+///
+/// Dispatch sub-ops (entry results, fallback results, sub-op reads) are
+/// treated as reads at the Dispatch op's index, so parameter slots that
+/// are only referenced inside dispatch entries stay alive until the
+/// Dispatch executes.
+fn compute_liveness(
+    ops: &[Op],
+    dispatch_tables: &[CompiledDispatchTable],
+) -> (HashMap<Slot, usize>, HashMap<usize, Vec<Slot>>) {
     let mut last_use: HashMap<Slot, usize> = HashMap::new();
     for (i, op) in ops.iter().enumerate() {
         for s in op_slots_read(op).into_iter().chain(op_dst(op)) {
             last_use.insert(s, i);
+        }
+        // For Dispatch ops, also mark slots referenced by the table's
+        // sub-ops and result slots as live at this index.
+        if let Op::Dispatch { table_id, .. } = op {
+            if let Some(table) = dispatch_tables.get(*table_id as usize) {
+                // Fallback
+                last_use.entry(table.fallback_slot).and_modify(|v| *v = (*v).max(i)).or_insert(i);
+                for s in table.fallback_ops.iter().flat_map(op_slots_read) {
+                    last_use.entry(s).and_modify(|v| *v = (*v).max(i)).or_insert(i);
+                }
+                // Entries
+                for (entry_ops, result_slot) in table.entries.values() {
+                    last_use.entry(*result_slot).and_modify(|v| *v = (*v).max(i)).or_insert(i);
+                    for s in entry_ops.iter().flat_map(op_slots_read) {
+                        last_use.entry(s).and_modify(|v| *v = (*v).max(i)).or_insert(i);
+                    }
+                }
+            }
         }
     }
     // Build reverse: op_index → [slots dying here]

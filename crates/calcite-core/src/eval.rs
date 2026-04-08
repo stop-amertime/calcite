@@ -288,6 +288,7 @@ impl Evaluator {
         // Execute numeric assignments via compiled bytecode
         compile::execute(&self.compiled, state, &mut self.slots);
 
+
         // Evaluate string assignments via interpreter (after compiled pass,
         // so state is up-to-date for var() references).
         if !self.string_assignments.is_empty() {
@@ -402,6 +403,18 @@ impl Evaluator {
     /// Read a computed property value from the most recent tick.
     pub fn get_property(&self, name: &str) -> Option<f64> {
         self.properties.get(name).map(|v| v.as_number())
+    }
+
+    /// Read a compiled property's slot value after execution.
+    ///
+    /// Returns the value computed for `name` during the most recent tick.
+    /// This reads directly from the slot array, so it works for compiled
+    /// numeric properties (not string assignments).
+    pub fn get_slot_value(&self, name: &str) -> Option<i32> {
+        self.compiled
+            .property_slots
+            .get(name)
+            .and_then(|&slot| self.slots.get(slot as usize).copied())
     }
 
     /// Run a batch of ticks, returning the net state diff across all ticks.
@@ -750,10 +763,7 @@ pub fn property_to_address(name: &str) -> Option<i32> {
     let canonical = to_bare_name(name);
 
     // Check the CSS-derived address map first.
-    let (found, map_empty) = ADDRESS_MAP.with(|map| {
-        let m = map.borrow();
-        (m.get(canonical).copied(), m.is_empty())
-    });
+    let found = ADDRESS_MAP.with(|map| map.borrow().get(canonical).copied());
     if found.is_some() {
         return found;
     }
@@ -763,22 +773,17 @@ pub fn property_to_address(name: &str) -> Option<i32> {
         return parse_mem_address(rest);
     }
 
-    // Heuristic fallback: if no CSS-derived map was installed, try to infer
-    // register addresses from standard naming. This is used by simple test CSS
-    // that doesn't include dispatch tables.
-    if map_empty {
-        return register_name_heuristic(canonical);
-    }
-
-    None
+    // Register name fallback: standard register names (AX, IP, flags, etc.)
+    // Always consulted — the CSS-derived map may contain only memory cells
+    // (e.g., v2 i8086-css where --readMem maps m0..mN but not registers).
+    register_name_heuristic(canonical)
 }
 
-/// Heuristic: infer register addresses from standard CSS naming patterns.
+/// Map standard register names to their state addresses.
 ///
-/// This fallback is only used when no CSS-derived address map has been
-/// installed (i.e., for CSS that lacks dispatch tables). When a real CSS
-/// program is loaded, the dispatch table analysis provides the definitive
-/// mapping and this heuristic is not consulted.
+/// Always consulted as a fallback after the CSS-derived address map.
+/// The address map may only contain memory cells (e.g., from --readMem
+/// identity-read dispatch) without register entries.
 fn register_name_heuristic(name: &str) -> Option<i32> {
     use crate::state::addr;
     match name {
