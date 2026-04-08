@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CSS-DOS</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="desktop">
+
+    <!-- Title bar -->
+    <div class="window main-window">
+      <div class="title-bar">
+        <span class="title-icon">&#9632;</span>
+        <span>CSS-DOS</span>
+        <span class="title-buttons">
+          <span class="title-btn">&#9650;</span>
+          <span class="title-btn">&#9660;</span>
+        </span>
+      </div>
+      <div class="menu-bar">
+        <span class="menu-item">File</span>
+        <span class="menu-item">Programs</span>
+        <span class="menu-item">About</span>
+        <span class="menu-item">Help</span>
+      </div>
+      <div class="window-body">
+
+        <!-- Hero -->
+        <div class="hero">
+          <img src="logo.png" alt="CSS-DOS" class="logo" width="128" height="128">
+          <div class="hero-text">
+            <h1>CSS-DOS</h1>
+            <p class="tagline">A DOS computer running in pure CSS.</p>
+            <p class="subtitle">No JavaScript. No WebAssembly. No cheating.<br>
+            Every CPU register, every byte of memory, every instruction decode<br>
+            is a CSS custom property evaluated by <code>calc()</code>.</p>
+          </div>
+        </div>
+
+        <hr class="groove">
+
+        <!-- Program list -->
+        <div class="group">
+          <span class="group-label">Programs</span>
+          <p class="hint">Select a program to view its CSS source, stats, and run it.</p>
+
+          <table class="file-list">
+            <thead>
+              <tr>
+                <th class="col-icon"></th>
+                <th class="col-name">Name</th>
+                <th class="col-desc">Description</th>
+                <th class="col-css">CSS Size</th>
+                <th class="col-src">Source</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="file-row" onclick="location.href='program.html?p=zork1'">
+                <td class="col-icon"><span class="file-icon">&#128196;</span></td>
+                <td class="col-name"><a href="program.html?p=zork1">zork1.css</a></td>
+                <td class="col-desc">Zork I: The Great Underground Empire (1980)</td>
+                <td class="col-css">569 MB</td>
+                <td class="col-src">101 KB</td>
+              </tr>
+              <tr class="file-row" onclick="location.href='program.html?p=tetris2k'">
+                <td class="col-icon"><span class="file-icon">&#128196;</span></td>
+                <td class="col-name"><a href="program.html?p=tetris2k">tetris2k.css</a></td>
+                <td class="col-desc">SmallTetris &mdash; Tetris in 2KB of x86</td>
+                <td class="col-css">569 MB</td>
+                <td class="col-src">2 KB</td>
+              </tr>
+              <tr class="file-row" onclick="location.href='program.html?p=eliza'">
+                <td class="col-icon"><span class="file-icon">&#128196;</span></td>
+                <td class="col-name"><a href="program.html?p=eliza">eliza.css</a></td>
+                <td class="col-desc">ELIZA &mdash; the 1966 AI chatbot</td>
+                <td class="col-css">569 MB</td>
+                <td class="col-src">9 KB</td>
+              </tr>
+              <tr class="file-row" onclick="location.href='program.html?p=snake'">
+                <td class="col-icon"><span class="file-icon">&#128196;</span></td>
+                <td class="col-name"><a href="program.html?p=snake">snake.css</a></td>
+                <td class="col-desc">Snake game</td>
+                <td class="col-css">569 MB</td>
+                <td class="col-src">1.3 KB</td>
+              </tr>
+              <tr class="file-row" onclick="location.href='program.html?p=linkfour'">
+                <td class="col-icon"><span class="file-icon">&#128196;</span></td>
+                <td class="col-name"><a href="program.html?p=linkfour">linkfour.css</a></td>
+                <td class="col-desc">Connect Four with CGA graphics (1986)</td>
+                <td class="col-css">569 MB</td>
+                <td class="col-src">16 KB</td>
+              </tr>
+              <tr class="file-row" onclick="location.href='program.html?p=monosol'">
+                <td class="col-icon"><span class="file-icon">&#128196;</span></td>
+                <td class="col-name"><a href="program.html?p=monosol">monosol.css</a></td>
+                <td class="col-desc">Klondike Solitaire (monochrome)</td>
+                <td class="col-css">569 MB</td>
+                <td class="col-src">2.9 KB</td>
+              </tr>
+              <tr class="file-row disabled">
+                <td class="col-icon"><span class="file-icon">&#128196;</span></td>
+                <td class="col-name"><span class="wip">doom.css</span></td>
+                <td class="col-desc">DOOM (1993) &mdash; <em>work in progress</em></td>
+                <td class="col-css">~13.6 GB</td>
+                <td class="col-src">157 KB</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <hr class="groove">
+
+        <!-- How it works -->
+        <div class="group">
+          <span class="group-label">How it works</span>
+          <div class="how-grid">
+            <div class="how-step">
+              <div class="step-num">1.</div>
+              <div class="step-text">
+                <strong>A real x86 program</strong> (like Zork, a 101KB DOS executable from 1980)
+                is transpiled into <strong>pure CSS</strong>.
+              </div>
+            </div>
+            <div class="how-step">
+              <div class="step-num">2.</div>
+              <div class="step-text">
+                The CSS encodes the entire 8086 CPU: registers, flags, instruction
+                decode, memory &mdash; all as <code>@property</code> declarations
+                and <code>calc()</code> expressions. The result is <strong>569 MB
+                of CSS</strong> &mdash; 19 million lines.
+              </div>
+            </div>
+            <div class="how-step">
+              <div class="step-num">3.</div>
+              <div class="step-text">
+                Open it in Chrome and it <em>works</em>. Slowly. The browser
+                manages about one clock cycle every two seconds. At that rate,
+                Zork printing &ldquo;West of House&rdquo; takes <strong>months</strong>.
+              </div>
+            </div>
+            <div class="how-step">
+              <div class="step-num">4.</div>
+              <div class="step-text">
+                <strong><a href="https://github.com/AhmedAmer/calcite">Calcite</a></strong>
+                is a JIT compiler for CSS &mdash; like V8 is for JavaScript.
+                It parses the <em>exact same CSS</em>, recognises patterns, and
+                runs it at <strong>300 kHz</strong> &mdash; 600,000&times; faster. No cheating.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <hr class="groove">
+
+        <!-- Upload your own -->
+        <div class="group">
+          <span class="group-label">Bring Your Own</span>
+          <p class="hint">Upload a DOS .COM or .EXE file and we'll generate the CSS for you.</p>
+          <div class="upload-row">
+            <label class="btn upload-btn">
+              Upload .COM / .EXE
+              <input type="file" id="upload-input" accept=".com,.exe,.zip" style="display:none">
+            </label>
+            <span id="upload-status" class="upload-status"></span>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Status bar -->
+      <div class="status-bar">
+        <span>CSS-DOS v0.1</span>
+        <span class="status-right">Pure CSS. Pure madness.</span>
+      </div>
+    </div>
+
+  </div>
+</body>
+</html>

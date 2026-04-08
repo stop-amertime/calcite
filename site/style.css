@@ -1,0 +1,679 @@
+/* ============================================================
+   CSS-DOS showcase site — Windows 1.0 / GEM aesthetic
+   ============================================================ */
+
+@font-face {
+  font-family: 'DOS';
+  src: local('Perfect DOS VGA 437'), local('Fixedsys'), local('Terminal'),
+       local('Courier New');
+}
+
+/* ── Reset ── */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ── Desktop background — teal like Windows 3.1 ── */
+body {
+  font-family: 'DOS', 'Fixedsys', 'Terminal', 'Courier New', monospace;
+  font-size: 13px;
+  background: #008080;
+  color: #000;
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  padding: 4px;
+  cursor: default;
+  image-rendering: pixelated;
+  -ms-interpolation-mode: nearest-neighbor;
+}
+
+/* ── Desktop area ── */
+.desktop {
+  width: 800px;
+  max-width: 100%;
+}
+
+/* ── Windows 1.0 beveled box ── */
+.window {
+  background: #c0c0c0;
+  border-top: 2px solid #fff;
+  border-left: 2px solid #fff;
+  border-right: 2px solid #000;
+  border-bottom: 2px solid #000;
+  box-shadow: inset -1px -1px 0 #808080, inset 1px 1px 0 #dfdfdf;
+  margin-bottom: 4px;
+}
+
+/* ── Title bar ── */
+.title-bar {
+  background: #000080;
+  color: #fff;
+  padding: 2px 4px;
+  font-size: 13px;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  user-select: none;
+  letter-spacing: 1px;
+}
+
+.title-icon {
+  margin-right: 6px;
+  font-size: 10px;
+}
+
+.title-buttons {
+  margin-left: auto;
+  display: flex;
+  gap: 1px;
+}
+
+.title-btn {
+  background: #c0c0c0;
+  color: #000;
+  font-size: 8px;
+  width: 16px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-top: 1px solid #fff;
+  border-left: 1px solid #fff;
+  border-right: 1px solid #808080;
+  border-bottom: 1px solid #808080;
+}
+
+/* ── Menu bar ── */
+.menu-bar {
+  background: #c0c0c0;
+  border-bottom: 1px solid #808080;
+  padding: 1px 0;
+  display: flex;
+}
+
+.menu-item {
+  padding: 2px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.menu-item:hover {
+  background: #000080;
+  color: #fff;
+}
+
+/* ── Window body ── */
+.window-body {
+  padding: 10px;
+}
+
+/* ── Buttons — classic beveled ── */
+.btn {
+  background: #c0c0c0;
+  border-top: 2px solid #fff;
+  border-left: 2px solid #fff;
+  border-right: 2px solid #808080;
+  border-bottom: 2px solid #808080;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 4px 16px;
+  cursor: pointer;
+  color: #000;
+  display: inline-block;
+  text-align: center;
+  text-decoration: none;
+}
+
+.btn:active:not(:disabled) {
+  border-top: 2px solid #808080;
+  border-left: 2px solid #808080;
+  border-right: 2px solid #fff;
+  border-bottom: 2px solid #fff;
+  padding: 5px 15px 3px 17px;
+}
+
+.btn:disabled {
+  color: #808080;
+  text-shadow: 1px 1px 0 #fff;
+}
+
+/* ── Groove separator ── */
+hr.groove {
+  border: none;
+  border-top: 1px solid #808080;
+  border-bottom: 1px solid #fff;
+  margin: 10px 0;
+}
+
+/* ── Group box ── */
+.group {
+  border: 1px solid #808080;
+  padding: 12px 10px 10px;
+  margin-bottom: 8px;
+  position: relative;
+}
+
+.group-label {
+  position: absolute;
+  top: -8px;
+  left: 10px;
+  background: #c0c0c0;
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+/* ── Status bar ── */
+.status-bar {
+  border-top: 1px solid #808080;
+  border-left: 1px solid #808080;
+  border-right: 1px solid #fff;
+  border-bottom: 1px solid #fff;
+  background: #c0c0c0;
+  padding: 2px 6px;
+  font-size: 11px;
+  display: flex;
+  justify-content: space-between;
+}
+
+.status-right {
+  color: #808080;
+}
+
+/* ── Sunken panel ── */
+.sunken {
+  border-top: 1px solid #808080;
+  border-left: 1px solid #808080;
+  border-right: 1px solid #fff;
+  border-bottom: 1px solid #fff;
+  background: #fff;
+  padding: 6px;
+}
+
+.sunken-dark {
+  border-top: 1px solid #808080;
+  border-left: 1px solid #808080;
+  border-right: 1px solid #fff;
+  border-bottom: 1px solid #fff;
+  background: #000;
+  color: #33ff33;
+  padding: 8px;
+  font-family: inherit;
+  font-size: 13px;
+  white-space: pre;
+  line-height: 1.2;
+  overflow: auto;
+}
+
+/* ============================================================
+   Hero
+   ============================================================ */
+.hero {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 0;
+}
+
+.logo {
+  image-rendering: pixelated;
+  -ms-interpolation-mode: nearest-neighbor;
+}
+
+.hero-text h1 {
+  font-size: 22px;
+  letter-spacing: 2px;
+  margin-bottom: 2px;
+}
+
+.tagline {
+  font-size: 14px;
+  font-weight: bold;
+  margin-bottom: 4px;
+}
+
+.subtitle {
+  font-size: 11px;
+  color: #404040;
+  line-height: 1.4;
+}
+
+.subtitle code {
+  background: #e0e0e0;
+  padding: 0 3px;
+  font-size: 11px;
+}
+
+/* ============================================================
+   File list table
+   ============================================================ */
+.hint {
+  font-size: 11px;
+  color: #404040;
+  margin-bottom: 8px;
+}
+
+.file-list {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.file-list thead {
+  background: #000080;
+  color: #fff;
+}
+
+.file-list th {
+  text-align: left;
+  padding: 2px 6px;
+  font-weight: normal;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.file-list td {
+  padding: 3px 6px;
+  border-bottom: 1px solid #dfdfdf;
+}
+
+.file-row {
+  cursor: pointer;
+}
+
+.file-row:hover {
+  background: #000080;
+  color: #fff;
+}
+
+.file-row:hover a {
+  color: #fff;
+}
+
+.file-row.disabled {
+  cursor: default;
+  color: #808080;
+}
+
+.file-row.disabled:hover {
+  background: transparent;
+  color: #808080;
+}
+
+.file-icon {
+  font-size: 14px;
+}
+
+.col-icon { width: 24px; }
+.col-name { width: 140px; }
+.col-css { width: 80px; text-align: right; }
+.col-src { width: 70px; text-align: right; }
+
+.file-list a {
+  color: #000080;
+  text-decoration: underline;
+}
+
+.wip {
+  color: #808080;
+  font-style: italic;
+}
+
+.wip::after {
+  content: ' [WIP]';
+  font-size: 10px;
+}
+
+/* ============================================================
+   How it works
+   ============================================================ */
+.how-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.how-step {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.step-num {
+  font-weight: bold;
+  min-width: 20px;
+  color: #000080;
+}
+
+.step-text code {
+  background: #e0e0e0;
+  padding: 0 3px;
+  font-size: 11px;
+}
+
+.step-text a {
+  color: #000080;
+}
+
+.step-text em {
+  font-style: italic;
+}
+
+/* ============================================================
+   Upload
+   ============================================================ */
+.upload-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.upload-btn {
+  cursor: pointer;
+}
+
+.upload-status {
+  font-size: 11px;
+  color: #808080;
+}
+
+/* ============================================================
+   Program detail page
+   ============================================================ */
+
+/* Stats boxes */
+.stats-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.stat-box {
+  border-top: 1px solid #808080;
+  border-left: 1px solid #808080;
+  border-right: 1px solid #fff;
+  border-bottom: 1px solid #fff;
+  background: #fff;
+  padding: 6px 10px;
+  text-align: center;
+  min-width: 100px;
+  flex: 1;
+}
+
+.stat-value {
+  font-size: 18px;
+  font-weight: bold;
+  color: #000080;
+  display: block;
+}
+
+.stat-label {
+  font-size: 10px;
+  color: #808080;
+  display: block;
+  margin-top: 2px;
+}
+
+/* Comparisons list */
+.comparisons {
+  border-top: 1px solid #808080;
+  border-left: 1px solid #808080;
+  border-right: 1px solid #fff;
+  border-bottom: 1px solid #fff;
+  background: #ffffcc;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.6;
+  margin-bottom: 8px;
+}
+
+.comparisons strong {
+  color: #800000;
+}
+
+/* Action buttons */
+.actions-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+.btn-primary {
+  background: #000080;
+  color: #fff;
+  border-top: 2px solid #4040c0;
+  border-left: 2px solid #4040c0;
+  border-right: 2px solid #000040;
+  border-bottom: 2px solid #000040;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 4px 20px;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+
+.btn-primary:active {
+  border-top: 2px solid #000040;
+  border-left: 2px solid #000040;
+  border-right: 2px solid #4040c0;
+  border-bottom: 2px solid #4040c0;
+}
+
+/* CSS viewer */
+.css-viewer-container {
+  position: relative;
+}
+
+.css-viewer {
+  border-top: 1px solid #808080;
+  border-left: 1px solid #808080;
+  border-right: 1px solid #fff;
+  border-bottom: 1px solid #fff;
+  background: #000;
+  color: #33ff33;
+  padding: 0;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.25;
+  height: 300px;
+  overflow: auto;
+  position: relative;
+}
+
+.css-viewer-content {
+  padding: 4px 8px;
+  white-space: pre;
+  min-height: 100%;
+}
+
+.css-line-num {
+  color: #666;
+  display: inline-block;
+  width: 70px;
+  text-align: right;
+  padding-right: 8px;
+  user-select: none;
+  border-right: 1px solid #333;
+  margin-right: 8px;
+}
+
+.viewer-nav {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+
+.viewer-sep {
+  color: #808080;
+  margin: 0 2px;
+}
+
+.viewer-status {
+  background: #222;
+  color: #999;
+  font-size: 10px;
+  padding: 2px 8px;
+  display: flex;
+  justify-content: space-between;
+  border-top: 1px solid #444;
+}
+
+.css-viewer-loading {
+  color: #999;
+  padding: 8px;
+  text-align: center;
+}
+
+.css-viewer-progress {
+  margin: 4px 0;
+  height: 12px;
+  border-top: 1px solid #808080;
+  border-left: 1px solid #808080;
+  border-right: 1px solid #fff;
+  border-bottom: 1px solid #fff;
+  background: #000;
+  position: relative;
+}
+
+.css-viewer-progress-bar {
+  height: 100%;
+  background: #000080;
+  transition: width 0.2s;
+}
+
+/* Chrome warning box */
+.chrome-warning {
+  border-top: 1px solid #808080;
+  border-left: 1px solid #808080;
+  border-right: 1px solid #fff;
+  border-bottom: 1px solid #fff;
+  background: #fff;
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  margin-bottom: 8px;
+}
+
+.chrome-warning h3 {
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.chrome-warning .speed-compare {
+  display: flex;
+  gap: 16px;
+  margin: 8px 0;
+  font-size: 11px;
+}
+
+.speed-col {
+  flex: 1;
+  text-align: center;
+  padding: 8px;
+}
+
+.speed-col.chrome {
+  background: #ffcccc;
+  border: 1px solid #cc0000;
+}
+
+.speed-col.calcite {
+  background: #ccffcc;
+  border: 1px solid #008000;
+}
+
+.speed-col .speed-val {
+  font-size: 20px;
+  font-weight: bold;
+  display: block;
+  margin: 4px 0;
+}
+
+.speed-col .speed-label {
+  font-size: 10px;
+  color: #808080;
+}
+
+.speed-col.chrome .speed-val { color: #cc0000; }
+.speed-col.calcite .speed-val { color: #008000; }
+
+/* Runner panel */
+.runner-screen {
+  border-top: 1px solid #808080;
+  border-left: 1px solid #808080;
+  border-right: 1px solid #fff;
+  border-bottom: 1px solid #fff;
+  background: #000;
+  color: #aaa;
+  font-family: inherit;
+  font-size: 14px;
+  white-space: pre;
+  line-height: 1.15;
+  padding: 8px;
+  min-height: 200px;
+  overflow: hidden;
+}
+
+.runner-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.runner-stats {
+  font-size: 11px;
+  color: #808080;
+  margin-left: auto;
+}
+
+/* Back link */
+.back-link {
+  display: inline-block;
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: #000080;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* Description text */
+.desc-text {
+  font-size: 12px;
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
+
+/* Scrollbar — chunky, old-school */
+::-webkit-scrollbar {
+  width: 16px;
+  height: 16px;
+}
+
+::-webkit-scrollbar-track {
+  background: repeating-conic-gradient(#c0c0c0 0% 25%, #fff 0% 50%) 50% / 2px 2px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c0c0c0;
+  border-top: 1px solid #fff;
+  border-left: 1px solid #fff;
+  border-right: 1px solid #808080;
+  border-bottom: 1px solid #808080;
+}
+
+::-webkit-scrollbar-button {
+  background: #c0c0c0;
+  border-top: 1px solid #fff;
+  border-left: 1px solid #fff;
+  border-right: 1px solid #808080;
+  border-bottom: 1px solid #808080;
+  display: block;
+  height: 16px;
+  width: 16px;
+}

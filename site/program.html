@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CSS-DOS</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="desktop">
+    <div class="window main-window">
+      <div class="title-bar">
+        <span class="title-icon">&#9632;</span>
+        <span id="window-title">CSS-DOS &mdash; Loading...</span>
+        <span class="title-buttons">
+          <span class="title-btn">&#9650;</span>
+          <span class="title-btn">&#9660;</span>
+        </span>
+      </div>
+      <div class="menu-bar">
+        <span class="menu-item" onclick="location.href='index.html'">File</span>
+        <span class="menu-item">View</span>
+        <span class="menu-item">Run</span>
+        <span class="menu-item">Help</span>
+      </div>
+      <div class="window-body">
+
+        <a class="back-link" href="index.html">&laquo; Back to programs</a>
+
+        <!-- Program header -->
+        <div id="program-header">
+          <h2 id="program-title" style="font-size:16px; margin-bottom:4px;"></h2>
+          <p id="program-desc" class="desc-text"></p>
+        </div>
+
+        <hr class="groove">
+
+        <!-- Stats -->
+        <div class="group">
+          <span class="group-label">The CSS</span>
+
+          <div class="stats-row">
+            <div class="stat-box">
+              <span class="stat-value" id="stat-css-size">---</span>
+              <span class="stat-label">CSS file size</span>
+            </div>
+            <div class="stat-box">
+              <span class="stat-value" id="stat-lines">---</span>
+              <span class="stat-label">lines of CSS</span>
+            </div>
+            <div class="stat-box">
+              <span class="stat-value" id="stat-properties">---</span>
+              <span class="stat-label">@property decls</span>
+            </div>
+            <div class="stat-box">
+              <span class="stat-value" id="stat-assignments">---</span>
+              <span class="stat-label">calc() assignments</span>
+            </div>
+          </div>
+
+          <div id="comparisons" class="comparisons"></div>
+
+          <div class="actions-row">
+            <a id="btn-download" class="btn" href="#">&#128190; Download CSS (<span id="download-size">---</span>)</a>
+          </div>
+        </div>
+
+        <!-- CSS Viewer -->
+        <div id="viewer-panel" class="group">
+          <span class="group-label">CSS Source</span>
+
+          <!-- Navigation -->
+          <div class="viewer-nav">
+            <button class="btn" id="viewer-go-top" disabled title="First page">|&lt;</button>
+            <button class="btn" id="viewer-back-100" disabled title="Back 100 pages">&minus;100</button>
+            <button class="btn" id="viewer-back-10" disabled title="Back 10 pages">&minus;10</button>
+            <button class="btn" id="viewer-pg-up" disabled title="Previous page">&minus;1</button>
+            <button class="btn" id="viewer-pg-dn" disabled title="Next page">+1</button>
+            <button class="btn" id="viewer-fwd-10" disabled title="Forward 10 pages">+10</button>
+            <button class="btn" id="viewer-fwd-100" disabled title="Forward 100 pages">+100</button>
+            <button class="btn" id="viewer-go-end" disabled title="Last page">&gt;|</button>
+            <span class="viewer-sep">|</span>
+            <label style="font-size:11px;">Line:</label>
+            <input type="number" id="viewer-goto-input" class="field" style="width:90px;" min="1" disabled>
+            <button class="btn" id="viewer-goto-btn" disabled>Go</button>
+            <span class="spacer"></span>
+            <span id="viewer-nav-info" style="font-size:11px; color:#808080;"></span>
+          </div>
+
+          <!-- Virtual scroll viewport -->
+          <div class="css-viewer-container">
+            <div id="css-viewer" class="css-viewer" tabindex="0">
+              <div id="css-viewer-spacer" style="width:1px;"></div>
+              <div id="css-viewer-content" class="css-viewer-content"></div>
+            </div>
+            <div id="viewer-progress" class="css-viewer-progress" style="display:none;">
+              <div id="viewer-progress-bar" class="css-viewer-progress-bar" style="width:0%;"></div>
+            </div>
+            <div class="viewer-status">
+              <span id="viewer-line-info">Line 1</span>
+              <span id="viewer-total-info"></span>
+            </div>
+          </div>
+        </div>
+
+        <hr class="groove">
+
+        <!-- Chrome vs Calcite -->
+        <div class="group">
+          <span class="group-label">Running this CSS</span>
+
+          <div class="chrome-warning">
+            <h3>This is <span id="css-size-text">569 MB</span> of pure CSS text.</h3>
+            <p>You <em>can</em> open it in Chrome. It will work. The browser will evaluate
+            every <code>calc()</code> expression, every <code>if()</code> condition, every
+            <code>var()</code> reference &mdash; because that's what CSS engines do.</p>
+            <p style="margin-top:6px;">The catch: each CPU clock cycle requires Chrome to
+            re-evaluate ~2 million <code>calc()</code> assignments across ~1 million
+            <code>@property</code> declarations in a single animation frame. Chrome was
+            never designed for this. It takes about 2 seconds per frame &mdash; giving
+            us a clock speed of 0.5 Hz. The original 8086 ran at 5 MHz. This is
+            <strong>ten million times slower</strong>.</p>
+
+            <div class="speed-compare">
+              <div class="speed-col chrome">
+                <span class="speed-label">Chrome (native CSS)</span>
+                <span class="speed-val">~0.5 Hz</span>
+                <span class="speed-label" id="chrome-time">Zork prompt: ~4 months</span>
+              </div>
+              <div class="speed-col calcite">
+                <span class="speed-label">Calcite (CSS JIT compiler)</span>
+                <span class="speed-val">~300 kHz</span>
+                <span class="speed-label">Zork prompt: instant</span>
+              </div>
+            </div>
+
+            <p style="margin-top:6px;">
+              <strong><a href="https://github.com/AhmedAmer/calcite">Calcite</a></strong>
+              is a JIT compiler for CSS &mdash; the same idea as V8 for JavaScript.
+              It parses the <em>exact same CSS file</em>, recognises patterns
+              (dispatch tables, broadcast writes, constant expressions), compiles them
+              to bytecode, and executes them. It doesn't skip anything. It doesn't
+              know what the CSS computes. It's just faster at evaluating it.
+            </p>
+            <p style="margin-top:6px; font-size:11px; color:#808080;">
+              If Calcite disagrees with Chrome, Calcite is wrong.
+            </p>
+          </div>
+
+          <div class="actions-row">
+            <button id="btn-run" class="btn-primary">&#9654; Run in Calcite</button>
+          </div>
+        </div>
+
+        <!-- Runner (hidden initially) -->
+        <div id="runner-panel" class="group" style="display:none;">
+          <span class="group-label">Calcite</span>
+          <div class="runner-controls">
+            <button id="btn-runner-stop" class="btn" disabled>&#9632; Stop</button>
+            <span class="runner-stats" id="runner-stats"></span>
+          </div>
+          <div id="runner-screen" class="runner-screen">Initializing...</div>
+          <div class="status-bar" style="margin-top:4px;">
+            <span id="runner-status">Loading CSS...</span>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="status-bar">
+        <span>CSS-DOS v0.1</span>
+        <span class="status-right" id="page-status"></span>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ============================================================
+// Program metadata
+// ============================================================
+const PROGRAMS = {
+  zork1: {
+    title: 'Zork I: The Great Underground Empire',
+    desc: 'The classic 1980 interactive fiction game by Infocom. Running in SvarDOS with a custom CSS BIOS which maps Intel 8086 assembly to pure CSS. The game binary (_zork1.com, 11KB) plus its data file (zork1.dat, 92KB) became 569 MB of CSS &mdash; a 5,700x expansion.',
+    source: '101 KB',
+    sourceBytes: 103562,
+    cssFile: 'zork1.css.gz',
+    cssSize: '569 MB',
+    cssSizeBytes: 596688648,
+    lines: '18,878,623',
+    properties: '1,048,604',
+    assignments: '2,097,279',
+    chromeTime: 'Zork prompt: ~4 months',
+  },
+  tetris2k: {
+    title: 'SmallTetris',
+    desc: 'A complete Tetris game in just 2,048 bytes of 8086 machine code. Running in SvarDOS via CSS-DOS. The 2KB binary became 569 MB of CSS &mdash; a 291,000x expansion. That\'s like expanding a haiku into the entire Library of Congress.',
+    source: '2 KB',
+    sourceBytes: 2048,
+    cssFile: 'tetris2k.css.gz',
+    cssSize: '569 MB',
+    cssSizeBytes: 596368075,
+    lines: '18,878,623',
+    properties: '1,048,604',
+    assignments: '2,097,279',
+    chromeTime: 'First piece appears: ~3 weeks',
+  },
+  eliza: {
+    title: 'ELIZA',
+    desc: 'One of the earliest chatbot AIs, written in 1966 by Joseph Weizenbaum at MIT. This DOS version (5.9KB) with its response database (3.4KB) runs in SvarDOS via CSS-DOS. An AI running in a stylesheet.',
+    source: '9 KB',
+    sourceBytes: 9411,
+    cssFile: 'eliza.css.gz',
+    cssSize: '569 MB',
+    cssSizeBytes: 596397657,
+    lines: '18,878,623',
+    properties: '1,048,604',
+    assignments: '2,097,279',
+    chromeTime: 'First response: ~2 months',
+  },
+  snake: {
+    title: 'Snake',
+    desc: 'The classic snake game, a 1.3KB DOS .COM file. Becoming 569 MB of CSS gives it a 450,000x expansion ratio.',
+    source: '1.3 KB',
+    sourceBytes: 1306,
+    cssFile: 'snake.css.gz',
+    cssSize: '569 MB',
+    cssSizeBytes: 596299315,
+    lines: '18,878,592',
+    properties: '1,048,604',
+    assignments: '2,097,279',
+    chromeTime: 'First frame: ~1 month',
+  },
+  linkfour: {
+    title: 'Connect Four',
+    desc: 'A Connect Four implementation with CGA graphics and decent AI, from 1986. 16KB of 8086 code running in SvarDOS via CSS-DOS.',
+    source: '16 KB',
+    sourceBytes: 16807,
+    cssFile: 'linkfour.css.gz',
+    cssSize: '569 MB',
+    cssSizeBytes: 596368075,
+    lines: '18,878,623',
+    properties: '1,048,604',
+    assignments: '2,097,279',
+    chromeTime: 'Board drawn: ~2 weeks',
+  },
+  monosol: {
+    title: 'Monochrome Solitaire',
+    desc: 'A tiny Klondike Solitaire game in 2.9KB. Monochrome text-mode. Running in SvarDOS via CSS-DOS.',
+    source: '2.9 KB',
+    sourceBytes: 2953,
+    cssFile: 'monosol.css.gz',
+    cssSize: '569 MB',
+    cssSizeBytes: 596299315,
+    lines: '18,878,592',
+    properties: '1,048,604',
+    assignments: '2,097,279',
+    chromeTime: 'Cards dealt: ~3 weeks',
+  },
+};
+
+// ============================================================
+// Page init
+// ============================================================
+const params = new URLSearchParams(location.search);
+const programId = params.get('p');
+const prog = PROGRAMS[programId];
+
+if (!prog) {
+  document.getElementById('program-title').textContent = 'Program not found';
+  document.getElementById('program-desc').textContent = 'Unknown program: ' + programId;
+} else {
+  document.title = `CSS-DOS \u2014 ${prog.title}`;
+  document.getElementById('window-title').innerHTML = `CSS-DOS &mdash; ${programId}.css`;
+  document.getElementById('program-title').textContent = prog.title;
+  document.getElementById('program-desc').innerHTML = prog.desc;
+
+  // Stats
+  document.getElementById('stat-css-size').textContent = prog.cssSize;
+  document.getElementById('stat-lines').textContent = prog.lines;
+  document.getElementById('stat-properties').textContent = prog.properties;
+  document.getElementById('stat-assignments').textContent = prog.assignments;
+  document.getElementById('css-size-text').textContent = prog.cssSize;
+  document.getElementById('chrome-time').textContent = prog.chromeTime;
+  document.getElementById('download-size').textContent = prog.cssSize;
+
+  // Fun comparisons
+  const cssMB = prog.cssSizeBytes / 1024 / 1024;
+  const shakespeares = (cssMB / 5.5).toFixed(0);
+  const bibles = (cssMB / 4.5).toFixed(0);
+  const expansion = (prog.cssSizeBytes / prog.sourceBytes).toFixed(0);
+  const wikis = (cssMB / 21000 * 100).toFixed(1); // english wikipedia ~21GB
+
+  document.getElementById('comparisons').innerHTML =
+    `This is <strong>${prog.cssSize}</strong> of pure CSS text. That's:\n` +
+    `<br>&bull; <strong>${expansion}x</strong> the original program size (${prog.source})` +
+    `<br>&bull; <strong>${shakespeares}x</strong> the complete works of Shakespeare` +
+    `<br>&bull; <strong>${bibles}x</strong> the King James Bible` +
+    `<br>&bull; <strong>${prog.lines}</strong> lines of CSS &mdash; ` +
+    `if printed at 60 lines per page, that's <strong>${Math.round(parseInt(prog.lines.replace(/,/g,'')) / 60).toLocaleString()}</strong> pages` +
+    `<br>&bull; Every single line is valid CSS that Chrome can evaluate`;
+
+  // Download link
+  document.getElementById('btn-download').href = `programs/${prog.cssFile}`;
+  document.getElementById('btn-download').download = `${programId}.css.gz`;
+}
+
+// ============================================================
+// CSS Viewer — virtual scroll with chunked line storage
+// ============================================================
+
+// Lines are stored in chunks to avoid one giant array.
+// We render only the visible "page" of lines into the DOM.
+const LINES_PER_PAGE = 50;      // lines visible at once
+const CHUNK_SIZE = 10000;       // lines per storage chunk
+let viewerLines = [];           // array of chunks: [string[CHUNK_SIZE], ...]
+let viewerTotalLines = 0;
+let viewerLoaded = false;
+let viewerCurrentPage = 0;      // 0-indexed page number
+
+function getLine(n) { // 0-indexed
+  const chunk = Math.floor(n / CHUNK_SIZE);
+  const offset = n % CHUNK_SIZE;
+  return viewerLines[chunk]?.[offset] ?? '';
+}
+
+function viewerTotalPages() {
+  return Math.max(1, Math.ceil(viewerTotalLines / LINES_PER_PAGE));
+}
+
+function renderPage(page) {
+  page = Math.max(0, Math.min(page, viewerTotalPages() - 1));
+  viewerCurrentPage = page;
+
+  const content = document.getElementById('css-viewer-content');
+  const startLine = page * LINES_PER_PAGE;
+  const endLine = Math.min(startLine + LINES_PER_PAGE, viewerTotalLines);
+
+  let html = '';
+  for (let i = startLine; i < endLine; i++) {
+    const num = (i + 1).toString().padStart(8);
+    const text = getLine(i);
+    // Escape HTML
+    const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    html += `<span class="css-line-num">${num}</span>${escaped}\n`;
+  }
+
+  if (viewerTotalLines === 0) {
+    html = viewerLoaded ? '(empty file)' : 'Loading...';
+  }
+
+  content.innerHTML = html;
+
+  // Update status
+  document.getElementById('viewer-line-info').textContent =
+    `Lines ${(startLine+1).toLocaleString()}\u2013${endLine.toLocaleString()}`;
+  document.getElementById('viewer-nav-info').textContent =
+    `Page ${(page+1).toLocaleString()} of ${viewerTotalPages().toLocaleString()}`;
+
+  // Update goto input max
+  const gotoInput = document.getElementById('viewer-goto-input');
+  gotoInput.max = viewerTotalLines;
+  gotoInput.placeholder = `1\u2013${viewerTotalLines.toLocaleString()}`;
+
+  // Scroll viewer to top
+  document.getElementById('css-viewer').scrollTop = 0;
+}
+
+function navigateViewer(delta) {
+  if (!viewerLoaded && viewerTotalLines === 0) return;
+  renderPage(viewerCurrentPage + delta);
+}
+
+function enableViewerButtons() {
+  for (const id of ['viewer-go-top', 'viewer-back-100', 'viewer-back-10',
+      'viewer-pg-up', 'viewer-pg-dn', 'viewer-fwd-10', 'viewer-fwd-100',
+      'viewer-go-end', 'viewer-goto-input', 'viewer-goto-btn']) {
+    document.getElementById(id).disabled = false;
+  }
+}
+
+// Button handlers
+document.getElementById('viewer-go-top').addEventListener('click', () => renderPage(0));
+document.getElementById('viewer-back-100').addEventListener('click', () => navigateViewer(-100));
+document.getElementById('viewer-back-10').addEventListener('click', () => navigateViewer(-10));
+document.getElementById('viewer-pg-up').addEventListener('click', () => navigateViewer(-1));
+document.getElementById('viewer-pg-dn').addEventListener('click', () => navigateViewer(1));
+document.getElementById('viewer-fwd-10').addEventListener('click', () => navigateViewer(10));
+document.getElementById('viewer-fwd-100').addEventListener('click', () => navigateViewer(100));
+document.getElementById('viewer-go-end').addEventListener('click', () => renderPage(viewerTotalPages() - 1));
+
+document.getElementById('viewer-goto-btn').addEventListener('click', () => {
+  const line = parseInt(document.getElementById('viewer-goto-input').value);
+  if (line >= 1) renderPage(Math.floor((line - 1) / LINES_PER_PAGE));
+});
+document.getElementById('viewer-goto-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('viewer-goto-btn').click();
+});
+
+// Keyboard navigation when viewer is focused
+document.getElementById('css-viewer').addEventListener('keydown', (e) => {
+  switch (e.key) {
+    case 'ArrowDown': case 'j': navigateViewer(1); e.preventDefault(); break;
+    case 'ArrowUp': case 'k': navigateViewer(-1); e.preventDefault(); break;
+    case 'PageDown': case ' ': navigateViewer(1); e.preventDefault(); break;
+    case 'PageUp': navigateViewer(-1); e.preventDefault(); break;
+    case 'Home': renderPage(0); e.preventDefault(); break;
+    case 'End': renderPage(viewerTotalPages() - 1); e.preventDefault(); break;
+  }
+});
+
+// Main loader — also wired to the button for re-focus
+async function loadCssViewer() {
+  const content = document.getElementById('css-viewer-content');
+  const totalInfo = document.getElementById('viewer-total-info');
+
+  if (viewerLoaded || viewerTotalLines > 0) {
+    renderPage(viewerCurrentPage);
+    return;
+  }
+
+  const progressDiv = document.getElementById('viewer-progress');
+  const progressBar = document.getElementById('viewer-progress-bar');
+  progressDiv.style.display = '';
+  progressBar.style.width = '0%';
+  content.innerHTML = '<span class="css-viewer-loading">Downloading and decompressing ' + prog.cssSize + ' of CSS...</span>';
+  totalInfo.textContent = 'Connecting...';
+
+  try {
+    const resp = await fetch(`programs/${prog.cssFile}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+    const ds = new DecompressionStream('gzip');
+    const decompressed = resp.body.pipeThrough(ds);
+    const reader = decompressed.getReader();
+    const decoder = new TextDecoder();
+
+    let totalBytes = 0;
+    let partial = '';
+    let currentChunk = [];
+    let lastProgressUpdate = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      totalBytes += value.length;
+      const text = partial + decoder.decode(value, { stream: true });
+      const lines = text.split('\n');
+      partial = lines.pop();
+
+      for (const line of lines) {
+        currentChunk.push(line);
+        viewerTotalLines++;
+
+        if (currentChunk.length >= CHUNK_SIZE) {
+          viewerLines.push(currentChunk);
+          currentChunk = [];
+        }
+      }
+
+      // Show first page as soon as we have enough lines
+      if (viewerTotalLines >= LINES_PER_PAGE && viewerCurrentPage === 0 &&
+          content.querySelector('.css-viewer-loading')) {
+        enableViewerButtons();
+        renderPage(0);
+      }
+
+      // Update progress bar (throttled to avoid layout thrash)
+      const now = Date.now();
+      if (now - lastProgressUpdate > 100) {
+        lastProgressUpdate = now;
+        const pct = (totalBytes / prog.cssSizeBytes * 100);
+        progressBar.style.width = pct.toFixed(1) + '%';
+        totalInfo.textContent = `${(totalBytes / 1024 / 1024).toFixed(0)} MB / ${prog.cssSize} (${pct.toFixed(0)}%) \u2014 ${viewerTotalLines.toLocaleString()} lines`;
+      }
+    }
+
+    // Final partial line
+    if (partial) {
+      currentChunk.push(partial);
+      viewerTotalLines++;
+    }
+    if (currentChunk.length > 0) {
+      viewerLines.push(currentChunk);
+    }
+
+    viewerLoaded = true;
+    progressBar.style.width = '100%';
+    setTimeout(() => { progressDiv.style.display = 'none'; }, 500);
+    totalInfo.textContent = `${(totalBytes / 1024 / 1024).toFixed(0)} MB, ${viewerTotalLines.toLocaleString()} lines \u2014 fully loaded`;
+    enableViewerButtons();
+    renderPage(viewerCurrentPage);
+
+    reader.releaseLock();
+  } catch (err) {
+    progressDiv.style.display = 'none';
+    content.textContent = `Error loading CSS: ${err.message}\n\n(CSS files need to be served from a web server with gzip support)`;
+  }
+}
+
+// Auto-load viewer on page load
+if (prog) loadCssViewer();
+
+// ============================================================
+// Runner (placeholder — needs WASM build)
+// ============================================================
+document.getElementById('btn-run').addEventListener('click', () => {
+  const panel = document.getElementById('runner-panel');
+  panel.style.display = '';
+  const screen = document.getElementById('runner-screen');
+  const status = document.getElementById('runner-status');
+
+  screen.textContent = 'Loading CSS-DOS engine (calcite-wasm)...\n\nThis requires the WASM build. Run:\n  wasm-pack build crates/calcite-wasm --target web --out-dir ../../site/pkg\n\nThen serve this directory with a web server.';
+  status.textContent = 'WASM not loaded';
+
+  // TODO: integrate calcite-worker.js + WASM
+  // The flow would be:
+  // 1. Fetch the .css.gz, decompress to string
+  // 2. Send to calcite-wasm worker
+  // 3. Run tick loop, render screen
+});
+</script>
+</body>
+</html>
