@@ -10,6 +10,9 @@
 // --trace         Print register state every tick
 // --trace-from=N  Start tracing at tick N
 // --halt-detect   Stop when IP loops or HLT flag set (default on)
+// --int-trace     Log all INT calls (number, AH function, CS:IP caller)
+// --int-trace-from=N  Start INT tracing at tick N
+// --port-trace    Log all I/O port accesses
 
 import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
@@ -28,6 +31,9 @@ const maxTicks = parseInt(flags.ticks || '1000000');
 const showVga = flags.vga === 'true';
 const traceAll = flags.trace === 'true';
 const traceFrom = parseInt(flags['trace-from'] || '-1');
+const intTrace = flags['int-trace'] === 'true';
+const intTraceFrom = parseInt(flags['int-trace-from'] || '-1');
+const portTrace = flags['port-trace'] === 'true';
 
 // --- Load JS 8086 ---
 const js8086Source = readFileSync(resolve(__dirname, 'js8086.js'), 'utf-8');
@@ -51,8 +57,28 @@ for (let i = 0; i < diskBin.length && 0xD0000 + i < memory.length; i++) memory[0
 for (let i = 0; i < biosBin.length; i++) memory[0xF0000 + i] = biosBin[i];
 
 // --- CPU ---
+let vgaWriteCount = 0;
+let vgaWriteTickStart = parseInt(flags['vga-trace-from'] || '-1');
+let vgaWriteTickEnd = parseInt(flags['vga-trace-to'] || '-1');
+let currentTick = 0;
 const cpu = Intel8086(
-  (addr, val) => { memory[addr & 0xFFFFF] = val & 0xFF; },
+  (addr, val) => {
+    const a = addr & 0xFFFFF;
+    memory[a] = val & 0xFF;
+    // Track VGA buffer writes (B8000-B8FFF) - character bytes only (even addresses)
+    if (a >= 0xB8000 && a < 0xB9000 && vgaWriteTickStart >= 0 && currentTick >= vgaWriteTickStart && (vgaWriteTickEnd < 0 || currentTick <= vgaWriteTickEnd)) {
+      const offset = a - 0xB8000;
+      const row = Math.floor(offset / 160);
+      const col = Math.floor((offset % 160) / 2);
+      const isChar = (offset % 2) === 0;
+      if (isChar) {
+        const ch = val & 0xFF;
+        const c = ch >= 0x20 && ch < 0x7F ? String.fromCharCode(ch) : `\\x${hex(ch, 2)}`;
+        console.error(`  [T${currentTick}] VGA write row=${row} col=${col} char='${c}' (0x${hex(ch, 2)})`);
+      }
+      vgaWriteCount++;
+    }
+  },
   (addr) => memory[addr & 0xFFFFF],
 );
 
@@ -103,12 +129,16 @@ function dumpVGA() {
       const ch = memory[addr];
       line += ch >= 0x20 && ch < 0x7F ? String.fromCharCode(ch) : ' ';
     }
-    // Only print non-empty rows
+    // Print all rows, with line number
     const trimmed = line.trimEnd();
     if (trimmed.length > 0) {
       console.log(`  ${String(row).padStart(2)}: ${line.trimEnd()}`);
     }
   }
+  // Also show BDA cursor position (0040:0050-0051)
+  const curRow = memory[0x451];
+  const curCol = memory[0x450];
+  console.log(`  Cursor: row=${curRow} col=${curCol}`);
   console.log('--- End VGA ---\n');
 }
 
@@ -117,7 +147,7 @@ let ttyOutput = '';
 
 // --- Run ---
 console.error(`Running JS reference emulator in DOS mode, up to ${maxTicks} ticks...`);
-console.error(`BIOS init at F000:${hex(0x038F)}, kernel at 0060:0000`);
+console.error(`BIOS init at F000:${hex(biosInitOffset)}, kernel at 0060:0000`);
 
 let prevIP = -1;
 let prevCS = -1;
@@ -128,6 +158,7 @@ let lastProgressTick = 0;
 const milestones = new Map();
 
 for (let tick = 0; tick < maxTicks; tick++) {
+  currentTick = tick;
   const r = getRegs();
   const flatIP = r.CS * 16 + r.IP;
 
@@ -158,6 +189,12 @@ for (let tick = 0; tick < maxTicks; tick++) {
       milestones.set('int21_installed', tick);
       console.error(`  [T${tick}] INT 21h installed at ${hex(int21cs)}:${hex(int21ip)}`);
     }
+    // Check INT 29h handler
+    if (tick === 10000 || tick === 100000 || tick === 500000 || tick === 1000000) {
+      const int29ip = memory[0xA4] | (memory[0xA5] << 8);
+      const int29cs = memory[0xA6] | (memory[0xA7] << 8);
+      console.error(`  [T${tick}] INT 29h handler: ${hex(int29cs)}:${hex(int29ip)}`);
+    }
   }
 
   // Detect COMMAND.COM execution (CS changes to something in low memory, not kernel segment)
@@ -183,6 +220,45 @@ for (let tick = 0; tick < maxTicks; tick++) {
     if (ch === 13) { /* CR */ }
     else if (ch === 10) { ttyOutput += '\n'; }
     else if (ch >= 0x20 && ch < 0x7F) { ttyOutput += String.fromCharCode(ch); }
+  }
+
+  // INT call tracing
+  if (intTrace || (intTraceFrom >= 0 && tick >= intTraceFrom)) {
+    const opByte = memory[flatIP & 0xFFFFF];
+    if (opByte === 0xCD) { // INT imm8
+      const intNum = memory[(flatIP + 1) & 0xFFFFF];
+      const ah = (r.AX >> 8) & 0xFF;
+      const al = r.AX & 0xFF;
+      let extra = '';
+      // For INT 21h AH=40h (write), show the data being written
+      if (intNum === 0x21 && ah === 0x40) {
+        const base = r.DS * 16 + r.DX;
+        const len = r.CX;
+        let data = '';
+        for (let i = 0; i < Math.min(len, 64); i++) {
+          const b = memory[(base + i) & 0xFFFFF];
+          data += b >= 0x20 && b < 0x7F ? String.fromCharCode(b) : `\\x${hex(b, 2)}`;
+        }
+        extra = ` DATA="${data}"`;
+      }
+      // For INT 21h AH=09h (print string), show the string
+      if (intNum === 0x21 && ah === 0x09) {
+        const base = r.DS * 16 + r.DX;
+        let data = '';
+        for (let i = 0; i < 80; i++) {
+          const b = memory[(base + i) & 0xFFFFF];
+          if (b === 0x24) break; // '$' terminator
+          data += b >= 0x20 && b < 0x7F ? String.fromCharCode(b) : `\\x${hex(b, 2)}`;
+        }
+        extra = ` DATA="${data}"`;
+      }
+      // For INT 10h AH=0Eh (teletype), show the character
+      if (intNum === 0x10 && ah === 0x0E) {
+        const ch = al;
+        extra = ` CHAR='${ch >= 0x20 && ch < 0x7F ? String.fromCharCode(ch) : `\\x${hex(ch, 2)}`}'`;
+      }
+      console.error(`  [T${tick}] INT ${hex(intNum, 2)}h AH=${hex(ah, 2)}h AL=${hex(al, 2)}h from ${hex(r.CS)}:${hex(r.IP)} BX=${hex(r.BX)} CX=${hex(r.CX)} DX=${hex(r.DX)} DS=${hex(r.DS)} ES=${hex(r.ES)}${extra}`);
+    }
   }
 
   // Detect stuck (same CS:IP for too long)
