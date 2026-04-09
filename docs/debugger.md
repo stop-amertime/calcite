@@ -82,17 +82,39 @@ done
 curl -s localhost:3333/compare-paths | python3 -m json.tool
 ```
 
-### Comparing against a reference emulator
+### Finding the first divergence against the reference emulator
+
+The primary workflow uses `fulldiff.mjs`, which drives the debugger
+automatically. Start the debugger, then in another terminal:
 
 ```sh
-# Generate reference trace
-node tools/ref-emu.mjs program.com bios.bin 1000 --json > ref.json
+# Find first divergence (compares all registers + all FLAGS bits, REP-aware)
+node tools/fulldiff.mjs --ticks=5000
 
-# Load into debugger
+# Skip past known-good ticks to search further into execution
+node tools/fulldiff.mjs --ticks=5000 --skip=272000
+```
+
+For deeper property-level diagnosis at the divergence point:
+
+```sh
+# For DOS programs:
+node tools/diagnose.mjs --dos --ticks=5000
+
+# For simple .COM programs:
+node tools/diagnose.mjs program.com bios.bin --ticks=5000
+```
+
+You can also load a reference trace directly via the `/compare` endpoint:
+
+```sh
+node tools/ref-emu.mjs program.com bios.bin 1000 --json > ref.json
 curl -sX POST localhost:3333/compare \
   -d "{\"reference\": $(cat ref.json), \"stop_at_first\": true}" \
   | python3 -m json.tool
 ```
+
+See `docs/conformance-testing.md` for the full debugging workflow.
 
 ### Inspecting memory regions
 
