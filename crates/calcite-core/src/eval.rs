@@ -634,7 +634,14 @@ fn collect_style_deps(
     out: &mut Vec<usize>,
 ) {
     match expr {
-        Expr::Var { fallback, .. } => {
+        Expr::Var { name, fallback } => {
+            // Track dependency on current-tick computed properties referenced via var().
+            // Skip --__1X references (previous-tick values) as they don't need ordering.
+            if !name.starts_with("--__") {
+                if let Some(&idx) = defined.get(name) {
+                    out.push(idx);
+                }
+            }
             if let Some(fb) = fallback {
                 collect_style_deps(fb, defined, functions, fn_cache, out);
             }

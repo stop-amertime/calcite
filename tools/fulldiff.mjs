@@ -1,13 +1,11 @@
 #!/usr/bin/env node
-// fulldiff.mjs — Exhaustive tick-by-tick comparison of reference emulator vs calcite.
+// fulldiff.mjs — Find the FIRST divergence between JS reference emulator and calcite.
 //
-// For EVERY tick, compares ALL registers AND all memory writes. Reports everything:
-// - What instruction executed (opcode bytes, address)
-// - What BOTH emulators produced for every register
-// - What memory was written and what values
-// - The FIRST divergence with full context
+// Compares ALL registers including ALL 16 bits of FLAGS (no masking).
+// Handles REP sync (JS ref does entire REP in one step, calcite expands per tick).
+// On first divergence: prints previous state, instruction, and full comparison, then stops.
 //
-// Usage: node tools/fulldiff.mjs --dos [--ticks=N]
+// Usage: node tools/fulldiff.mjs [--ticks=N] [--skip=N]
 //
 // Requires: calcite-debugger running on localhost:3333
 
@@ -24,13 +22,14 @@ const flags = Object.fromEntries(
   })
 );
 const maxTicks = parseInt(flags.ticks || '500');
+const skipTicks = parseInt(flags.skip || '0');
 const port = parseInt(flags.port || '3333');
 const BASE = `http://localhost:${port}`;
 
 // --- Reference emulator setup ---
 const cssDir = resolve(__dirname, '..', '..', 'i8086-css');
 const js8086Source = readFileSync(resolve(__dirname, 'js8086.js'), 'utf-8');
-const evalSource = js8086Source.replace("'use strict';", '').replace('let CPU_186 = 0;', 'var CPU_186 = 0;');
+const evalSource = js8086Source.replace("'use strict';", '').replace('let CPU_186 = 0;', 'var CPU_186 = 1;');
 const Intel8086 = new Function(evalSource + '\nreturn Intel8086;')();
 
 const refMem = new Uint8Array(1024 * 1024);
@@ -56,7 +55,6 @@ try {
   }
 } catch {}
 
-// Track ALL memory writes in the reference emulator
 const refWritesThisTick = [];
 const cpu = Intel8086(
   (addr, val) => {
@@ -85,6 +83,26 @@ function getRefRegs() {
   };
 }
 
+// --- REP detection ---
+const STRING_OPS = new Set([0xA4, 0xA5, 0xA6, 0xA7, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF]);
+const SEG_PREFIXES = new Set([0x26, 0x2E, 0x36, 0x3E]);
+
+function detectREP(cs, ip) {
+  const base = (cs * 16 + ip) & 0xFFFFF;
+  let off = 0;
+  let hasRep = false;
+  for (let i = 0; i < 4; i++) {
+    const b = refMem[(base + off) & 0xFFFFF];
+    if (b === 0xF2 || b === 0xF3) { hasRep = true; off++; }
+    else if (SEG_PREFIXES.has(b)) { off++; }
+    else break;
+  }
+  if (!hasRep) return null;
+  const opcode = refMem[(base + off) & 0xFFFFF];
+  if (!STRING_OPS.has(opcode)) return null;
+  return { opcode };
+}
+
 // --- HTTP helpers ---
 async function post(path, body) {
   const resp = await fetch(`${BASE}${path}`, {
@@ -98,6 +116,11 @@ async function get(path) { return (await fetch(`${BASE}${path}`)).json(); }
 function hex(v, w = 4) { return v.toString(16).padStart(w, '0'); }
 function hexAddr(cs, ip) { return `${hex(cs)}:${hex(ip)} (${hex(cs * 16 + ip, 5)})`; }
 
+function flagBits(f) {
+  const names = ['CF','','PF','','AF','','ZF','SF','TF','IF','DF','OF'];
+  return names.map((n, i) => n && (f & (1 << i)) ? n : '').filter(Boolean).join('|') || '(none)';
+}
+
 // --- Main ---
 async function main() {
   try { await get('/info'); } catch {
@@ -106,44 +129,69 @@ async function main() {
   }
 
   await post('/seek', { tick: 0 });
-  console.error(`Full diff: ${maxTicks} ticks, ref vs calcite`);
+  console.error(`Full diff: up to ${maxTicks} ref ticks, all 16 FLAGS bits, REP-aware`);
+  if (skipTicks > 0) console.error(`Skipping first ${skipTicks} ticks...`);
 
   let prevRefRegs = getRefRegs();
-  let divergences = 0;
+  let calciteTick = 0;
+
+  // Skip phase
+  if (skipTicks > 0) {
+    for (let t = 0; t < skipTicks; t++) {
+      const cxBefore = prevRefRegs.CX;
+      const rep = detectREP(prevRefRegs.CS, prevRefRegs.IP);
+      cpu.step();
+      const refAfter = getRefRegs();
+      if (rep && cxBefore > 0) {
+        const iters = cxBefore - refAfter.CX;
+        if (iters > 0) { await post('/tick', { count: iters }); calciteTick += iters; }
+        else { await post('/tick', { count: 1 }); calciteTick++; }
+      } else {
+        await post('/tick', { count: 1 });
+        calciteTick++;
+      }
+      prevRefRegs = refAfter;
+      if (t > 0 && t % 5000 === 0) console.error(`  skipped ${t}...`);
+    }
+    console.error(`  Skip done. Calcite at tick ${calciteTick}.`);
+  }
 
   for (let tick = 0; tick < maxTicks; tick++) {
-    // Snapshot instruction bytes BEFORE stepping
+    const refTick = skipTicks + tick;
     const flatIP = prevRefRegs.CS * 16 + prevRefRegs.IP;
     const instBytes = [];
     for (let i = 0; i < 8; i++) instBytes.push(refMem[(flatIP + i) & 0xFFFFF]);
 
-    // Step reference
+    const cxBefore = prevRefRegs.CX;
+    const rep = detectREP(prevRefRegs.CS, prevRefRegs.IP);
+
     refWritesThisTick.length = 0;
     cpu.step();
     const refAfter = getRefRegs();
 
-    // Step calcite
-    await post('/tick', { count: 1 });
+    let calciteSteps = 1;
+    if (rep && cxBefore > 0) {
+      const iters = cxBefore - refAfter.CX;
+      if (iters > 0) calciteSteps = iters;
+    }
+    await post('/tick', { count: calciteSteps });
+    calciteTick += calciteSteps;
     const calState = await get('/state');
     const cal = calState.registers;
 
-    // Compare ALL registers
-    // FLAGS: mask to only check bits that affect program behavior:
-    // CF(0), PF(2), ZF(6), SF(7), DF(10), OF(11)
-    // Ignore: reserved(1), AF(4), TF(8), IF(9)
-    const FLAGS_MASK = 0x0CC5;  // CF|PF|ZF|SF|DF|OF
+    // Compare ALL registers, ALL FLAGS bits
     const regDiffs = [];
     for (const r of REG_NAMES) {
-      if (r === 'FLAGS') {
-        if ((refAfter[r] & FLAGS_MASK) !== (cal[r] & FLAGS_MASK)) regDiffs.push(r);
-      } else {
-        if (refAfter[r] !== cal[r]) regDiffs.push(r);
-      }
+      if (refAfter[r] !== cal[r]) regDiffs.push(r);
     }
 
-    // Compare memory writes: check that calcite's memory matches ref at written addresses
+    // Check memory writes
     const memDiffs = [];
-    for (const w of refWritesThisTick) {
+    const maxMemChecks = 200;
+    const writesSample = refWritesThisTick.length > maxMemChecks
+      ? refWritesThisTick.filter((_, i) => i < 100 || i >= refWritesThisTick.length - 100)
+      : refWritesThisTick;
+    for (const w of writesSample) {
       const calMem = await post('/memory', { addr: w.addr, len: 1 });
       const calVal = calMem.bytes[0];
       if (calVal !== refMem[w.addr]) {
@@ -152,65 +200,73 @@ async function main() {
     }
 
     if (regDiffs.length > 0 || memDiffs.length > 0) {
-      divergences++;
+      const repNote = rep ? ` [REP ${hex(rep.opcode, 2)}, CX: ${cxBefore}→${refAfter.CX}, calcite +${calciteSteps}]` : '';
       console.log(`\n${'='.repeat(78)}`);
-      console.log(`TICK ${tick}  instruction at ${hexAddr(prevRefRegs.CS, prevRefRegs.IP)}`);
-      console.log(`  bytes: ${instBytes.map(b => hex(b, 2)).join(' ')}`);
-      console.log(`${'─'.repeat(78)}`);
+      console.log(`FIRST DIVERGENCE at ref tick ${refTick} (calcite tick ${calciteTick})`);
+      console.log(`${'='.repeat(78)}`);
 
-      // Show ALL register states
-      console.log('  Register        Reference    Calcite      Match');
-      console.log('  ' + '─'.repeat(55));
+      // Previous state (before the instruction that caused divergence)
+      console.log(`\n  Before: ${hexAddr(prevRefRegs.CS, prevRefRegs.IP)}${repNote}`);
+      console.log(`  Instruction bytes: ${instBytes.map(b => hex(b, 2)).join(' ')}`);
+      console.log(`  Pre-FLAGS: ref=${hex(prevRefRegs.FLAGS)} [${flagBits(prevRefRegs.FLAGS)}]`);
+
+      // Full register comparison
+      console.log(`\n  Register        Reference    Calcite      Match`);
+      console.log('  ' + '─'.repeat(60));
       for (const r of REG_NAMES) {
         const rv = refAfter[r], cv = cal[r];
         const match = rv === cv ? '  ✓' : '  ✗ DIFF';
-        console.log(`  ${r.padEnd(14)}  ${hex(rv).padEnd(12)} ${hex(cv).padEnd(12)} ${match}`);
-      }
-
-      // Show memory writes
-      if (refWritesThisTick.length > 0) {
-        console.log(`\n  Memory writes (${refWritesThisTick.length} bytes):`);
-        console.log('  Address     Old   Ref→    Calcite  Match');
-        console.log('  ' + '─'.repeat(50));
-        for (const w of refWritesThisTick) {
-          const calMem = await post('/memory', { addr: w.addr, len: 1 });
-          const calVal = calMem.bytes[0];
-          const match = calVal === refMem[w.addr] ? '✓' : '✗ DIFF';
-          console.log(`  ${hex(w.addr, 6)}    ${hex(w.old, 2)}    ${hex(refMem[w.addr], 2)}      ${hex(calVal, 2)}       ${match}`);
+        let extra = '';
+        if (r === 'FLAGS' && rv !== cv) {
+          const xor = rv ^ cv;
+          extra = `  (diff bits: ${flagBits(xor)})`;
         }
+        console.log(`  ${r.padEnd(14)}  ${hex(rv).padEnd(12)} ${hex(cv).padEnd(12)} ${match}${extra}`);
       }
 
-      // Show what changed in reference (register deltas)
+      // FLAGS detail
+      if (regDiffs.includes('FLAGS')) {
+        console.log(`\n  Ref FLAGS:     ${hex(refAfter.FLAGS)} = ${refAfter.FLAGS.toString(2).padStart(16, '0')} [${flagBits(refAfter.FLAGS)}]`);
+        console.log(`  Calcite FLAGS: ${hex(cal.FLAGS)} = ${cal.FLAGS.toString(2).padStart(16, '0')} [${flagBits(cal.FLAGS)}]`);
+      }
+
+      // Memory diffs
+      if (memDiffs.length > 0) {
+        console.log(`\n  Memory mismatches (${memDiffs.length} of ${writesSample.length} checked, ${refWritesThisTick.length} total writes):`);
+        for (const d of memDiffs.slice(0, 20)) {
+          console.log(`    ${hex(d.addr, 6)}: ref=${hex(d.refVal, 2)} cal=${hex(d.calVal, 2)} (was ${hex(d.old, 2)})`);
+        }
+      } else if (refWritesThisTick.length > 0) {
+        console.log(`\n  Memory: ${refWritesThisTick.length} writes, all match ✓`);
+      }
+
+      // Ref deltas
       const changed = [];
       for (const r of REG_NAMES) {
         if (prevRefRegs[r] !== refAfter[r]) changed.push(`${r}: ${hex(prevRefRegs[r])}→${hex(refAfter[r])}`);
       }
-      if (changed.length) console.log(`\n  Ref changes: ${changed.join(', ')}`);
+      if (changed.length) console.log(`\n  Ref deltas: ${changed.join(', ')}`);
 
-      console.log(`${'='.repeat(78)}`);
+      // Calcite properties for debugging
+      const props = calState.properties || {};
+      const interestingProps = ['opcode', 'hasREP', 'repType', 'prefixLen', 'mod', 'reg', 'rm', 'ea', 'hasSegOverride'];
+      const propLines = interestingProps
+        .filter(p => `--${p}` in props)
+        .map(p => `${p}=${props[`--${p}`]}`);
+      if (propLines.length) console.log(`\n  Calcite props: ${propLines.join(', ')}`);
 
-      // Stop after a few non-FLAGS-only divergences
-      const hasNonFlagsDiff = regDiffs.some(r => r !== 'FLAGS') || memDiffs.length > 0;
-      if (hasNonFlagsDiff) {
-        if (divergences >= 5) {
-          console.log(`\nStopping after ${divergences} non-FLAGS divergences (${tick + 1} ticks checked).`);
-          break;
-        }
-      }
+      console.log(`\n${'='.repeat(78)}`);
+      console.log(`\nStopped at first divergence. ${refTick} ref ticks matched before this.`);
+      break;
     }
 
     prevRefRegs = refAfter;
 
     if (tick > 0 && tick % 1000 === 0) {
-      console.error(`  ${tick} ticks OK...`);
+      console.error(`  ${tick} ref ticks OK (calcite tick ${calciteTick})...`);
     }
   }
 
-  if (divergences === 0) {
-    console.log(`\n✓ ALL ${maxTicks} ticks match perfectly.`);
-  } else {
-    console.log(`\n${divergences} divergence(s) found in ${maxTicks} ticks.`);
-  }
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
