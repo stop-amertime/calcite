@@ -147,71 +147,20 @@ never be one.
 
 ### Conformance testing — the main debugging workflow
 
-The ground truth is `tools/js8086.js`, a reference 8086 emulator in JavaScript.
-Every bug fix must be validated by diffing calcite against this reference
-implementation tick-by-tick. The reference emulator runs real x86 machine code
-with no CSS involvement, so any divergence means calcite (or the CSS generator)
-is computing something wrong.
+**Read `docs/conformance-testing.md` before doing any debugging work.** It
+has the full tool reference, usage examples, and step-by-step workflows.
 
-**The key principle: always diff carefully against the reference.** The
-reference emulator is authoritative. When calcite and the reference disagree,
-calcite is wrong (or the CSS is wrong). Never assume calcite is correct just
-because it "looks right" — always verify with the reference.
+The key principles:
 
-The workflow for finding and fixing bugs is:
-
-1. **Find the first divergence.** Start the HTTP debugger, then run
-   `fulldiff.mjs` — it steps both emulators tick-by-tick, comparing ALL
-   registers including all 16 bits of FLAGS (no masking). It handles REP
-   instruction sync (the JS reference executes an entire REP in one step,
-   while calcite expands it per-tick). It stops at the first mismatch with
-   full context: previous state, instruction bytes, register comparison,
-   and FLAG bit diffs.
-
-   ```sh
-   # Start the debugger
-   cargo run --release -p calcite-debugger -- -i program.css
-   # Find first divergence (in another terminal)
-   node tools/fulldiff.mjs --ticks=5000
-   # Skip past known-good ticks to search further
-   node tools/fulldiff.mjs --ticks=5000 --skip=10000
-   ```
-
-2. **Diagnose the root cause.** Once you know the divergent tick,
-   `diagnose.mjs` digs into CSS property-level diagnostics — it
-   cross-references every CSS property against what the reference emulator
-   expects, showing exactly which property computed the wrong value and why.
-
-   ```sh
-   # For simple .COM programs (debugger must be running):
-   node tools/diagnose.mjs program.com bios.bin --ticks=5000
-   # For DOS boot:
-   node tools/diagnose.mjs --dos --ticks=5000
-   ```
-
-3. **Fix the bug.** Bugs are OFTEN in the CSS generator (i8086-css transpiler),
-   not in calcite. When compiled and interpreted paths agree but diverge from
-   the reference emulator, it's a CSS bug — fix it in i8086-css regardless of
-   which repo you're working in. Fix, regenerate the CSS, re-run the
-   comparison, repeat.
-
-4. **Run the reference standalone to understand expected behaviour.** When you
-   need to understand what the CPU *should* be doing without involving calcite:
-
-   ```sh
-   # DOS boot mode (same BIOS + DOS kernel):
-   node tools/ref-dos.mjs --ticks=50000 --vga --trace-from=272000
-   # Simple .COM program:
-   node tools/ref-emu.mjs program.com bios.bin 5000 --json
-   ```
-
-Key tools:
-- `tools/fulldiff.mjs` — **primary**: find first divergence, REP-aware, full FLAGS
-- `tools/diagnose.mjs` — property-level CSS diagnosis (needs debugger running)
-- `tools/ref-dos.mjs` — standalone reference emulator (DOS boot mode)
-- `tools/ref-emu.mjs` — standalone reference emulator (simple BIOS programs)
-- `tools/compare.mjs` — tick-by-tick comparison for simple BIOS .COM programs
-- `../i8086-css/tools/compare-dos.mjs` — older DOS boot comparison (runs in i8086-css repo)
+- **Always diff against the reference.** `tools/js8086.js` is a reference
+  8086 emulator that serves as ground truth. When calcite and the reference
+  disagree, calcite is wrong (or the CSS is wrong). Never assume calcite is
+  correct — always verify with the reference.
+- **Bugs are often in the CSS generator**, not calcite. When compiled and
+  interpreted paths agree but diverge from the reference, it's a CSS bug —
+  fix it in i8086-css.
+- **Use the debugger** (`docs/debugger.md`) to inspect calcite's internal
+  state at any tick, compare compiled vs interpreted paths, and read memory.
 
 ### Running programs
 
