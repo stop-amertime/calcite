@@ -62,18 +62,23 @@ self.onmessage = async function (event) {
         engine.tick_batch(data.count || 1);
         const stringProps = JSON.parse(engine.get_string_properties());
 
-        // Text-mode screen (if present): rendered as a string.
+        // Read current video mode from BDA (0x0449). This is the runtime
+        // source of truth: what INT 10h AH=00h last wrote. The runner uses
+        // it to decide which output to show (text vs. canvas).
+        const videoMode = engine.get_video_mode();
+        const isGfxMode = videoMode === 0x13; // Mode 13h: 320x200x256
+
+        // Text-mode screen: only rendered when not in a graphics mode.
         let screen = null;
-        if (videoRegions.text) {
+        if (!isGfxMode && videoRegions.text) {
           const t = videoRegions.text;
           screen = engine.render_screen(t.addr, t.width, t.height);
         }
 
-        // Graphics-mode framebuffer (if present): raw RGBA bytes, posted
-        // as a transferable so the main thread can blit to a canvas.
+        // Graphics-mode framebuffer: only read when in a graphics mode.
         let gfxBytes = null;
         const transfer = [];
-        if (videoRegions.gfx) {
+        if (isGfxMode && videoRegions.gfx) {
           const g = videoRegions.gfx;
           // read_framebuffer_rgba returns a Uint8Array backed by wasm
           // memory — copy into a new ArrayBuffer we can transfer.
@@ -90,6 +95,7 @@ self.onmessage = async function (event) {
             stringProperties: stringProps,
             screen,
             gfxBytes,
+            videoMode,
             ticks: data.count || 1,
           },
           transfer,

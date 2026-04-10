@@ -255,6 +255,8 @@
     let video = { text: null, gfx: null };
     // Cached ImageData for the gfx canvas, sized on first use.
     let gfxImageData = null;
+    // Last known video mode byte from BDA 0x0449. Used to switch display.
+    let currentVideoMode = 0x03; // start in text mode
 
     worker.onmessage = ({ data }) => {
       switch (data.type) {
@@ -270,29 +272,19 @@
           modeBadge.textContent = labels.join(' + ') || 'NO VIDEO';
           modeBadge.style.display = '';
 
-          // If there's a gfx region, show the canvas and size its ImageData
-          // to match. Otherwise hide the canvas and let the text output
-          // element take over.
+          // Pre-size the canvas if a gfx region is present. Visibility is
+          // controlled at runtime by the BDA video mode byte, not bake-time.
           if (video.gfx) {
             canvas.width = video.gfx.width;
             canvas.height = video.gfx.height;
             // Scale up via CSS so 320x200 is viewable on modern monitors.
             canvas.style.width = (video.gfx.width * 2) + 'px';
             canvas.style.height = (video.gfx.height * 2) + 'px';
-            canvas.style.display = '';
             gfxImageData = ctx.createImageData(video.gfx.width, video.gfx.height);
-            // If there's no text region, hide the text output entirely.
-            if (!video.text) {
-              output.style.display = 'none';
-            } else {
-              output.style.display = '';
-              output.style.minHeight = '0';
-            }
-          } else {
-            canvas.style.display = 'none';
-            output.style.display = '';
-            output.style.minHeight = '0';
           }
+          // Start hidden; first tick-result will show the right one.
+          canvas.style.display = 'none';
+          output.style.display = 'none';
 
           // Auto-run as soon as the engine is ready. The Run/Stop buttons
           // still work as pause/resume; they just aren't required to see
@@ -306,6 +298,23 @@
           const elapsed = (performance.now() - startTime) / 1000;
           stats.textContent = `${totalTicks.toLocaleString()} ticks | ${(totalTicks / elapsed).toFixed(0)} t/s`;
 
+          // Switch display based on BDA video mode byte (runtime source of truth).
+          // A program that switches from text to Mode 13h mid-run is handled
+          // correctly because we check every tick, not just at init.
+          const isGfxMode = (data.videoMode === 0x13);
+          if (isGfxMode !== (currentVideoMode === 0x13)) {
+            currentVideoMode = data.videoMode;
+            if (isGfxMode) {
+              canvas.style.display = '';
+              output.style.display = 'none';
+            } else {
+              canvas.style.display = 'none';
+              output.style.display = '';
+              output.style.minHeight = '0';
+            }
+          }
+          currentVideoMode = data.videoMode;
+
           // Graphics: blit RGBA bytes straight to the canvas.
           if (data.gfxBytes && gfxImageData) {
             const src = new Uint8Array(data.gfxBytes);
@@ -314,9 +323,9 @@
           }
 
           // Text mode: write the rendered screen string.
-          if (video.text && data.screen != null) {
+          if (!isGfxMode && data.screen != null) {
             output.textContent = data.screen;
-          } else if (!video.gfx && data.stringProperties) {
+          } else if (!isGfxMode && !video.text && data.stringProperties) {
             // Legacy path: string-property output (only used when neither
             // text nor gfx regions were detected).
             const parts = [];

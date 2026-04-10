@@ -83,8 +83,11 @@ impl CalciteEngine {
 
     /// Set the keyboard input state.
     /// Pass (scancode << 8 | ascii), or 0 for no key.
+    /// Writes to memory 0x500 (ascii) and 0x501 (scancode) — the address
+    /// that the CSS-DOS BIOS polls for keystrokes via INT 16h.
     pub fn set_keyboard(&mut self, key: i32) {
-        self.state.keyboard = key;
+        self.state.write_mem(0x500, key & 0xFF);
+        self.state.write_mem(0x501, (key >> 8) & 0xFF);
     }
 
     /// Get the current value of a register (for debugging).
@@ -177,6 +180,15 @@ impl CalciteEngine {
             None => "null".to_string(),
         };
         format!("{{\"text\":{text_json},\"gfx\":{gfx_json}}}")
+    }
+
+    /// Read the current video mode from the BDA (0x0449).
+    ///
+    /// Returns the byte at flat address 0x0449 (BDA segment 0x0040, offset 0x49).
+    /// This is written by INT 10h AH=00h (set mode) and read by AH=0Fh (get mode).
+    /// Common values: 0x03 = 80x25 text, 0x13 = VGA Mode 13h (320x200x256).
+    pub fn get_video_mode(&self) -> u8 {
+        self.state.read_mem(0x0449) as u8
     }
 
     /// Return string properties as a JSON object string, e.g. `{"textBuffer":"Hello"}`.

@@ -83,26 +83,8 @@ const jsCpu = Intel8086(
 );
 jsCpu.reset();
 
-// Determine bios_init offset from the listing (fallback to 0x038A).
-let biosInitOffset = 0x038A;
-try {
-  const lst = readFileSync(resolve(cssDir, 'build', 'gossamer-dos.lst'), 'utf-8');
-  const lines = lst.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes('bios_init:')) {
-      const m = lines[i + 1]?.match(/([0-9A-Fa-f]{8})/);
-      if (m) biosInitOffset = parseInt(m[1], 16);
-      break;
-    }
-  }
-} catch {}
-
-jsCpu.setRegs({
-  cs: 0xF000, ip: biosInitOffset,
-  ss: 0, sp: 0xFFF8, ds: 0, es: 0,
-  ah: 0, al: 0, bh: 0, bl: 0, ch: 0, cl: 0, dh: 0, dl: 0,
-});
-
+// Initial registers are set after calcite-debugger is ready (see initJsCpu below),
+// so they match the CSS @property initial-values exactly.
 let jsTick = 0;
 
 function jsGetRegs() {
@@ -186,6 +168,27 @@ function httpRequest(method, path, body) {
     if (data) req.write(data);
     req.end();
   });
+}
+
+// Seed the JS CPU registers from calcite's tick-0 state so they exactly
+// match the @property initial-values in the CSS, regardless of which BIOS
+// version is currently built.
+async function initJsCpu() {
+  const state = await httpRequest('GET', '/state');
+  const r = state.registers;
+  jsCpu.setRegs({
+    cs: r.CS, ip: r.IP & 0xFFFF,
+    ss: r.SS, sp: r.SP,
+    ds: r.DS, es: r.ES,
+    ah: (r.AX >> 8) & 0xFF, al: r.AX & 0xFF,
+    bh: (r.BX >> 8) & 0xFF, bl: r.BX & 0xFF,
+    ch: (r.CX >> 8) & 0xFF, cl: r.CX & 0xFF,
+    dh: (r.DX >> 8) & 0xFF, dl: r.DX & 0xFF,
+    bp: r.BP, si: r.SI, di: r.DI,
+  });
+  // FLAGS can't be set via setRegs in js8086 — it starts from cpu.reset() defaults,
+  // which is close enough (usually 0x0002, matching the CSS initial value).
+  console.error(`[codebug] JS CPU seeded from CSS: CS=${r.CS.toString(16)} IP=${(r.IP&0xFFFF).toString(16)} SP=${r.SP.toString(16)}`);
 }
 
 async function waitForCalcite(maxMs = 60000) {
@@ -479,8 +482,8 @@ const server = createServer(async (req, res) => {
 
 startCalcite();
 await waitForCalcite();
+await initJsCpu();
 console.error(`[codebug] calcite-debugger ready on :${calcitePort}`);
-console.error(`[codebug] JS reference booted, bios_init=0x${biosInitOffset.toString(16)}`);
 
 server.listen(port, '127.0.0.1', () => {
   console.error(`[codebug] listening on http://localhost:${port}`);
