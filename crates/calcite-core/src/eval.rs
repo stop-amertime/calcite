@@ -614,24 +614,66 @@ impl Evaluator {
             .collect()
     }
 
+    /// Per-tick gate for `apply_input_edges`. Inlined at every tick-path
+    /// call site so cabinets that never touch the input-edge path pay
+    /// **zero** function-call overhead in the hot loop.
+    ///
+    /// Returns true if the slow path must run. The conditions match
+    /// what the slow path would short-circuit on:
+    ///
+    /// - `input_edge_bindings.is_empty()` → no edges to apply (carts
+    ///   without `&:has(...)` rules; entire smoke set except doom8088).
+    /// - `pseudo_active.is_empty() && !last_apply_was_nonzero` → nothing
+    ///   pressed and nothing written non-zero last tick, so no slot
+    ///   needs clearing either. The common case on doom8088 during
+    ///   boot, level-load, and ingame-idle ticks.
+    ///
+    /// Crucially this is a sub-100-byte function with no loops and no
+    /// allocations — the inliner takes it at every call site, leaving
+    /// the per-tick cost as a handful of field-load-and-compare wasm
+    /// ops. The original `apply_input_edges` was too large for the
+    /// inliner's default heuristic, so calling it added a real
+    /// function-call frame to every tick (~50 wasm ops × 34M ticks ≈
+    /// ~4 seconds of overhead measured 2026-05-22 on doom-loading
+    /// web bench, recovered to master parity by this split).
+    #[inline(always)]
+    fn needs_input_edge_apply(&self, state: &State) -> bool {
+        if self.input_edge_bindings.is_empty() {
+            return false;
+        }
+        // pseudo_active.is_empty() and last_apply_was_nonzero are both
+        // single-field loads; `&&` short-circuits in caller order. This
+        // is the same gate the slow path's layer-3 check uses; we just
+        // promote it to the inlined hot path so the call frame itself
+        // is elided when the gate would have early-returned anyway.
+        // Note: this version is conservative — it returns `true` once
+        // before the lazy `input_edge_groups` is built (first call),
+        // which lets the slow path do the grouping work. Subsequent
+        // ticks short-circuit here.
+        !(state.pseudo_active.is_empty() && !self.last_apply_was_nonzero)
+    }
+
     /// Apply input-edge bindings to state vars. For each gated state-var
     /// slot, sum the values of edges whose `(pseudo, selector)` pair is
     /// reported active by the host, and write the result. Slots with no
     /// active edges get 0 (release semantics).
     ///
-    /// **Hot path.** Called at the top of every tick batch. Three layers
-    /// of fast-out:
+    /// **Hot path.** Called at the top of every tick batch — but always
+    /// behind `needs_input_edge_apply` so the function-call frame is
+    /// elided when nothing's happening. The body itself still has its
+    /// own fast-outs (kept for safety), which only matter on the first
+    /// few ticks when the lazy `input_edge_groups` is being built.
     ///
-    /// 1. No bindings → return immediately (used by carts without input
-    ///    edges, e.g. all the smoke set except doom8088).
+    /// Layers:
+    ///
+    /// 1. No bindings → return immediately. (Same check the inlined
+    ///    gate does; kept here as a safety net.)
     /// 2. Lazy compile-once of the resolved-and-grouped form.
     ///    `state.var_slot(bare(property))` is a HashMap probe; we cache
     ///    the slot per binding on first call so subsequent ticks skip
     ///    string conversion + HashMap lookup entirely.
     /// 3. `state.pseudo_active.is_empty()` AND last apply wrote zero
-    ///    everywhere → return. The common case on doom8088 is "no key
-    ///    pressed and none pressed last tick"; cuts the per-tick cost
-    ///    of input-edge handling to a single bool check.
+    ///    everywhere → return. Belt-and-braces with the inlined gate.
     ///
     /// Without these the function used to do ~59 string allocations,
     ///  ~59 HashMap probes, and an O(n²) accumulator scan per tick on
@@ -711,7 +753,7 @@ impl Evaluator {
         // into the underlying state-var slot. Properties with no active
         // edges get 0 (release semantics). Done before `compile::execute`
         // so the bytecode sees the new value during this tick.
-        self.apply_input_edges(state);
+        if self.needs_input_edge_apply(state) { self.apply_input_edges(state); }
 
         // Snapshot state vars for change detection
         let prev_vars = state.state_vars.clone();
@@ -845,7 +887,7 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
-        self.apply_input_edges(state);
+        if self.needs_input_edge_apply(state) { self.apply_input_edges(state); }
         compile::execute(&self.compiled, state, &mut self.slots);
         if !self.string_assignments.is_empty() {
             self.properties.clear();
@@ -888,7 +930,7 @@ impl Evaluator {
         let t1 = Instant::now();
         profile.hooks += t1.duration_since(t0).as_secs_f64();
 
-        self.apply_input_edges(state);
+        if self.needs_input_edge_apply(state) { self.apply_input_edges(state); }
 
         // Snapshot
         let prev_vars = state.state_vars.clone();
@@ -953,7 +995,7 @@ impl Evaluator {
             hook(state);
         }
 
-        self.apply_input_edges(state);
+        if self.needs_input_edge_apply(state) { self.apply_input_edges(state); }
 
         self.properties.clear();
         self.call_depth = 0;
