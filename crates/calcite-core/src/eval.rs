@@ -126,6 +126,13 @@ pub struct Evaluator {
     /// we'd have to write zero to every grouped slot on every empty
     /// tick, which is the regression behaviour we're fixing.
     last_apply_was_nonzero: bool,
+    /// Last observed `state.pseudo_active_gen` from a real apply.
+    /// `apply_input_edges` recomputes the per-slot sum and bumps this;
+    /// the gate skips the recompute when the generation hasn't changed.
+    /// During doomLoad the active set is stable for ~50 K ticks between
+    /// pulse-release boundaries — without the gen check we re-summed 59
+    /// edges every tick to produce the same result.
+    last_apply_gen: u32,
 }
 
 /// Compiled form of a `ParsedProgram::input_edges` entry. The
@@ -593,6 +600,7 @@ impl Evaluator {
             input_edge_bindings,
             input_edge_groups: None,
             last_apply_was_nonzero: false,
+            last_apply_gen: u32::MAX, // sentinel: forces first-tick recompute
         }
     }
 
@@ -641,15 +649,17 @@ impl Evaluator {
         if self.input_edge_bindings.is_empty() {
             return false;
         }
-        // pseudo_active.is_empty() and last_apply_was_nonzero are both
-        // single-field loads; `&&` short-circuits in caller order. This
-        // is the same gate the slow path's layer-3 check uses; we just
-        // promote it to the inlined hot path so the call frame itself
-        // is elided when the gate would have early-returned anyway.
-        // Note: this version is conservative — it returns `true` once
-        // before the lazy `input_edge_groups` is built (first call),
-        // which lets the slow path do the grouping work. Subsequent
-        // ticks short-circuit here.
+        // Cheap per-tick gate: skip the apply if the active set hasn't
+        // changed since our last recompute AND we don't need to clear
+        // last tick's writes. The gen counter on State is bumped only
+        // by `set_pseudo_class_active` mutations, so 99 %+ of doomLoad
+        // ticks short-circuit here. (Sentinel `u32::MAX` on first call
+        // forces a recompute so lazy grouping happens.)
+        if state.pseudo_active_gen == self.last_apply_gen {
+            return false;
+        }
+        // Generation moved (or sentinel/first-call). Drop into the
+        // slow path unless we know there's literally nothing to do.
         !(state.pseudo_active.is_empty() && !self.last_apply_was_nonzero)
     }
 
@@ -705,31 +715,53 @@ impl Evaluator {
         }
 
         // Slow path: at least one pseudo active OR we need to clear last
-        // tick's writes. Walk groups, sum the active edges per slot,
-        // write the result. Single linear pass — no O(n²) acc scan.
+        // tick's writes. **Iteration is inverted** from the obvious shape:
+        // we walk `pseudo_active` (small — 0-2 entries during gameplay)
+        // and look up matching edges by reference-compare, rather than
+        // walking every edge (~59 on doom8088) and probing the HashSet
+        // each time. The HashSet probe allocates owned String keys per
+        // call (`to_string()` × 2); at ~250 K ticks/sec with 59 edges
+        // active, that was 30 M+ allocations/sec — the doomLoad-phase
+        // regression measured 2026-05-26.
         let mut any_nonzero = false;
+        // First pass: clear all gated slots to 0. We'll sum back into
+        // them below if any active edge writes them.
         for group in groups {
-            let mut sum: i32 = 0;
-            // pseudo_active is a HashSet; the empty-set case was already
-            // filtered out above (we only get here if it's non-empty or
-            // we're clearing). When empty, this loop just sums zeros and
-            // writes 0 to the slot, which is exactly the clear-to-zero
-            // we want for the "release everything" tick.
-            if !state.pseudo_active.is_empty() {
+            if group.slot < state.state_vars.len() {
+                state.state_vars[group.slot] = 0;
+            }
+        }
+        // Second pass: for each currently-active (pseudo, selector),
+        // walk the groups and sum matching edge values. Active set is
+        // tiny in steady state; the inner walk over `groups` is one
+        // group per gated slot (1 on doom8088 — all 59 edges write
+        // `--keyboard`). String compares by reference; no allocations.
+        for (active_pseudo, active_selector) in &state.pseudo_active {
+            for group in groups {
                 for edge in &group.edges {
-                    if state.pseudo_class_active_pair(&edge.pseudo, &edge.selector) {
-                        sum += edge.value;
+                    if edge.pseudo == *active_pseudo && edge.selector == *active_selector {
+                        if group.slot < state.state_vars.len() {
+                            state.state_vars[group.slot] =
+                                state.state_vars[group.slot].saturating_add(edge.value);
+                        }
                     }
                 }
             }
-            if group.slot < state.state_vars.len() {
-                state.state_vars[group.slot] = sum;
-            }
-            if sum != 0 {
+        }
+        // Track whether any slot ended non-zero so the next-tick gate
+        // knows to do another clear-pass even with an empty active set.
+        for group in groups {
+            if group.slot < state.state_vars.len()
+                && state.state_vars[group.slot] != 0
+            {
                 any_nonzero = true;
+                break;
             }
         }
         self.last_apply_was_nonzero = any_nonzero;
+        // Record the generation we just reflected; future ticks with
+        // the same gen skip the recompute via `needs_input_edge_apply`.
+        self.last_apply_gen = state.pseudo_active_gen;
     }
 
     /// Register a pre-tick hook that is called before each tick.
@@ -2373,6 +2405,7 @@ mod tests {
             input_edge_bindings: Vec::new(),
             input_edge_groups: None,
             last_apply_was_nonzero: false,
+            last_apply_gen: u32::MAX, // sentinel: forces first-tick recompute
         };
         (evaluator, state)
     }

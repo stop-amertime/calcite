@@ -109,6 +109,13 @@ pub struct State {
     /// (`apply_input_edges` in the evaluator) can short-circuit on
     /// `pseudo_active.is_empty()` without allocating lookup keys.
     pub pseudo_active: std::collections::HashSet<(String, String)>,
+    /// Monotonic counter bumped on every mutation of `pseudo_active`.
+    /// The evaluator caches `apply_input_edges` results keyed by this
+    /// generation, so unchanged-set ticks skip recomputation entirely.
+    /// During doomLoad the active set stays stable for tens of thousands
+    /// of ticks at a time between pulse releases; without this cache,
+    /// we re-summed 59 edges every tick for no observable change.
+    pub pseudo_active_gen: u32,
 }
 
 /// A "window of bytes addressed by an in-memory key" — a CSS shape where a
@@ -160,6 +167,7 @@ impl State {
             packed_cell_size: 0,
             windowed_byte_array: None,
             pseudo_active: std::collections::HashSet::new(),
+            pseudo_active_gen: 0,
         }
     }
 
@@ -257,21 +265,19 @@ impl State {
     /// on this element right now"; `value=false` means inactive. The
     /// host is responsible for sending matching false edges (release).
     pub fn set_pseudo_class_active(&mut self, pseudo: &str, selector: &str, value: bool) {
-        if value {
+        let changed = if value {
             // HashSet's API forces an owned key on insert; lookups below
             // can avoid this with a tuple-of-refs query but inserts can't.
             // Acceptable: the host calls this rarely (one make + one break
             // per key event). The hot path is the per-tick lookup, not this.
-            self.pseudo_active.insert((pseudo.to_string(), selector.to_string()));
+            self.pseudo_active.insert((pseudo.to_string(), selector.to_string()))
         } else {
-            // Borrow-trait-friendly remove via tuple-of-refs query.
-            // Avoids the to_string allocations the previous impl did on
-            // every release edge.
-            let key = (pseudo, selector);
             // HashSet doesn't have a remove-by-borrowed-tuple API, so
             // fall back to allocation here too. Same trade-off as insert.
-            let _ = key;
-            self.pseudo_active.remove(&(pseudo.to_string(), selector.to_string()));
+            self.pseudo_active.remove(&(pseudo.to_string(), selector.to_string()))
+        };
+        if changed {
+            self.pseudo_active_gen = self.pseudo_active_gen.wrapping_add(1);
         }
     }
 

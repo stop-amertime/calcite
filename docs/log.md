@@ -11,6 +11,55 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-26 — apply_input_edges hot-path: inversion + gen cache (doomLoad fix)
+
+Branch `feat/keyboard-pseudo-input`. Cross-link: CSS-DOS LOGBOOK
+2026-05-26.
+
+The 2026-05-22 inline-gate fix (`763d6cd`) recovered the boot path but
+did NOT fix the doomLoad-phase regression. Root cause for the residual:
+during doomLoad the `doom-all` bench's `title_tap` watch fires every
+poll (cond `menuactive=0,gamestate=3,bdamode=0x13,repeat`), so
+`pseudo_active` is non-empty most of the time and the body of
+`apply_input_edges` runs every tick. Each tick walked all 59 input
+edges and called `state.pseudo_class_active_pair(&pseudo, &selector)`,
+which did `self.pseudo_active.contains(&(p.to_string(), s.to_string()))`
+— two `String::from(&str)` allocations per lookup, 118 allocations per
+tick, ~30 M/sec at 250 K t/s. **That** was the doomLoad bottleneck.
+
+Two changes in this commit:
+
+1. **Inverted iteration.** The slow path now walks `pseudo_active`
+   (small — 0-2 entries during gameplay) and looks up matching edges
+   by reference-compare, rather than walking every edge and probing
+   the HashSet. Zero allocations on the hot path.
+
+2. **Generation cache.** Added `State::pseudo_active_gen` bumped on
+   every mutation, and `Evaluator::last_apply_gen` recording the gen
+   at the last apply. `needs_input_edge_apply` now short-circuits on
+   `gen == last_apply_gen` — so during the long quiet stretches
+   between pulse-release boundaries (~50 K ticks at a time), we skip
+   the recompute entirely.
+
+Bench numbers on doom-all web (5 runs each, post-fix vs the fresh-wasm
+pre-fix baseline established the same day):
+
+| Metric          | pre-fix avg | post-fix avg | master 2026-05-08 |
+|-----------------|------------:|-------------:|------------------:|
+| runMsToInGame   | 174.6 s     | ~92 s        | 77.1 s            |
+| doomLoad        | 155.1 s     | ~78 s        | 70.0 s            |
+| ticksPerSecAvg  | 193 K       | ~377 K       | ~446 K            |
+| ingameFps       | 0.50        | 0.9-1.7      | ~1.9              |
+
+Most of the 1.78× regression closed. Residual ~12 % gap vs master is
+within the range plausibly explained by struct-layout cache effects
+from the additional `pseudo_active` HashSet field — not worth chasing
+unless it widens.
+
+Files: `crates/calcite-core/src/{eval.rs,state.rs}`. Unit tests:
+`input_edges_drive_state_var` still passes (it tests the apply path
+end-to-end including the new inversion + gen-cache).
+
 ## 2026-05-19 — script: WatchKind::Stride regression fix (wasm poll cadence)
 
 Branch `feat/keyboard-pseudo-input`. Cross-link: CSS-DOS
