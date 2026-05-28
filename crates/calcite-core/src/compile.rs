@@ -6239,7 +6239,7 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     //
     //   [0xD0000, 0xD0200)  — ROM-disk window (read-only via --readDiskByte)
     //   [0xF0000, 0x100000) — BIOS ROM (extended map, not state.memory)
-    if ranges_overlap_virtual(dst_lo_linear, dst_hi_linear - dst_lo_linear) {
+    if ranges_overlap_virtual(state, dst_lo_linear, dst_hi_linear - dst_lo_linear) {
         rep_fast_forward_panic(
             "dst-virtual-range",
             opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
@@ -6511,7 +6511,7 @@ fn rep_fast_forward_cmps_scas(
 /// Compute the 8086 flag word produced by SUB(dst, src), preserving the
 /// upper control bits (TF=0x100, IF=0x200, DF=0x400) from `prev_flags`.
 /// Mirrors kiln's `--subFlags8` / `--subFlags16` + `+ and(prev, 1792)`.
-fn compute_sub_flags(dst: i32, src: i32, is_word: bool, prev_flags: i32) -> i32 {
+pub(crate) fn compute_sub_flags(dst: i32, src: i32, is_word: bool, prev_flags: i32) -> i32 {
     let mask: i32 = if is_word { 0xFFFF } else { 0xFF };
     let sign_bit: i32 = if is_word { 0x8000 } else { 0x80 };
     let dst_u = dst & mask;
@@ -6689,16 +6689,24 @@ pub fn rep_diag_report() -> String {
 /// fast-forward collapses iterations into a single `state.memory`
 /// operation, which would be wrong for any of these ranges.
 #[inline]
-fn ranges_overlap_virtual(start: i64, len: i64) -> bool {
+pub(crate) fn ranges_overlap_virtual(state: &State, start: i64, len: i64) -> bool {
     if len <= 0 { return false; }
     let end = start + len;
     let overlaps = |a: i64, b: i64, c: i64, d: i64| a < d && c < b;
-    overlaps(start, end, 0x0500, 0x0502)
-        || overlaps(start, end, 0xD_0000, 0xD_0200)
-        || overlaps(start, end, 0xF_0000, 0x10_0000)
+    // Extended-map range: a State invariant, not a cabinet feature.
+    if overlaps(start, end, 0xF_0000, 0x10_0000) {
+        return true;
+    }
+    // Cabinet-registered virtual regions (windowed byte arrays, etc).
+    for region in &state.virtual_regions {
+        if overlaps(start, end, region.start as i64, region.end as i64) {
+            return true;
+        }
+    }
+    false
 }
 
-fn bulk_store_byte(state: &mut State, addr: i64, val: u8) {
+pub(crate) fn bulk_store_byte(state: &mut State, addr: i64, val: u8) {
     // Mirrors MemoryFill/MemoryCopy discipline (bulk path is
     // diagnostic-silent: no write_log entries). Routes through
     // `bulk_fill_byte(count=1)` so packed cabinets land the byte in the
@@ -6730,7 +6738,7 @@ fn effective_guest_mem_end(state: &State) -> usize {
 }
 
 #[inline]
-fn bulk_fill(state: &mut State, dst: i64, count: usize, val: u8) {
+pub(crate) fn bulk_fill(state: &mut State, dst: i64, count: usize, val: u8) {
     if count == 0 || dst < 0 { return; }
     let mem_len = effective_guest_mem_end(state);
     if (dst as usize) >= mem_len { return; }
