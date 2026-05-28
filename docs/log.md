@@ -11,6 +11,64 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-28 — input-edge apply moved off per-tick path (Phase 4)
+
+Branch `feat/keyboard-pseudo-input`. Cross-link: CSS-DOS LOGBOOK
+2026-05-28.
+
+The per-tick `needs_input_edge_apply` gate + `apply_input_edges` body
+ran on every tick (~34 M times per doom-loading run). After the 2026-05-26
+fix the gate was cheap (a gen-counter compare, then a bool fast-path),
+but the bandwidth still cost something on the web bench: 9-run avg
+~377 K t/s vs the 2026-05-08 master baseline of ~446 K t/s.
+
+Two commits in this session:
+
+1. **`dcc7dd5` — Phase 1: collapse gate to single bool field load.**
+   Replaced `pseudo_active_gen: u32` on State + `last_apply_gen: u32`
+   on Evaluator with `pseudo_active_dirty: bool` on State. The gate
+   read becomes one byte load + branch instead of two u32 loads +
+   compare. Native A/B (6 runs) showed wash within noise — confirmed
+   the gate cost was not the binding constraint. Kept anyway: simpler
+   shape, sets up Phase 4.
+
+2. **`f4da585` — Phase 4: apply-on-transition.** Moved the entire
+   apply path off the per-tick loop. `State::set_pseudo_class_active`
+   now directly recomputes the affected gated state-var slots at the
+   moment of mutation. Per-tick cost is zero — no gate, no apply.
+
+   Mechanics:
+   - `State::input_edge_groups: Vec<InputEdgeGroup>` installed by
+     `Evaluator::wire_state_for_input_edges(&mut state)` at engine
+     construction (and on `reset()`). Same wiring pattern as
+     `wire_state_for_packed_memory` / `windowed_byte_array`.
+   - `set_pseudo_class_active` toggles HashSet membership, then for
+     each group sums values of edges whose `(pseudo, selector)` is
+     currently active and writes the slot. Inverted iteration over
+     the small active set avoids HashSet allocations.
+
+   Deletions: `needs_input_edge_apply` gate, `apply_input_edges`
+   body, `build_input_edge_groups` helper, `InputEdgeGroup` /
+   `InputEdgeGroupEntry` structs (moved to state.rs, pub),
+   `input_edge_groups` / `last_apply_was_nonzero` / `pseudo_active_dirty`
+   fields, 4 per-tick call sites. Net −73 lines.
+
+Web doom-loading bench (4 runs after Phase 4):
+- 394 K / 87.0 s
+- 431 K / 79.4 s
+- 436 K / 79.5 s
+- 432 K / 79.9 s
+
+Median ~432 K / ~79.5 s, vs 2026-05-08 master baseline 446 K / 77.1 s.
+**Within ~3 % of master** on doomLoad-shape work. Smoke 7/7 PASS.
+Unit + integration input-edge tests pass.
+
+Cabinet-genericity preserved: the apply path operates over CSS pseudo
+classes, selectors, and state-var slots — no knowledge of what those
+slots represent above the CSS layer.
+
+---
+
 ## 2026-05-26 — apply_input_edges hot-path: inversion + gen cache (doomLoad fix)
 
 Branch `feat/keyboard-pseudo-input`. Cross-link: CSS-DOS LOGBOOK
