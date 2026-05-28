@@ -150,6 +150,31 @@ pub struct LoopDescriptor {
     /// the cycle counter slot (e.g. `--cycleCount` → `--zorch`) does
     /// not affect the extraction.
     pub per_iter_cycles: Option<i32>,
+    /// Name of an extra slot whose value is added to the IP slot's
+    /// post-dispatch value, when the IP slot's top-level assignment is
+    /// wrapped in `Calc(Add(<dispatch-tree>, Var(extra)))` (commutative).
+    ///
+    /// The cabinet's IP assignment is structurally
+    /// `--IP = calc(<style-tree-containing-dispatch> + var(extra))`.
+    /// The dispatch's per-key body already adds an opcode-length literal
+    /// (`ip_advance_literal`); the outer wrapper adds a uniform
+    /// per-instruction contribution (e.g. an optional opcode prefix's
+    /// byte length). The runtime applier needs the post-tick value of
+    /// the extra slot to commit the correct IP after fast-forwarding.
+    ///
+    /// `Some(slot_name)` when the outermost wrapper around the IP
+    /// dispatch is a bare-Var addend; `None` when the IP slot's
+    /// assignment is the dispatch alone (no outer add).
+    ///
+    /// **Cardinal-rule probe.** A 6502 cabinet whose IP slot has no
+    /// prefix-byte mechanism produces `None`. A brainfuck cabinet whose
+    /// equivalent wrapper names the slot anything at all (`--introBytes`,
+    /// `--zorch`, etc.) produces `Some("--zorch")` — the recogniser
+    /// captures whatever name the cabinet used, without inspecting the
+    /// characters of that name. Renaming the slot does not affect the
+    /// match; the structural fact is "the outermost top-level Calc(Add)
+    /// has a bare-Var operand and the dispatch on the other side."
+    pub ip_extra_advance_slot: Option<String>,
 }
 
 /// Coarse classification of how a recognised self-loop's per-iter
@@ -830,6 +855,8 @@ fn recognise_one_opcode<'a>(
 
     let per_iter_cycles = extract_per_iter_cycles(family, key_value);
 
+    let ip_extra_advance_slot = extract_ip_extra_advance_slot(assignment_index, ip_prop);
+
     Some(LoopDescriptor {
         key_property: family.key_property.clone(),
         key_value,
@@ -844,7 +871,61 @@ fn recognise_one_opcode<'a>(
         flag_conditioned,
         bulk_class,
         per_iter_cycles,
+        ip_extra_advance_slot,
     })
+}
+
+/// Extract the name of an extra-add slot wrapping the IP slot's dispatch.
+///
+/// Walks the IP slot's top-level assignment expression, looking for the
+/// pattern `Calc(Add(<X>, <Y>))` where:
+/// - exactly one of `<X>`/`<Y>` is a bare `Expr::Var { name, .. }`;
+/// - the other side contains the single-key dispatch identified for the
+///   loop family (matched structurally via `find_inner_dispatch`).
+///
+/// When both conditions hold, returns `Some(name)` — the cabinet's own
+/// slot name for the extra-advance addend. Otherwise returns `None`.
+///
+/// **Cardinal-rule shape.** This matcher inspects only:
+/// - The shape of `Expr` nodes (`Calc(Add(...))`, `Var { .. }`).
+/// - Whether the non-var side contains a dispatch (delegated to the
+///   existing structural `find_inner_dispatch`).
+/// - Whole-name equality is not applied to any payload here — the
+///   returned name is the literal opaque name the cabinet used. No
+///   character of any name is inspected by this function.
+///
+/// A cabinet whose IP body has shape `calc(<dispatch> + var(extra))`
+/// returns `Some("--whatever-extra-is-named")`. A cabinet without the
+/// wrapper (bare dispatch, or `calc(<dispatch> + literal)`, or
+/// `calc(<dispatch> + non-var-tree)`) returns `None`.
+fn extract_ip_extra_advance_slot(
+    assignment_index: &HashMap<&str, &Expr>,
+    ip_prop: &str,
+) -> Option<String> {
+    let top = *assignment_index.get(ip_prop)?;
+    let Expr::Calc(CalcOp::Add(a, b)) = top else {
+        return None;
+    };
+    // Try the two orientations: (dispatch, var) and (var, dispatch).
+    if let Some(name) = ip_extra_add_orientation(a.as_ref(), b.as_ref()) {
+        return Some(name);
+    }
+    ip_extra_add_orientation(b.as_ref(), a.as_ref())
+}
+
+/// Given the two operands of a top-level `Calc(Add(...))`, return the
+/// var name from `extra_candidate` when `dispatch_candidate` contains the
+/// loop's single-key dispatch and `extra_candidate` is a bare `Var`.
+fn ip_extra_add_orientation(dispatch_candidate: &Expr, extra_candidate: &Expr) -> Option<String> {
+    let Expr::Var { name, .. } = extra_candidate else {
+        return None;
+    };
+    // The dispatch side must transitively contain a single-key dispatch
+    // (the same kind of dispatch the family walker locks onto). This is
+    // identical to the descent rule used by `find_inner_dispatch`, so we
+    // delegate to that.
+    find_inner_dispatch(dispatch_candidate)?;
+    Some(name.clone())
 }
 
 /// Find the per-iteration cycle cost literal for one opcode, structurally.

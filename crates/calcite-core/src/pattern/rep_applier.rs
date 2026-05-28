@@ -126,22 +126,10 @@ pub(crate) enum CommitMode {
 // panics — charging a fabricated cost would break cabinets whose
 // progression is gated on cycle-derived timers.
 
-/// Resolve the prefix-length value used by the IP advance formula.
-///
-/// CARDINAL-RULE WART. The hardcoded path reads `--prefixLen` as a literal
-/// property name (default 1 if missing); the descriptor as it stands today
-/// has no structural pointer to that slot. Recognising it would require
-/// the recogniser to trace the cabinet's IP-advance branch back through
-/// the slot graph and identify the slot whose value is added to IP — a
-/// well-formed structural recognition, but independent work.
-///
-/// Step 7 reads `--prefixLen` by name as a contained wart, mirroring the
-/// hardcoded path's lookup. This is a leaf call site, not a structural
-/// decision in the recogniser. Default of 1 matches the hardcoded path's
-/// default.
-fn read_prefix_len(program: &CompiledProgram, state: &State, slots: &[i32]) -> i32 {
-    read_prop(program, state, slots, "--prefixLen").unwrap_or(1)
-}
+// (Removed `read_prefix_len`: the IP extra-advance addend is now resolved
+// from the descriptor's structurally-captured `ip_extra_advance_slot`.
+// See `LoopDescriptor::ip_extra_advance_slot` and the resolution in
+// `commit_ip_and_cycles` below.)
 
 /// Look up a property name's current value. Mirrors the resolver inside
 /// `compile.rs::rep_fast_forward`: try the compiled program's
@@ -240,6 +228,9 @@ pub(crate) fn apply_fill_with_commit(
     let Some(per_iter) = descriptor.per_iter_cycles else {
         return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
     };
+    if commit == CommitMode::Full && descriptor.ip_extra_advance_slot.is_none() {
+        return ApplyOutcome::Unsupported("ip_extra_advance_slot not captured");
+    }
     // Counter — must be present, must resolve, must be > 0. CX<=0 is the
     // "no work to do" case the hardcoded path already filters before
     // calling us; the dual harness only reaches here after that filter,
@@ -437,6 +428,9 @@ pub(crate) fn apply_copy_with_commit(
     let Some(per_iter) = descriptor.per_iter_cycles else {
         return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
     };
+    if commit == CommitMode::Full && descriptor.ip_extra_advance_slot.is_none() {
+        return ApplyOutcome::Unsupported("ip_extra_advance_slot not captured");
+    }
     let Some(counter) = descriptor.counter.as_ref() else {
         return ApplyOutcome::Unsupported("no counter");
     };
@@ -749,6 +743,9 @@ pub(crate) fn apply_read_only_with_commit(
     let Some(per_iter) = descriptor.per_iter_cycles else {
         return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
     };
+    if commit == CommitMode::Full && descriptor.ip_extra_advance_slot.is_none() {
+        return ApplyOutcome::Unsupported("ip_extra_advance_slot not captured");
+    }
     let Some(counter) = descriptor.counter.as_ref() else {
         return ApplyOutcome::Unsupported("no counter");
     };
@@ -1026,11 +1023,22 @@ fn commit_counter(state: &mut State, property: &str, value: i32) {
 
 /// Advance IP and charge cycles for `iters` iterations. Mirrors the
 /// hardcoded path's
-///     state.set_var("IP", (ip + 1 + prefix_len) & 0xFFFF);
+///     state.set_var("IP", (ip + 1 + extra) & 0xFFFF);
 ///     state.set_var("cycleCount", cc + iters * per_iter);
-/// The `+ 1` is `descriptor.ip_advance_literal` (the structural per-iter
-/// IP step from the recogniser); the `+ prefix_len` is the WART
-/// documented at [`read_prefix_len`].
+///
+/// The `+ 1` is `descriptor.ip_advance_literal` (the per-iter advance
+/// literal that the dispatch's per-key body adds — extracted
+/// structurally by the recogniser). The `+ extra` is read from
+/// `descriptor.ip_extra_advance_slot`, the cabinet's own name for the
+/// outer-wrapper addend (`Calc(Add(<dispatch>, var(extra)))` shape on
+/// the IP slot's top-level assignment).
+///
+/// Caller contract: the descriptor's `ip_extra_advance_slot` MUST be
+/// `Some` and the named slot MUST resolve. Both invariants are checked
+/// at the start of each `apply_*_with_commit` and the applier returns
+/// `Unsupported` before reaching this commit step when they don't hold;
+/// here we resolve unconditionally (with `unwrap_or(0)` as belt-and-
+/// braces, since the slot was already proven resolvable upstream).
 fn commit_ip_and_cycles(
     program: &CompiledProgram,
     state: &mut State,
@@ -1040,8 +1048,12 @@ fn commit_ip_and_cycles(
     per_iter: i32,
 ) {
     let ip = state.get_var("IP").unwrap_or(0);
-    let prefix_len = read_prefix_len(program, state, slots);
-    let new_ip = (ip + descriptor.ip_advance_literal + prefix_len) & 0xFFFF;
+    let extra = descriptor
+        .ip_extra_advance_slot
+        .as_deref()
+        .and_then(|slot| read_prop(program, state, slots, slot))
+        .unwrap_or(0);
+    let new_ip = (ip + descriptor.ip_advance_literal + extra) & 0xFFFF;
     if state.state_var_index.contains_key("IP") {
         state.set_var("IP", new_ip);
     }
@@ -1144,6 +1156,7 @@ mod tests {
             flag_conditioned: false,
             bulk_class: BulkClass::Fill,
             per_iter_cycles: Some(10),
+            ip_extra_advance_slot: Some("--prefixLen".to_string()),
         }
     }
 
@@ -1200,6 +1213,7 @@ mod tests {
             flag_conditioned: false,
             bulk_class: BulkClass::Fill,
             per_iter_cycles: Some(10),
+            ip_extra_advance_slot: Some("--prefixLen".to_string()),
         }
     }
 
@@ -1510,6 +1524,7 @@ mod tests {
             flag_conditioned: false,
             bulk_class: BulkClass::Fill,
             per_iter_cycles: Some(10),
+            ip_extra_advance_slot: Some("--prefixLen".to_string()),
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state = rigged_state(&["alpha", "beta", "epsilon", "delta", "gamma"]);
@@ -1682,6 +1697,7 @@ mod tests {
             flag_conditioned: false,
             bulk_class: BulkClass::Copy,
             per_iter_cycles: Some(17),
+            ip_extra_advance_slot: Some("--prefixLen".to_string()),
         }
     }
 
@@ -1755,6 +1771,7 @@ mod tests {
             flag_conditioned: false,
             bulk_class: BulkClass::Copy,
             per_iter_cycles: Some(17),
+            ip_extra_advance_slot: Some("--prefixLen".to_string()),
         }
     }
 
@@ -2069,6 +2086,7 @@ mod tests {
             flag_conditioned: false,
             bulk_class: BulkClass::Copy,
             per_iter_cycles: Some(17),
+            ip_extra_advance_slot: Some("--prefixLen".to_string()),
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state =
@@ -2225,6 +2243,7 @@ mod tests {
             flag_conditioned: false,
             bulk_class: BulkClass::ReadOnly,
             per_iter_cycles: Some(15),
+            ip_extra_advance_slot: Some("--prefixLen".to_string()),
         }
     }
 
@@ -2267,6 +2286,7 @@ mod tests {
             flag_conditioned: true,
             bulk_class: BulkClass::ReadOnly,
             per_iter_cycles: Some(22),
+            ip_extra_advance_slot: Some("--prefixLen".to_string()),
         }
     }
 
@@ -2309,6 +2329,7 @@ mod tests {
             flag_conditioned: true,
             bulk_class: BulkClass::ReadOnly,
             per_iter_cycles: Some(15),
+            ip_extra_advance_slot: Some("--prefixLen".to_string()),
         }
     }
 
@@ -2687,6 +2708,7 @@ mod tests {
             flag_conditioned: false,
             bulk_class: BulkClass::ReadOnly,
             per_iter_cycles: Some(15),
+            ip_extra_advance_slot: Some("--prefixLen".to_string()),
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state = rigged_state(&["alpha", "beta", "gamma"]);

@@ -2313,3 +2313,241 @@ fn per_iter_cycles_picks_most_populated_self_add_literal_family_member() {
          from --bigSlot, not K=99 from --smallSlot",
     );
 }
+
+// ---------------------------------------------------------------------------
+// ip_extra_advance_slot — structural capture of the outer-wrapper var
+// added to the IP slot's dispatch (the cabinet's per-instruction "extra
+// advance" addend; in CSS-DOS today this is `--prefixLen`, but the
+// recogniser captures whatever name the cabinet uses).
+//
+// Tests:
+//   1. `ip_extra_advance_slot_captured_for_cabinet_a` — the existing x86-
+//      shaped cabinet wraps IP as `calc(<dispatch> + var(--prefixLen))`;
+//      the recogniser captures `--prefixLen`.
+//   2. `ip_extra_advance_slot_captured_for_cabinet_b` — the brainfuck
+//      cabinet uses a completely different slot name (`--introBytes`).
+//      The recogniser captures *that* name, proving the rule is shape-
+//      driven, not content-driven.
+//   3. `ip_extra_advance_slot_arbitrary_name` — a synthetic cabinet
+//      where we plug in a fully arbitrary opaque slot name to confirm
+//      the recogniser doesn't care what the string contains.
+//   4. `ip_extra_advance_slot_none_when_no_outer_wrapper` — a cabinet
+//      whose IP assignment is bare dispatch (no outer add) yields None.
+//   5. `ip_extra_advance_slot_none_when_outer_add_is_literal` — a
+//      cabinet whose IP outer wrapper adds a literal (not a var) yields
+//      None: the structural shape requires a bare-Var addend.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ip_extra_advance_slot_captured_for_cabinet_a() {
+    let descs = recognise_loops(&cabinet_a());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        assert_eq!(
+            d.ip_extra_advance_slot.as_deref(),
+            Some("--prefixLen"),
+            "cabinet A's IP slot wraps the dispatch in calc(... + var(--prefixLen))",
+        );
+    }
+}
+
+#[test]
+fn ip_extra_advance_slot_captured_for_cabinet_b() {
+    // Cabinet B uses `--introBytes` as its analog of `--prefixLen`.
+    let descs = recognise_loops(&cabinet_b());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        assert_eq!(
+            d.ip_extra_advance_slot.as_deref(),
+            Some("--introBytes"),
+            "cabinet B's IP slot wraps the dispatch in calc(... + var(--introBytes))",
+        );
+    }
+}
+
+/// Build a minimal x86-style cabinet whose IP outer wrapper var-addend
+/// is `extra_slot`. Reuses the `ip_body` / `counter_body` / `pointer_body`
+/// helpers from above. The only "interesting" knob is `extra_slot`.
+fn cabinet_with_named_ip_extra(extra_slot: &str) -> Vec<Assignment> {
+    let pred_continue = style_eq("--_repContinue", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--__1CX"))],
+        keep_self("--__1CX"),
+    );
+    let ip_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            ip_body(pred_continue.clone(), "--__1IP", var(extra_slot), 1),
+        )],
+        keep_self("--__1IP"),
+    );
+    let ip_wrapped = add(ip_dispatch, var(extra_slot));
+    let di_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--__1DI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1DI"),
+    );
+
+    vec![
+        assign("--CX", cx_dispatch),
+        assign("--IP", ip_wrapped),
+        assign("--DI", di_dispatch),
+    ]
+}
+
+#[test]
+fn ip_extra_advance_slot_arbitrary_name() {
+    // A genericity probe: the recogniser captures whatever opaque slot
+    // name the cabinet emits, with no character inspection. We use a
+    // slot name shared with no x86 convention.
+    let descs = recognise_loops(&cabinet_with_named_ip_extra("--zorch"));
+    assert_eq!(descs.len(), 1);
+    assert_eq!(descs[0].ip_extra_advance_slot.as_deref(), Some("--zorch"));
+
+    // Sanity: a different opaque name produces a different captured
+    // name. Same shape, different cabinet vocabulary, no recogniser
+    // change.
+    let descs2 = recognise_loops(&cabinet_with_named_ip_extra("--whatever-this-is"));
+    assert_eq!(descs2.len(), 1);
+    assert_eq!(
+        descs2[0].ip_extra_advance_slot.as_deref(),
+        Some("--whatever-this-is"),
+    );
+}
+
+#[test]
+fn ip_extra_advance_slot_none_when_no_outer_wrapper() {
+    // A cabinet whose IP slot is the bare dispatch — no outer
+    // `calc(<dispatch> + var(extra))` wrapper. The recogniser yields
+    // None for the extra-advance slot.
+    let pred_continue = style_eq("--_repContinue", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--__1CX"))],
+        keep_self("--__1CX"),
+    );
+    // No wrapping add — pass the dispatch directly. The per-key body
+    // still has `self + literal` shape (advance), so the IP-stay-or-
+    // advance match still fires; only the outer wrapper is missing.
+    let ip_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            ip_body(pred_continue.clone(), "--__1IP", lit(0.0), 1),
+        )],
+        keep_self("--__1IP"),
+    );
+    let di_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--__1DI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1DI"),
+    );
+
+    let asns = vec![
+        assign("--CX", cx_dispatch),
+        assign("--IP", ip_dispatch),
+        assign("--DI", di_dispatch),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1);
+    assert!(
+        descs[0].ip_extra_advance_slot.is_none(),
+        "bare IP dispatch (no outer Calc(Add(..., var(...)))) must yield None, \
+         got {:?}",
+        descs[0].ip_extra_advance_slot,
+    );
+}
+
+#[test]
+fn ip_extra_advance_slot_none_when_outer_add_is_literal() {
+    // A cabinet whose IP outer wrapper is `calc(<dispatch> + lit(K))`
+    // rather than `calc(<dispatch> + var(slot))`. The structural rule
+    // requires a bare-Var addend; a literal addend produces None.
+    let pred_continue = style_eq("--_repContinue", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--__1CX"))],
+        keep_self("--__1CX"),
+    );
+    let ip_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            ip_body(pred_continue.clone(), "--__1IP", lit(0.0), 1),
+        )],
+        keep_self("--__1IP"),
+    );
+    let ip_wrapped = add(ip_dispatch, lit(2.0)); // literal addend, NOT a Var.
+    let di_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--__1DI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1DI"),
+    );
+
+    let asns = vec![
+        assign("--CX", cx_dispatch),
+        assign("--IP", ip_wrapped),
+        assign("--DI", di_dispatch),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1);
+    assert!(
+        descs[0].ip_extra_advance_slot.is_none(),
+        "literal addend (not a bare-Var) must not be captured as an extra-advance slot, \
+         got {:?}",
+        descs[0].ip_extra_advance_slot,
+    );
+}
