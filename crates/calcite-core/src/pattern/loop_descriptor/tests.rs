@@ -2142,3 +2142,174 @@ fn indirect_read_without_clean_seg_decomposition_still_promotes_to_copy() {
         "Copy promotion fires on pointer-mirror reference alone",
     );
 }
+
+// ---------------------------------------------------------------------------
+// per_iter_cycles — structural extraction from a "self + literal" dispatch
+// family member.
+//
+// The cardinal-rule probe is split across three tests:
+//
+//   1. `per_iter_cycles_extracted_from_self_add_literal_dispatch` — the
+//      vanilla x86-shaped cabinet has a per-opcode `var(self) + K` dispatch
+//      family member, and the recogniser extracts K for each opcode's
+//      descriptor.
+//
+//   2. `per_iter_cycles_brainfuck_shape_extracts_same_way` — a structurally
+//      identical cabinet with completely different slot names (no shared
+//      naming convention with x86) yields the same extraction outcome on the
+//      same shape. Recogniser is name-blind.
+//
+//   3. `per_iter_cycles_none_when_no_self_add_literal_family_member` — a
+//      cabinet that has no member with the `var(X) + Literal(K)`-per-key
+//      shape returns `None`. The applier will then refuse to fast-forward
+//      and the dispatcher panics rather than charging a fabricated cost.
+// ---------------------------------------------------------------------------
+
+/// Like `cabinet_a` but with one additional family member: a slot named
+/// `cycle_slot` whose per-opcode body is `calc(var(cycle_mirror) +
+/// K_opcode)`. This is structurally what kiln emits for the `cycleCount`
+/// dispatch in the doom8088 cabinet (one of the 94 opcode entries in
+/// `kiln/cycle-counts.mjs`).
+fn cabinet_a_with_cycle_dispatch(
+    cycle_slot: &str,
+    cycle_mirror: &str,
+    k_aa: i32,
+    k_a4: i32,
+) -> Vec<Assignment> {
+    let mut asns = cabinet_a();
+    let cycle_dispatch = dispatch(
+        "--opcode",
+        vec![
+            (0xAA as f64, add(var(cycle_mirror), lit(k_aa as f64))),
+            (0xA4 as f64, add(var(cycle_mirror), lit(k_a4 as f64))),
+        ],
+        var(cycle_mirror),
+    );
+    asns.push(assign(cycle_slot, cycle_dispatch));
+    asns
+}
+
+#[test]
+fn per_iter_cycles_extracted_from_self_add_literal_dispatch() {
+    // x86-shaped cabinet: STOSB (0xAA) costs 10 cycles, MOVSB (0xA4)
+    // costs 17 cycles. The recogniser sees the cycle dispatch as a
+    // family member whose body for each opcode is
+    // `calc(var(--__1cycleCount) + K)` and extracts K.
+    let asns = cabinet_a_with_cycle_dispatch("--cycleCount", "--__1cycleCount", 10, 17);
+    let descs = recognise_loops(&asns);
+    let stos = descs
+        .iter()
+        .find(|d| d.key_value == 0xAA)
+        .expect("STOSB descriptor");
+    let movs = descs
+        .iter()
+        .find(|d| d.key_value == 0xA4)
+        .expect("MOVSB descriptor");
+    assert_eq!(stos.per_iter_cycles, Some(10));
+    assert_eq!(movs.per_iter_cycles, Some(17));
+}
+
+#[test]
+fn per_iter_cycles_renaming_is_blind() {
+    // Same cabinet shape, completely different cycle slot name. The
+    // recogniser does not inspect characters of the slot name; renaming
+    // does not affect extraction.
+    let asns = cabinet_a_with_cycle_dispatch("--zorch", "--__zorchPrev", 10, 17);
+    let descs = recognise_loops(&asns);
+    let stos = descs.iter().find(|d| d.key_value == 0xAA).unwrap();
+    let movs = descs.iter().find(|d| d.key_value == 0xA4).unwrap();
+    assert_eq!(stos.per_iter_cycles, Some(10));
+    assert_eq!(movs.per_iter_cycles, Some(17));
+}
+
+#[test]
+fn per_iter_cycles_brainfuck_shape_extracts_same_way() {
+    // Construct a brainfuck-shaped cabinet structurally equivalent to
+    // cabinet A. Different opcode key values (70, 80 instead of 0xAA,
+    // 0xA4). Different per-key cycle costs (3, 7) — these are *the
+    // cabinet's* per-opcode literals, not x86 ones. The recogniser
+    // produces the cabinet's own K values via the same structural rule.
+    let mut asns = cabinet_b();
+    let cycle_dispatch = dispatch(
+        "--recipeStep",
+        vec![
+            (70.0, add(var("--priorWhiskCount"), lit(3.0))),
+            (80.0, add(var("--priorWhiskCount"), lit(7.0))),
+        ],
+        var("--priorWhiskCount"),
+    );
+    asns.push(assign("--whiskCount", cycle_dispatch));
+    let descs = recognise_loops(&asns);
+    let fill = descs
+        .iter()
+        .find(|d| d.key_value == 70)
+        .expect("brainfuck fill-shape descriptor");
+    let copy = descs
+        .iter()
+        .find(|d| d.key_value == 80)
+        .expect("brainfuck copy-shape descriptor");
+    assert_eq!(
+        fill.per_iter_cycles,
+        Some(3),
+        "brainfuck cabinet's K is extracted just like x86's K",
+    );
+    assert_eq!(copy.per_iter_cycles, Some(7));
+}
+
+#[test]
+fn per_iter_cycles_none_when_no_self_add_literal_family_member() {
+    // Cabinet A as-is has no cycleCount-style family member: the only
+    // dispatch family members are counter, IP, pointer, memwrite address,
+    // and memwrite value. None of those have `var(X) + Literal(K)` shape
+    // per opcode (counter is `max(0, self - 1)`, pointer involves a
+    // function call, etc.). per_iter_cycles must be None — the applier
+    // will then refuse to fast-forward.
+    let descs = recognise_loops(&cabinet_a());
+    for d in &descs {
+        assert!(
+            d.per_iter_cycles.is_none(),
+            "cabinet without a self+lit dispatch member should yield None, \
+             got Some({:?}) for opcode {:#x}",
+            d.per_iter_cycles,
+            d.key_value,
+        );
+    }
+}
+
+#[test]
+fn per_iter_cycles_picks_most_populated_self_add_literal_family_member() {
+    // Two candidate family members exist for "self+literal" extraction.
+    // The one with more participating opcode keys wins. This is the
+    // structural rule's tiebreaker: the cycle counter is the slot whose
+    // dispatch covers the most opcodes with the self-add-literal shape.
+    let mut asns = cabinet_a();
+
+    // First candidate: only covers ONE opcode (0xAA → +99). Insufficient.
+    let small_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, add(var("--smallPrev"), lit(99.0)))],
+        var("--smallPrev"),
+    );
+    asns.push(assign("--smallSlot", small_dispatch));
+
+    // Second candidate: covers BOTH opcodes (0xAA → +10, 0xA4 → +17).
+    // This is the most-populated; the recogniser picks it.
+    let big_dispatch = dispatch(
+        "--opcode",
+        vec![
+            (0xAA as f64, add(var("--bigPrev"), lit(10.0))),
+            (0xA4 as f64, add(var("--bigPrev"), lit(17.0))),
+        ],
+        var("--bigPrev"),
+    );
+    asns.push(assign("--bigSlot", big_dispatch));
+
+    let descs = recognise_loops(&asns);
+    let stos = descs.iter().find(|d| d.key_value == 0xAA).unwrap();
+    assert_eq!(
+        stos.per_iter_cycles,
+        Some(10),
+        "the most-populated self+lit member wins; we should pick K=10 \
+         from --bigSlot, not K=99 from --smallSlot",
+    );
+}

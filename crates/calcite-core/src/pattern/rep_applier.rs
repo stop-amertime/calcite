@@ -114,51 +114,17 @@ pub(crate) enum CommitMode {
 // Per-iter cycle cost.
 // ---------------------------------------------------------------------------
 //
-// CARDINAL-RULE WART (per scoping doc Q3 / step 7).
+// The per-iteration cycle cost is **structurally derived** by the
+// recogniser and stored on the descriptor as `per_iter_cycles:
+// Option<i32>`. See `pattern/loop_descriptor.rs::extract_per_iter_cycles`
+// for the structural rule (the most-populated dispatch family member
+// whose per-key bodies have shape `Calc(Add(Var(X), Literal(K)))` with X
+// the same opaque slot reference across keys).
 //
-// The per-iteration cycle counts (10/17/22/15) are taken straight from the
-// hardcoded `rep_fast_forward` path, which got them from kiln's per-opcode
-// schedule. They are upstream (x86) knowledge: a 6502 / brainfuck cabinet
-// emitting structurally identical CSS would have different cycle costs.
-//
-// The cleanest cardinal-rule fix is for the recogniser to discover the
-// per-iteration cycle increment from the cabinet's `--cycleCount` dispatch
-// body — a structural pass that finds, for each opcode key, the `+ K`
-// added to a counter mirror — and stash it on the descriptor as a
-// `per_iter_cycles: i32` field. That pass is independent work and carries
-// the same flavour of Q3 Option B (it's structurally extractable, but
-// requires extending the recogniser).
-//
-// Step 7 takes the pragmatic option (b) called out by the scoping doc:
-// keyed on `BulkClass` + pointer count + step. The dispatch is structural
-// (no opcode lookup, no name inspection), and the WART is bounded to this
-// helper. Cabinets whose cycle costs differ from doom8088 will produce
-// observable cycleCount drift under `CALCITE_REP_GENERIC=1`; the next
-// session's punch list owns the recogniser-driven fix.
-fn per_iter_cycles(descriptor: &LoopDescriptor) -> i32 {
-    match descriptor.bulk_class {
-        // STOS-shape: one stepping pointer, no source pointer, fill.
-        BulkClass::Fill => 10,
-        // MOVS-shape: two stepping pointers, source-keyed indirect read.
-        BulkClass::Copy => 17,
-        // CMPS (2 pointers) costs 22; SCAS (1 pointer) costs 15. LODS
-        // would also fall here (1 pointer, !flag_conditioned) but the
-        // hardcoded path doesn't fast-forward LODS at all, so the
-        // dispatch in `compile.rs::rep_fast_forward` never reaches the
-        // descriptor-driven applier with a LODS descriptor under the
-        // generic flag — the parity is preserved trivially.
-        BulkClass::ReadOnly => {
-            if descriptor.pointers.len() == 2 {
-                22 // CMPS
-            } else {
-                15 // SCAS / LODS
-            }
-        }
-        // PerIter shapes don't have a fast-forward applier yet; this
-        // branch is unreachable from the dispatch sites.
-        BulkClass::PerIter => 0,
-    }
-}
+// When the recogniser couldn't extract a value, the applier returns
+// `Unsupported("per_iter_cycles not extracted")` and the dispatcher
+// panics — charging a fabricated cost would break cabinets whose
+// progression is gated on cycle-derived timers.
 
 /// Resolve the prefix-length value used by the IP advance formula.
 ///
@@ -271,6 +237,9 @@ pub(crate) fn apply_fill_with_commit(
     if descriptor.bulk_class != BulkClass::Fill {
         return ApplyOutcome::Unsupported("not Fill class");
     }
+    let Some(per_iter) = descriptor.per_iter_cycles else {
+        return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
+    };
     // Counter — must be present, must resolve, must be > 0. CX<=0 is the
     // "no work to do" case the hardcoded path already filters before
     // calling us; the dual harness only reaches here after that filter,
@@ -400,7 +369,7 @@ pub(crate) fn apply_fill_with_commit(
         // Counter commit: drains to zero.
         commit_counter(state, &counter.property, 0);
         // IP advance and cycle charge.
-        commit_ip_and_cycles(program, state, slots, descriptor, n);
+        commit_ip_and_cycles(program, state, slots, descriptor, n, per_iter);
     }
 
     ApplyOutcome::Applied { iterations }
@@ -465,6 +434,9 @@ pub(crate) fn apply_copy_with_commit(
     if descriptor.bulk_class != BulkClass::Copy {
         return ApplyOutcome::Unsupported("not Copy class");
     }
+    let Some(per_iter) = descriptor.per_iter_cycles else {
+        return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
+    };
     let Some(counter) = descriptor.counter.as_ref() else {
         return ApplyOutcome::Unsupported("no counter");
     };
@@ -681,7 +653,7 @@ pub(crate) fn apply_copy_with_commit(
         commit_pointer(state, &dst_entry.property, new_dst);
         commit_pointer(state, &src_entry.property, new_src);
         commit_counter(state, &counter.property, 0);
-        commit_ip_and_cycles(program, state, slots, descriptor, n);
+        commit_ip_and_cycles(program, state, slots, descriptor, n, per_iter);
     }
 
     ApplyOutcome::Applied { iterations: n }
@@ -774,6 +746,9 @@ pub(crate) fn apply_read_only_with_commit(
     if descriptor.bulk_class != BulkClass::ReadOnly {
         return ApplyOutcome::Unsupported("not ReadOnly class");
     }
+    let Some(per_iter) = descriptor.per_iter_cycles else {
+        return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
+    };
     let Some(counter) = descriptor.counter.as_ref() else {
         return ApplyOutcome::Unsupported("no counter");
     };
@@ -830,7 +805,7 @@ pub(crate) fn apply_read_only_with_commit(
             let new_ptr = (ptr_value + n * signed_step) & 0xFFFF;
             commit_pointer(state, &ptr_entry.property, new_ptr);
             commit_counter(state, &counter.property, 0);
-            commit_ip_and_cycles(program, state, slots, descriptor, n);
+            commit_ip_and_cycles(program, state, slots, descriptor, n, per_iter);
         }
         return ApplyOutcome::Applied { iterations: n };
     }
@@ -1005,7 +980,7 @@ pub(crate) fn apply_read_only_with_commit(
         // IP advance and per-iter cycle charge. The `iters` value (not
         // n) is what the hardcoded path uses for the cycle multiplier on
         // CMPS/SCAS — early-exit reduces actual work done.
-        commit_ip_and_cycles(program, state, slots, descriptor, iters);
+        commit_ip_and_cycles(program, state, slots, descriptor, iters, per_iter);
     }
 
     ApplyOutcome::Applied { iterations: iters }
@@ -1062,6 +1037,7 @@ fn commit_ip_and_cycles(
     slots: &[i32],
     descriptor: &LoopDescriptor,
     iters: i32,
+    per_iter: i32,
 ) {
     let ip = state.get_var("IP").unwrap_or(0);
     let prefix_len = read_prefix_len(program, state, slots);
@@ -1069,7 +1045,6 @@ fn commit_ip_and_cycles(
     if state.state_var_index.contains_key("IP") {
         state.set_var("IP", new_ip);
     }
-    let per_iter = per_iter_cycles(descriptor);
     if let Some(cc) = state.get_var("cycleCount") {
         state.set_var("cycleCount", cc.wrapping_add(iters.wrapping_mul(per_iter)));
     }
@@ -1168,6 +1143,7 @@ mod tests {
             }],
             flag_conditioned: false,
             bulk_class: BulkClass::Fill,
+            per_iter_cycles: Some(10),
         }
     }
 
@@ -1223,6 +1199,7 @@ mod tests {
             ],
             flag_conditioned: false,
             bulk_class: BulkClass::Fill,
+            per_iter_cycles: Some(10),
         }
     }
 
@@ -1532,6 +1509,7 @@ mod tests {
             }],
             flag_conditioned: false,
             bulk_class: BulkClass::Fill,
+            per_iter_cycles: Some(10),
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state = rigged_state(&["alpha", "beta", "epsilon", "delta", "gamma"]);
@@ -1703,6 +1681,7 @@ mod tests {
             }],
             flag_conditioned: false,
             bulk_class: BulkClass::Copy,
+            per_iter_cycles: Some(17),
         }
     }
 
@@ -1775,6 +1754,7 @@ mod tests {
             ],
             flag_conditioned: false,
             bulk_class: BulkClass::Copy,
+            per_iter_cycles: Some(17),
         }
     }
 
@@ -2088,6 +2068,7 @@ mod tests {
             }],
             flag_conditioned: false,
             bulk_class: BulkClass::Copy,
+            per_iter_cycles: Some(17),
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state =
@@ -2243,6 +2224,7 @@ mod tests {
             writes: vec![],
             flag_conditioned: false,
             bulk_class: BulkClass::ReadOnly,
+            per_iter_cycles: Some(15),
         }
     }
 
@@ -2284,6 +2266,7 @@ mod tests {
             writes: vec![],
             flag_conditioned: true,
             bulk_class: BulkClass::ReadOnly,
+            per_iter_cycles: Some(22),
         }
     }
 
@@ -2325,6 +2308,7 @@ mod tests {
             writes: vec![],
             flag_conditioned: true,
             bulk_class: BulkClass::ReadOnly,
+            per_iter_cycles: Some(15),
         }
     }
 
@@ -2702,6 +2686,7 @@ mod tests {
             writes: vec![],
             flag_conditioned: false,
             bulk_class: BulkClass::ReadOnly,
+            per_iter_cycles: Some(15),
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state = rigged_state(&["alpha", "beta", "gamma"]);

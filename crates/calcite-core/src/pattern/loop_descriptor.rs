@@ -123,6 +123,33 @@ pub struct LoopDescriptor {
     /// not look at any name, only at whether write-value expressions
     /// transitively reference any pointer-slot mirror.
     pub bulk_class: BulkClass,
+    /// Per-iteration cycle cost charged when the applier fast-forwards
+    /// one iteration of this loop.
+    ///
+    /// **Structurally derived, not opcode-keyed.** At recogniser time we
+    /// scan the dispatch family for the single family member whose
+    /// per-key body has the shape `Calc(Add(Var(X), Literal(K)))` (or
+    /// the commutative `Literal(K) + Var(X)`) for the largest number
+    /// of keys, with `X` the same opaque slot reference across all
+    /// matching keys. That member is "the cycle counter": the slot
+    /// dispatched per opcode as a fixed-slot-plus-per-opcode-literal
+    /// shape. For this descriptor's `key_value`, the literal `K` from
+    /// that member's body is captured here.
+    ///
+    /// `Some(K)` when the dispatch family contains such a member AND
+    /// it has a body for this opcode of the matching shape.
+    /// `None` otherwise — the applier returns `Unsupported` and the
+    /// dispatcher panics, because charging the wrong cycle count would
+    /// break cabinets whose progression is gated on cycleCount-derived
+    /// timers.
+    ///
+    /// **Cardinal-rule probe.** A 6502 / brainfuck / non-emulator
+    /// cabinet whose CSS emits the same `var(X) + Literal(K)`-per-key
+    /// dispatch family produces the same `Some(K)`; one without that
+    /// shape produces `None`. Slot names are opaque tokens; renaming
+    /// the cycle counter slot (e.g. `--cycleCount` → `--zorch`) does
+    /// not affect the extraction.
+    pub per_iter_cycles: Option<i32>,
 }
 
 /// Coarse classification of how a recognised self-loop's per-iter
@@ -801,6 +828,8 @@ fn recognise_one_opcode<'a>(
 
     let bulk_class = classify_bulk(&pointers, &writes);
 
+    let per_iter_cycles = extract_per_iter_cycles(family, key_value);
+
     Some(LoopDescriptor {
         key_property: family.key_property.clone(),
         key_value,
@@ -814,7 +843,102 @@ fn recognise_one_opcode<'a>(
         writes,
         flag_conditioned,
         bulk_class,
+        per_iter_cycles,
     })
+}
+
+/// Find the per-iteration cycle cost literal for one opcode, structurally.
+///
+/// **Rule.** Among the dispatch family's members, pick the one with the
+/// highest count of bodies matching the shape
+/// `Calc(Add(Var(X), Literal(K)))` (with X the same opaque slot reference
+/// across all matching keys for that member). Call that member "the
+/// cycle-counter family member". For the requested `key_value`, return
+/// `Some(K)` if its body in that member matches the shape; `None`
+/// otherwise (no such family member exists, or this opcode is not one
+/// of the per-key bodies the chosen member covers).
+///
+/// **Why this rule.** A CPU cabinet that wants per-instruction cycle
+/// accounting emits exactly this shape: one slot dispatched on the
+/// opcode key, each branch returning `var(self_mirror) + per_opcode_K`.
+/// No matter what the slot name is (`--cycleCount`, `--zorch`,
+/// `--moodMeter`), no matter the cabinet's ISA, the dispatch shape is
+/// the same. The "most participants wins" tiebreaker is itself
+/// structural — the cycle counter is the family member with the
+/// broadest opcode coverage of the self-add-literal shape.
+///
+/// **Cardinal-rule guarantee.** No characters of any name are inspected.
+/// The recogniser compares `Var.name` strings only for whole-string
+/// equality (to detect "same X across keys"). A cabinet without a
+/// per-iter cycle-style dispatch returns `None`, and the applier bails
+/// loudly rather than charging a fabricated cost.
+fn extract_per_iter_cycles(family: &DispatchFamily<'_>, key_value: i64) -> Option<i32> {
+    // For each member, compute the (best_X, count) over its bodies: the
+    // single Var slot reference shared by the most "Var(X) + Literal(K)"
+    // bodies, and how many such bodies use it.
+    let mut best_member: Option<(&str, usize, &HashMap<i64, &Expr>, String)> = None;
+    for (&prop, member) in &family.members {
+        let Some((shared_x, count)) = best_shared_var_for_self_add_literal(&member.bodies) else {
+            continue;
+        };
+        let replace = match best_member.as_ref() {
+            None => true,
+            Some(&(prev_prop, prev_count, _, _)) => {
+                if count > prev_count {
+                    true
+                } else if count < prev_count {
+                    false
+                } else {
+                    // Tie on count — break deterministically by
+                    // lexicographic property-name order so the chosen
+                    // member is stable across HashMap iteration orders.
+                    prop < prev_prop
+                }
+            }
+        };
+        if replace {
+            best_member = Some((prop, count, &member.bodies, shared_x));
+        }
+    }
+
+    let (_, _, bodies, shared_x) = best_member?;
+    let body = bodies.get(&key_value)?;
+    let (x, k) = decompose_var_plus_literal(body)?;
+    if x != shared_x {
+        return None;
+    }
+    Some(k)
+}
+
+/// Decompose an expression matching shape `Calc(Add(Var(X), Literal(K)))`
+/// (or commutative `Literal(K) + Var(X)`) into `(X, K)`. Returns `None`
+/// for any other shape, including `Calc(Add(Var(X), Var(Y)))` (two vars)
+/// and `Calc(Add(Literal(K1), Literal(K2)))` (two literals).
+fn decompose_var_plus_literal(expr: &Expr) -> Option<(String, i32)> {
+    let Expr::Calc(CalcOp::Add(a, b)) = expr else { return None };
+    match (a.as_ref(), b.as_ref()) {
+        (Expr::Var { name, fallback: _ }, Expr::Literal(k)) => Some((name.clone(), *k as i32)),
+        (Expr::Literal(k), Expr::Var { name, fallback: _ }) => Some((name.clone(), *k as i32)),
+        _ => None,
+    }
+}
+
+/// Given a member's per-key bodies, find the single `Var.name` X that
+/// appears as the var operand in the largest number of bodies whose
+/// shape is `Calc(Add(Var(X), Literal(K)))`. Returns `(X, count)` for
+/// the best X, or `None` if no body matches the shape.
+fn best_shared_var_for_self_add_literal(
+    bodies: &HashMap<i64, &Expr>,
+) -> Option<(String, usize)> {
+    let mut by_x: HashMap<String, usize> = HashMap::new();
+    for body in bodies.values() {
+        if let Some((x, _)) = decompose_var_plus_literal(body) {
+            *by_x.entry(x).or_insert(0) += 1;
+        }
+    }
+    by_x.into_iter()
+        // Tiebreak by lexicographic name so the choice is deterministic.
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
 }
 
 /// Classify the bulk-applier shape of a recognised loop, structurally.
