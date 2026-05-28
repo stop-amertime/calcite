@@ -114,6 +114,12 @@ pub struct Evaluator {
     /// expression evaluator isn't worth the complexity for the current
     /// shapes kiln emits).
     pub(crate) input_edge_bindings: Vec<InputEdgeBinding>,
+    /// Self-loop descriptors recognised at compile time from the
+    /// cabinet's opcode-keyed dispatch family. Phase 1 of the
+    /// rep_fast_forward genericity mission emits these but does not
+    /// yet consume them at runtime — the hardcoded fast-forward path
+    /// remains the active applier.
+    pub loop_descriptors: Vec<crate::pattern::loop_descriptor::LoopDescriptor>,
 }
 
 /// Compiled form of a `ParsedProgram::input_edges` entry. The
@@ -286,6 +292,11 @@ impl Evaluator {
             stride: cw.stride,
             byte_array_base_key: cw.byte_array_base_key,
             byte_array: cw.byte_array.clone(),
+        });
+        state.virtual_regions.push(crate::state::VirtualRegion {
+            start: cw.window_base,
+            end: cw.window_end,
+            source: "windowed_byte_array",
         });
         log::info!(
             "[windowed-byte-array] installed: window=[0x{:X},0x{:X}) stride={} key_cell={} byte_array_len={}",
@@ -545,6 +556,18 @@ impl Evaluator {
             );
         }
 
+        // Recognise opcode-keyed self-loops in the cabinet's dispatch
+        // family. Phase 1 of the rep_fast_forward genericity mission:
+        // descriptors are produced but not yet consumed at runtime.
+        let loop_descriptors =
+            crate::pattern::loop_descriptor::recognise_loops(&program.assignments);
+        log::info!(
+            "[loop-descriptor] recognised {} self-loop opcodes",
+            loop_descriptors.len(),
+        );
+        let mut compiled = compiled;
+        compiled.loop_descriptors = loop_descriptors.clone();
+
         Evaluator {
             functions,
             assignments,
@@ -560,6 +583,7 @@ impl Evaluator {
             compiled,
             slots: Vec::with_capacity(slot_count),
             input_edge_bindings,
+            loop_descriptors,
         }
     }
 
@@ -2232,6 +2256,7 @@ mod tests {
             compiled,
             slots: Vec::new(),
             input_edge_bindings: Vec::new(),
+            loop_descriptors: Vec::new(),
         };
         (evaluator, state)
     }

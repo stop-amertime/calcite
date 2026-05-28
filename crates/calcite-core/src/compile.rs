@@ -538,6 +538,12 @@ pub struct CompiledProgram {
     /// inside the window collapse to one state-var read + one array index,
     /// instead of walking the inline-exception CmpEq chain on every byte.
     pub windowed_byte_array: Option<CompiledWindowedByteArray>,
+    /// Mirror of `Evaluator::loop_descriptors`. Populated at compile time
+    /// by the same recogniser; carried on the program so the per-tick
+    /// path can consult it without re-recognising. Phase 1 of the
+    /// rep_fast_forward genericity mission: populated but not yet
+    /// consumed at runtime.
+    pub loop_descriptors: Vec<crate::pattern::loop_descriptor::LoopDescriptor>,
 }
 
 /// Compile-time half of the windowed-byte-array fast path. The compiler can't
@@ -3322,6 +3328,7 @@ pub fn compile(
         packed_exception_tables: compiler.packed_exception_tables,
         packed_broadcast_writes: compiled_packed_bw,
         windowed_byte_array: compiler.recognised_windowed_byte_array.take(),
+        loop_descriptors: Vec::new(),
     };
 
     // Expand all Op::Call sites inline. Op::Call was a compile-time device to
