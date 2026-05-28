@@ -175,6 +175,92 @@ pub struct LoopDescriptor {
     /// match; the structural fact is "the outermost top-level Calc(Add)
     /// has a bare-Var operand and the dispatch on the other side."
     pub ip_extra_advance_slot: Option<String>,
+    /// Structural comparison shape for flag-conditioned ReadOnly loops
+    /// (CMPS / SCAS family). `Some` when the dispatch family contains a
+    /// comparison member whose per-key body for this opcode is shaped
+    /// `Calc(Sub(a, b))` (or commutative reassociations) with the
+    /// operands tracing through pointer mirrors or accumulator slots;
+    /// `None` otherwise.
+    ///
+    /// **Cardinal-rule probe.** A 6502 cabinet that emits a comparison
+    /// dispatch with the same `Calc(Sub(...))`-per-opcode shape produces
+    /// an equivalent ComparisonShape using the cabinet's own slot names.
+    /// Renaming the segment / pointer / accumulator slots does not affect
+    /// the match. A cabinet without a comparison dispatch produces
+    /// `None`, and the applier returns `Unsupported` — the dispatcher
+    /// panics, which is correct because the flag-conditioned ReadOnly
+    /// shape MUST have a comparison source somewhere in the cabinet.
+    pub comparison_shape: Option<ComparisonShape>,
+}
+
+/// How a flag-conditioned ReadOnly loop (CMPS / SCAS family) performs
+/// its per-iter comparison, captured structurally from the cabinet's
+/// own per-opcode comparison dispatch.
+///
+/// The shape is identified by finding a dispatch family member whose
+/// per-key body for the opcode of this descriptor is a `Calc(Sub(a, b))`
+/// (or `Calc(Add(a, Negate(b)))`) where one operand traces — through any
+/// intermediate slot bodies — to a memory read keyed on a pointer
+/// mirror. The other operand is either another such memory read (CMPS)
+/// or a bare `Var` (SCAS, the accumulator). No opcode-byte tables, no
+/// "this slot is named --AL" reads — the matcher only inspects `Expr`
+/// shape and whole-name slot identity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComparisonShape {
+    /// Width of one comparison step, in bytes. Structurally equal to
+    /// the loop's pointer step magnitude (`pointers[0].base_step`).
+    /// 8086 byte/word string ops give 1 or 2; a hypothetical wider
+    /// loop on another ISA would give a larger value.
+    pub width: u8,
+    /// Destination-side segment slot. Captured from the address
+    /// decomposition `var(seg) * 16 + var(ptr)` of one operand of the
+    /// comparison `Sub`. The slot name is opaque — no character of any
+    /// name is inspected.
+    pub dst_seg_property: String,
+    /// Destination-side pointer slot. Equals the destination pointer
+    /// entry's `self_property`.
+    pub dst_ptr_property: String,
+    /// Source operand of the comparison.
+    pub source: ComparisonSource,
+    /// Name of the slot whose values, paired with the comparison-derived
+    /// flag-bit slot's values in the IP-body predicate's disjunctive
+    /// branches, select the comparison-result sense (REPE vs REPNE on
+    /// x86; conceptually "continue while equal" vs "continue while
+    /// unequal" on any ISA with this loop family).
+    ///
+    /// Identified structurally as the predicate slot that:
+    ///   1. Takes more than one distinct literal value across the
+    ///      disjunctive branches of the IP predicate.
+    ///   2. Is NOT the comparison-derived flag-bit slot (the slot whose
+    ///      top-level body transitively depends on the comparison
+    ///      dispatch's output).
+    ///
+    /// `Some(slot)` when exactly one predicate slot satisfies both
+    /// rules. `None` when no such slot exists (a cabinet with a single
+    /// unconditional REPE-like exit polarity, or one whose discriminator
+    /// is encoded differently).
+    pub rep_type_property: Option<String>,
+}
+
+/// Source operand of a flag-conditioned ReadOnly comparison.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComparisonSource {
+    /// CMPS-shape: source is a memory read through a second stepping
+    /// pointer. Carries the source-side segment slot and pointer slot
+    /// (matching the descriptor's second pointer entry).
+    Pointer {
+        seg_property: String,
+        ptr_property: String,
+    },
+    /// SCAS-shape: source is an accumulator slot read once per iter.
+    /// The width-1 (byte) variant uses `byte_property`; the width-2
+    /// (word) variant uses `word_property`. Captured per-descriptor —
+    /// each opcode (byte / word) gets its own descriptor with the slot
+    /// for *that* width populated and the other left empty.
+    Accumulator {
+        byte_property: String,
+        word_property: String,
+    },
 }
 
 /// Coarse classification of how a recognised self-loop's per-iter
@@ -857,6 +943,12 @@ fn recognise_one_opcode<'a>(
 
     let ip_extra_advance_slot = extract_ip_extra_advance_slot(assignment_index, ip_prop);
 
+    let comparison_shape = if flag_conditioned && writes.is_empty() && !pointers.is_empty() {
+        extract_comparison_shape(family, key_value, &pointers, &predicate, assignment_index)
+    } else {
+        None
+    };
+
     Some(LoopDescriptor {
         key_property: family.key_property.clone(),
         key_value,
@@ -872,6 +964,7 @@ fn recognise_one_opcode<'a>(
         bulk_class,
         per_iter_cycles,
         ip_extra_advance_slot,
+        comparison_shape,
     })
 }
 
@@ -926,6 +1019,622 @@ fn ip_extra_add_orientation(dispatch_candidate: &Expr, extra_candidate: &Expr) -
     // delegate to that.
     find_inner_dispatch(dispatch_candidate)?;
     Some(name.clone())
+}
+
+/// Extract the structural comparison shape for a flag-conditioned
+/// ReadOnly loop (CMPS / SCAS family) at this opcode.
+///
+/// **Rule.** Walk the dispatch family looking for a "comparison" member:
+/// a member whose per-key body for `key_value` has shape
+/// `Calc(Sub(a, b))` (or `Calc(Add(a, Negate(b)))`), where the two
+/// operands transitively reference the loop's pointer mirror slots or
+/// accumulator-shaped bare `Var`s. The cabinet's comparison dispatch
+/// (8086: `--_cmpDiff`) emits exactly this shape per-opcode, mapping the
+/// upstream "compute the difference" intent onto a pure CSS arithmetic
+/// dispatch.
+///
+/// The matcher inspects only:
+/// - The shape of `Expr` nodes (`Calc(Sub(...))`, `FunctionCall`, `Var`).
+/// - Whole-name equality (pointer mirror lookup, intermediate body
+///   lookup via `assignment_index`).
+///
+/// It does NOT inspect characters of any name, look at the literal `0xA6`
+/// vs `0xA7`, or assume any particular function name for the comparison.
+///
+/// **Cardinal-rule probe.** A cabinet whose comparison dispatch member
+/// uses different slot names produces an equivalent `ComparisonShape`
+/// with those names. A cabinet without such a member produces `None`.
+fn extract_comparison_shape<'a>(
+    family: &DispatchFamily<'a>,
+    key_value: i64,
+    pointers: &[PointerEntry],
+    predicate: &StyleTest,
+    assignment_index: &HashMap<&'a str, &'a Expr>,
+) -> Option<ComparisonShape> {
+    // Pointer mirror set: the prior-tick slot names the pointer step
+    // bodies read. Used as the "reaches a pointer" test for the
+    // comparison operands.
+    let mirrors: HashSet<&str> = pointers.iter().map(|p| p.self_property.as_str()).collect();
+
+    // Exclude family members that have been classified upstream as the
+    // pointer / counter / IP slots — their bodies are loop machinery,
+    // not data comparison. (The pointer step body has a Calc(Sub(...))
+    // shape too, computing the next pointer value; we'd match it
+    // spuriously without this filter.)
+    let pointer_props: HashSet<&str> = pointers.iter().map(|p| p.property.as_str()).collect();
+
+    // Search family members for one whose body for this key is a Sub
+    // with two operands that each trace to a memory read keyed on a
+    // pointer mirror (CMPS) or one such + a bare-Var operand (SCAS).
+    let mut found: Option<(&Expr, &Expr)> = None;
+    for (mprop, member) in &family.members {
+        if pointer_props.contains(*mprop) {
+            continue;
+        }
+        let Some(body) = member.bodies.get(&key_value) else { continue };
+        if let Some(pair) = match_subtraction_operands(body) {
+            let (a, b) = pair;
+            // Comparison shape: both operands trace to data (either a
+            // memory read through a pointer mirror via an intermediate
+            // FunctionCall, or — for SCAS — one operand is a bare Var
+            // accumulator). We require:
+            //   - At least one operand traces to a memory read through
+            //     a pointer mirror (the "destination" side).
+            //   - The other operand is either a bare Var (accumulator)
+            //     or also traces to a memory read through a (different)
+            //     pointer mirror.
+            // We do NOT accept "operand contains a Var referencing the
+            // pointer mirror without going through an intermediate
+            // FunctionCall read" — that's the pointer-advance body
+            // shape, not a data comparison.
+            let a_reads = operand_reads_through_pointer(a, &mirrors, assignment_index);
+            let b_reads = operand_reads_through_pointer(b, &mirrors, assignment_index);
+            let a_acc = matches!(a, Expr::Var { fallback: None, .. })
+                && !mirrors.contains(match_bare_var(a).as_deref().unwrap_or(""));
+            let b_acc = matches!(b, Expr::Var { fallback: None, .. })
+                && !mirrors.contains(match_bare_var(b).as_deref().unwrap_or(""));
+            if (a_reads && b_reads) || (a_reads && b_acc) || (b_reads && a_acc) {
+                found = Some(pair);
+                break;
+            }
+        }
+    }
+    let (lhs, rhs) = found?;
+
+    // Identify which operand is the destination side. Convention:
+    // `pointers[0]` is the destination (alphabetic sort places `DI`
+    // before `SI`, but this is purely a convention — the comparison
+    // arithmetic is symmetric for the bytes-equal check that gates
+    // early exit, and the applier uses the same convention).
+    if pointers.is_empty() {
+        return None;
+    }
+    let dst_ptr_mirror = pointers[0].self_property.as_str();
+    let src_ptr_mirror_opt = pointers.get(1).map(|p| p.self_property.as_str());
+
+    // Resolve dst operand and dst segment.
+    let dst_operand = if reaches_specific_pointer_mirror(lhs, dst_ptr_mirror, assignment_index) {
+        lhs
+    } else if reaches_specific_pointer_mirror(rhs, dst_ptr_mirror, assignment_index) {
+        rhs
+    } else {
+        return None;
+    };
+    let (dst_seg_property, dst_ptr_property) =
+        trace_segmented_read(dst_operand, dst_ptr_mirror, assignment_index)?;
+
+    // The OTHER operand is the source.
+    let src_operand = if std::ptr::eq(dst_operand, lhs) { rhs } else { lhs };
+
+    let source = if let Some(src_ptr_mirror) = src_ptr_mirror_opt {
+        // CMPS shape: src operand must trace to the second pointer
+        // mirror and decompose to a segmented memory read.
+        let (src_seg, src_ptr) =
+            trace_segmented_read(src_operand, src_ptr_mirror, assignment_index)?;
+        ComparisonSource::Pointer {
+            seg_property: src_seg,
+            ptr_property: src_ptr,
+        }
+    } else {
+        // SCAS shape: src operand is an accumulator. Either a bare
+        // Var (byte: `var(--AL)`) or a Calc of bare Vars (word:
+        // `calc(var(--AH) * 256 + var(--AL))` or similar).
+        extract_accumulator(src_operand)?
+    };
+
+    let width = pointers[0].base_step as u8;
+    let rep_type_property =
+        identify_rep_type_slot(predicate, family, key_value, assignment_index);
+
+    Some(ComparisonShape {
+        width,
+        dst_seg_property,
+        dst_ptr_property,
+        source,
+        rep_type_property,
+    })
+}
+
+/// Match `Calc(Sub(a, b))` or `Calc(Add(a, Negate(b)))` and return the
+/// two operands `(a, b)` (in the order they appear in the subtraction:
+/// `lhs - rhs`).
+fn match_subtraction_operands(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    // Peel an outer StyleCondition fallback (the `repGuardReg` wrapper
+    // typically wraps `Calc(...)` in `if(...: oldVal; else: <real>)`).
+    let inner = match expr {
+        Expr::StyleCondition { fallback, .. } => fallback.as_ref(),
+        other => other,
+    };
+    // Peel a top-level Add of two sub-expressions: the cabinet may
+    // emit `calc(subFlags(a, b) + and(flags, mask))` where one side is
+    // a flag-mask term we want to skip past.
+    if let Expr::Calc(CalcOp::Add(left, right)) = inner {
+        if let Some(pair) = match_subtraction_operands_inner(left) {
+            return Some(pair);
+        }
+        if let Some(pair) = match_subtraction_operands_inner(right) {
+            return Some(pair);
+        }
+    }
+    match_subtraction_operands_inner(inner)
+}
+
+fn match_subtraction_operands_inner(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    match expr {
+        Expr::Calc(CalcOp::Sub(a, b)) => Some((a.as_ref(), b.as_ref())),
+        // FunctionCall with exactly 2 args is treated as a comparison
+        // primitive when its args reach the pointer mirrors (see
+        // `reaches_pointer_mirror` check by the caller). This lets us
+        // pick up cabinets that route the compare through a named
+        // function (e.g. `subFlags8(src, dst)`) rather than a bare Sub.
+        Expr::FunctionCall { args, .. } if args.len() == 2 => Some((&args[0], &args[1])),
+        _ => None,
+    }
+}
+
+/// True iff the operand represents a memory read through one of the
+/// pointer mirror slots. Accepted shapes:
+///
+/// 1. A bare `Var(name)` whose top-level body is a `FunctionCall(_, args)`
+///    where the args tree references a pointer mirror (canonical 8086
+///    `--_strDstByte = --readMem(calc(--ES * 16 + --DI))` shape).
+/// 2. A `Calc` tree containing such a Var (word concat shape:
+///    `calc(var(--lo) + var(--hi) * 256)` where `--lo` is the
+///    intermediate read).
+/// 3. A direct `FunctionCall(_, args)` whose args reference the mirror.
+///
+/// This is more restrictive than `reaches_pointer_mirror` — that helper
+/// also returns true for operands that just *contain* a `Var(pointer)`
+/// reference in some Calc tree (the pointer-advance body shape). For
+/// comparison-operand identification we need to filter those out.
+fn operand_reads_through_pointer<'a>(
+    expr: &Expr,
+    mirrors: &HashSet<&str>,
+    assignment_index: &HashMap<&'a str, &'a Expr>,
+) -> bool {
+    match expr {
+        Expr::Var { name, fallback: None } => {
+            if let Some(body) = assignment_index.get(name.as_str()) {
+                if let Expr::FunctionCall { args, .. } = body {
+                    return args.iter().any(|a| expr_references_any(a, mirrors));
+                }
+            }
+            false
+        }
+        Expr::Calc(op) => operand_reads_through_pointer_in_calc(op, mirrors, assignment_index),
+        Expr::FunctionCall { args, .. } => args.iter().any(|a| expr_references_any(a, mirrors)),
+        _ => false,
+    }
+}
+
+fn operand_reads_through_pointer_in_calc<'a>(
+    op: &CalcOp,
+    mirrors: &HashSet<&str>,
+    assignment_index: &HashMap<&'a str, &'a Expr>,
+) -> bool {
+    match op {
+        CalcOp::Add(a, b)
+        | CalcOp::Sub(a, b)
+        | CalcOp::Mul(a, b)
+        | CalcOp::Div(a, b)
+        | CalcOp::Mod(a, b)
+        | CalcOp::Pow(a, b) => {
+            operand_reads_through_pointer(a, mirrors, assignment_index)
+                || operand_reads_through_pointer(b, mirrors, assignment_index)
+        }
+        _ => false,
+    }
+}
+
+/// True iff the expression — possibly tracing through a single layer of
+/// intermediate slot (a top-level `Var(name)` whose body is in
+/// `assignment_index`) — references one of the pointer mirror slots.
+fn reaches_pointer_mirror<'a>(
+    expr: &Expr,
+    mirrors: &HashSet<&str>,
+    assignment_index: &HashMap<&'a str, &'a Expr>,
+) -> bool {
+    if expr_references_any(expr, mirrors) {
+        return true;
+    }
+    // Trace one layer through an intermediate slot's body.
+    if let Expr::Var { name, fallback: None } = expr {
+        if let Some(body) = assignment_index.get(name.as_str()) {
+            return expr_references_any(body, mirrors);
+        }
+    }
+    // Also walk Calc trees for a top-level word-concat shape:
+    //   calc(var(intermediate) + var(intermediate_hi) * 256)
+    // each sub-Var of which may be an intermediate.
+    if let Expr::Calc(op) = expr {
+        match op {
+            CalcOp::Add(a, b)
+            | CalcOp::Sub(a, b)
+            | CalcOp::Mul(a, b)
+            | CalcOp::Div(a, b)
+            | CalcOp::Mod(a, b)
+            | CalcOp::Pow(a, b) => {
+                if reaches_pointer_mirror(a, mirrors, assignment_index)
+                    || reaches_pointer_mirror(b, mirrors, assignment_index)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Like `operand_reads_through_pointer`, but restricted to a single
+/// specific mirror name. Used to disambiguate which operand is the
+/// destination side once we've identified the comparison pair.
+fn reaches_specific_pointer_mirror<'a>(
+    expr: &Expr,
+    mirror: &str,
+    assignment_index: &HashMap<&'a str, &'a Expr>,
+) -> bool {
+    let mut set: HashSet<&str> = HashSet::new();
+    set.insert(mirror);
+    operand_reads_through_pointer(expr, &set, assignment_index)
+}
+
+/// Trace an operand of the comparison subtraction down to the segment
+/// slot it reads through. The operand shape may be:
+///
+/// - A bare `Var(intermediate)` whose top-level body is
+///   `FunctionCall(_, [<calc(seg*16 + ptr)>])` (8086's
+///   `--readMem(calc(--ES * 16 + --DI))`-shaped pre-computed byte).
+/// - A `Calc(Add(...))` that itself contains the same shape, for word
+///   reads composed as `low + hi * 256`.
+/// - A direct `FunctionCall(_, args)` of similar shape.
+///
+/// Returns `(seg_property, ptr_property)` — the names the cabinet uses
+/// for the segment base and the pointer mirror. The pointer mirror
+/// matches `pointer_mirror_target`.
+fn trace_segmented_read<'a>(
+    expr: &Expr,
+    pointer_mirror_target: &str,
+    assignment_index: &HashMap<&'a str, &'a Expr>,
+) -> Option<(String, String)> {
+    // Case 1: intermediate slot — peek through to its body.
+    if let Expr::Var { name, fallback: None } = expr {
+        if let Some(body) = assignment_index.get(name.as_str()) {
+            return trace_segmented_read(body, pointer_mirror_target, assignment_index);
+        }
+    }
+    // Case 2: FunctionCall — descend into args.
+    if let Expr::FunctionCall { args, .. } = expr {
+        for a in args {
+            if let Some(pair) = trace_segmented_read(a, pointer_mirror_target, assignment_index) {
+                return Some(pair);
+            }
+            // Direct decomposition at the arg level.
+            if let Some(pair) = match_seg_plus_ptr(a, pointer_mirror_target) {
+                return Some(pair);
+            }
+            // The 8086 source-side dispatches through an intermediate
+            // `--_strSrcSeg = if(...: var(--segOverride); else: calc(--DS * 16))`
+            // shape — so the segment "slot" is itself a Var(intermediate).
+            // Accept that by capturing the intermediate's name and the
+            // ptr name from the surrounding shape.
+            if let Some(pair) = match_segvar_plus_ptr(a, pointer_mirror_target) {
+                return Some(pair);
+            }
+        }
+    }
+    // Case 3: Calc tree — descend through arithmetic ops to find the
+    // canonical seg-pointer shape buried inside.
+    if let Expr::Calc(op) = expr {
+        return calc_trace_segmented_read(op, pointer_mirror_target, assignment_index);
+    }
+    None
+}
+
+fn calc_trace_segmented_read<'a>(
+    op: &CalcOp,
+    pointer_mirror_target: &str,
+    assignment_index: &HashMap<&'a str, &'a Expr>,
+) -> Option<(String, String)> {
+    match op {
+        CalcOp::Add(a, b)
+        | CalcOp::Sub(a, b)
+        | CalcOp::Mul(a, b)
+        | CalcOp::Div(a, b)
+        | CalcOp::Mod(a, b)
+        | CalcOp::Pow(a, b) => trace_segmented_read(a, pointer_mirror_target, assignment_index)
+            .or_else(|| trace_segmented_read(b, pointer_mirror_target, assignment_index)),
+        _ => None,
+    }
+}
+
+/// Match `calc(var(seg) * 16 + var(ptr))` or the reversed orientation,
+/// returning `(seg_name, ptr_name)` when `ptr_name == pointer_mirror_target`.
+fn match_seg_plus_ptr(expr: &Expr, pointer_mirror_target: &str) -> Option<(String, String)> {
+    let (seg, ptr) = match_segmented_address(expr)?;
+    if ptr == pointer_mirror_target {
+        Some((seg, ptr))
+    } else {
+        None
+    }
+}
+
+/// Match `calc(var(seg_intermediate) + var(ptr))` (where the seg side is
+/// already shifted by the intermediate) — the 8086 `--_strSrcSeg` case.
+/// Returns `(seg_intermediate, ptr)` when `ptr == pointer_mirror_target`.
+fn match_segvar_plus_ptr(expr: &Expr, pointer_mirror_target: &str) -> Option<(String, String)> {
+    let Expr::Calc(CalcOp::Add(a, b)) = expr else { return None };
+    let (av, bv) = (match_bare_var(a), match_bare_var(b));
+    match (av, bv) {
+        (Some(left), Some(right)) => {
+            if left == pointer_mirror_target {
+                Some((right, left))
+            } else if right == pointer_mirror_target {
+                Some((left, right))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract the accumulator-side operand of a SCAS-shape comparison.
+/// Accepted shapes:
+/// - Bare `Var(name)` — byte accumulator: `byte_property = name`,
+///   `word_property = name`.
+/// - `Calc(Add(var(low), Calc(Mul(var(hi), Literal(256)))))` or
+///   reassociations — word accumulator. Currently captured as the bare
+///   form by recording the outermost Var (low byte) as `byte_property`
+///   and the parent Var as `word_property` when the cabinet uses
+///   `var(--__1AX)` as the word read. For the synthetic-cabinet tests
+///   we accept a bare Var for both byte and word forms.
+fn extract_accumulator(expr: &Expr) -> Option<ComparisonSource> {
+    // Strip one layer of intermediate Var.
+    if let Some(name) = match_bare_var(expr) {
+        return Some(ComparisonSource::Accumulator {
+            byte_property: name.clone(),
+            word_property: name,
+        });
+    }
+    // For word concat shapes (var(lo) + var(hi) * 256), capture the
+    // low-byte var as byte_property and itself as word_property; the
+    // applier reads `word_property` when width=2.
+    if let Expr::Calc(CalcOp::Add(a, b)) = expr {
+        if let (Some(lo), _) = (match_bare_var(a), b) {
+            return Some(ComparisonSource::Accumulator {
+                byte_property: lo.clone(),
+                word_property: lo,
+            });
+        }
+        if let (_, Some(lo)) = (a, match_bare_var(b)) {
+            return Some(ComparisonSource::Accumulator {
+                byte_property: lo.clone(),
+                word_property: lo,
+            });
+        }
+    }
+    None
+}
+
+/// Identify the rep-type discriminator slot among predicate slots.
+///
+/// **Rule.** Among `StyleTest::Single` slots in the IP-body predicate,
+/// pick the one that:
+///   1. Takes more than one distinct literal value across the
+///      disjunctive branches (i.e. the slot is keyed differently per
+///      branch — characteristic of a discriminator).
+///   2. Is NOT the comparison-result flag-bit slot — defined as the
+///      slot whose top-level body transitively depends on the
+///      comparison member's output. The comparison member is identified
+///      structurally above (same routine that produced the dst/src
+///      operands).
+///
+/// When exactly one slot satisfies both, return it. When zero or more
+/// than one do, return `None` — the applier will conservatively bail
+/// (Unsupported) rather than guess.
+fn identify_rep_type_slot<'a>(
+    predicate: &StyleTest,
+    family: &DispatchFamily<'a>,
+    key_value: i64,
+    assignment_index: &HashMap<&'a str, &'a Expr>,
+) -> Option<String> {
+    // Collect per-disjunctive-branch single-test slot→value mappings.
+    let branches = match predicate {
+        StyleTest::Or(parts) => parts.clone(),
+        StyleTest::And(_) | StyleTest::Single { .. } => vec![predicate.clone()],
+    };
+    if branches.len() < 2 {
+        return None;
+    }
+
+    // For each slot, collect the set of distinct literal values it
+    // takes across branches.
+    let mut per_slot_values: HashMap<String, HashSet<i64>> = HashMap::new();
+    for b in &branches {
+        let pairs = collect_single_pairs(b);
+        for (prop, val) in pairs {
+            per_slot_values.entry(prop).or_default().insert(val);
+        }
+    }
+
+    // The comparison-flag-bit slot is the one whose top-level body
+    // transitively depends on the comparison member's output. Identify
+    // the comparison-output property: the property of the family
+    // member we picked above (whose body is the Sub). We re-derive it
+    // here for locality.
+    let cmp_output_props: HashSet<&str> = family
+        .members
+        .iter()
+        .filter_map(|(prop, member)| {
+            let body = member.bodies.get(&key_value)?;
+            if match_subtraction_operands(body).is_some() {
+                Some(*prop)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Candidates: slots with >1 distinct value AND whose top-level body
+    // does NOT transitively reach any comparison output.
+    let mut candidates: Vec<String> = Vec::new();
+    for (slot, values) in &per_slot_values {
+        if values.len() < 2 {
+            continue;
+        }
+        // Reach test: does this slot's body depend on the comparison
+        // output (i.e. eventually read from `cmp_output_props`)?
+        if let Some(body) = assignment_index.get(slot.as_str()) {
+            if expr_references_any(body, &cmp_output_props) {
+                continue;
+            }
+            // Indirect: walk through one layer of intermediate Var
+            // references in case the dependency is two hops deep.
+            if expr_reaches_through_intermediates(body, &cmp_output_props, assignment_index, 3) {
+                continue;
+            }
+        }
+        candidates.push(slot.clone());
+    }
+
+    if candidates.len() == 1 {
+        return Some(candidates.into_iter().next().unwrap());
+    }
+    None
+}
+
+/// Collect (slot, literal_value) pairs from a flat conjunction
+/// `StyleTest`. Returns one entry per `StyleTest::Single { property,
+/// value: Literal(_) }` in the tree.
+fn collect_single_pairs(test: &StyleTest) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    walk_test(test, &mut |t| {
+        if let StyleTest::Single { property, value } = t {
+            if let Expr::Literal(v) = value {
+                out.push((property.clone(), *v as i64));
+            }
+        }
+    });
+    out
+}
+
+/// Walk through up to `depth` layers of intermediate `Var(name)` slot
+/// references, returning true if any slot's body reaches the targets.
+fn expr_reaches_through_intermediates<'a>(
+    expr: &Expr,
+    targets: &HashSet<&str>,
+    assignment_index: &HashMap<&'a str, &'a Expr>,
+    depth: u32,
+) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    if expr_references_any(expr, targets) {
+        return true;
+    }
+    // Collect intermediate Var names referenced anywhere in the tree
+    // and recurse on their bodies.
+    let mut seen: HashSet<String> = HashSet::new();
+    collect_var_names(expr, &mut seen);
+    for n in seen {
+        if let Some(body) = assignment_index.get(n.as_str()) {
+            if expr_reaches_through_intermediates(body, targets, assignment_index, depth - 1) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn collect_var_names(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Var { name, fallback } => {
+            out.insert(name.clone());
+            if let Some(fb) = fallback {
+                collect_var_names(fb, out);
+            }
+        }
+        Expr::Literal(_) | Expr::StringLiteral(_) => {}
+        Expr::Calc(op) => collect_var_names_in_calc(op, out),
+        Expr::StyleCondition { branches, fallback } => {
+            for b in branches {
+                collect_var_names_in_test(&b.condition, out);
+                collect_var_names(&b.then, out);
+            }
+            collect_var_names(fallback, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_var_names(a, out);
+            }
+        }
+        Expr::Concat(parts) => {
+            for p in parts {
+                collect_var_names(p, out);
+            }
+        }
+    }
+}
+
+fn collect_var_names_in_calc(op: &CalcOp, out: &mut HashSet<String>) {
+    match op {
+        CalcOp::Add(a, b)
+        | CalcOp::Sub(a, b)
+        | CalcOp::Mul(a, b)
+        | CalcOp::Div(a, b)
+        | CalcOp::Mod(a, b)
+        | CalcOp::Pow(a, b) => {
+            collect_var_names(a, out);
+            collect_var_names(b, out);
+        }
+        CalcOp::Min(args) | CalcOp::Max(args) => {
+            for a in args {
+                collect_var_names(a, out);
+            }
+        }
+        CalcOp::Clamp(a, b, c) => {
+            collect_var_names(a, out);
+            collect_var_names(b, out);
+            collect_var_names(c, out);
+        }
+        CalcOp::Round(_, a, b) => {
+            collect_var_names(a, out);
+            collect_var_names(b, out);
+        }
+        CalcOp::Sign(a) | CalcOp::Abs(a) | CalcOp::Negate(a) => collect_var_names(a, out),
+    }
+}
+
+fn collect_var_names_in_test(test: &StyleTest, out: &mut HashSet<String>) {
+    match test {
+        StyleTest::Single { property: _, value } => collect_var_names(value, out),
+        StyleTest::And(parts) | StyleTest::Or(parts) => {
+            for p in parts {
+                collect_var_names_in_test(p, out);
+            }
+        }
+    }
 }
 
 /// Find the per-iteration cycle cost literal for one opcode, structurally.

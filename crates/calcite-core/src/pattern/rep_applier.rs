@@ -689,26 +689,12 @@ pub(crate) fn apply_copy_with_commit(
 /// For LODS, the iteration count equals the counter `n`.
 ///
 /// For CMPS/SCAS, the iteration count depends on per-iter source-vs-
-/// destination equality. Computing it accurately requires reading source
-/// segments / accumulators / `--repType` to apply the REPE/REPNE early-
-/// exit logic. The descriptor as it stands today does NOT carry segment
-/// info for `ReadOnly` (segments live on `WriteEntry.addr_decomposition`,
-/// and `ReadOnly` has no writes), nor does it carry "this is the
-/// accumulator" metadata for SCAS, nor does it expose the predicate's
-/// REPE-vs-REPNE distinction in a name-blind form (the predicate is a
-/// `StyleTest` against the cabinet's `--repType` slot; the runtime needs
-/// to read that slot's current value to decide which branch fires).
-///
-/// **The cardinal-rule wart for ReadOnly** therefore lives in the
-/// CMPS/SCAS branch below: it reads `--ES`, `--DS`, `--SI`, `--DI`,
-/// `--AL`, `--AX`, and `--repType` by name, mirroring the hardcoded
-/// path's `rep_fast_forward_cmps_scas`. This is **the next cardinal-rule
-/// wart to fix after `rep_fast_forward` itself is gone** — Q3 of the
-/// scoping doc explicitly accepts it as a temporary in this step. The
-/// scoping doc's Q3 Option B (extracting the comparison structurally
-/// into the descriptor as a `comparison: Option<ComparisonShape>` field)
-/// is the cardinal-rule clean answer; landing it requires extending the
-/// recogniser and is deliberately deferred.
+/// destination equality. The applier resolves every segment / pointer /
+/// accumulator / rep-type slot through `descriptor.comparison_shape`,
+/// which the recogniser populates structurally from the cabinet's own
+/// per-opcode comparison dispatch. No literal-name reads of any
+/// register or flag slot — a cabinet that names the slots anything at
+/// all routes through the same code path.
 ///
 /// LODS is structurally clean — it reads no name as text beyond the
 /// `counter.property` lookup that all variants share (which is itself
@@ -810,37 +796,19 @@ pub(crate) fn apply_read_only_with_commit(
     // CMPS / SCAS shape. CMPS = 2 pointers (source + dest), SCAS = 1
     // pointer (dest only — source is the accumulator).
     //
-    // -------------------------------------------------------------------
-    // CARDINAL-RULE WART (next to fix after rep_fast_forward retirement).
-    // -------------------------------------------------------------------
-    // The reads below resolve `--ES` / `--DS` / `--SI` / `--DI` / `--AL`
-    // / `--AX` / `--repType` by literal name. This re-introduces upstream
-    // (x86) knowledge into a calcite-core path. It is contained to this
-    // function and only fires for CMPS/SCAS-shaped descriptors. The Q3
-    // Option B fix is to add a `comparison: Option<ComparisonShape>`
-    // field to `LoopDescriptor` that the recogniser populates from the
-    // predicate's structural shape (where ComparisonShape captures
-    // "compare bytes at two stepping pointers" or "compare register vs
-    // byte at stepping pointer", with segment slot info per pointer).
-    // Once that field exists, the lookups below become structural slot
-    // resolutions just like every other applier, and this WART comment
-    // can come out.
-    //
-    // Q3 Option A (this code) is acceptable as a temporary because:
-    //   1. It's a leaf call site, not a structural decision in the
-    //      recogniser. The cardinal rule's "calcite must work on a
-    //      6502 / brainfuck cabinet" property holds for the recogniser
-    //      and the dispatch in this function (LODS path is clean; the
-    //      CMPS/SCAS dispatch is by `flag_conditioned` + pointer count,
-    //      both purely structural).
-    //   2. The hardcoded names match what the existing
-    //      `rep_fast_forward_cmps_scas` already reads — the wart is
-    //      transferred, not multiplied.
-    //   3. Steps 4-5 set the precedent of accepting bounded warts when
-    //      the cleaner path requires a recogniser extension that's
-    //      genuinely independent work.
-    let dst_seg = read_prop(program, state, slots, "--ES").unwrap_or(0) & 0xFFFF;
-    let dst_seg_base = (dst_seg as i64) * 16;
+    // All segment / accumulator / rep-type slots are resolved through
+    // `descriptor.comparison_shape`, which the recogniser populates by
+    // structurally identifying the cabinet's per-opcode comparison
+    // dispatch. The slot names we read below are the names the cabinet
+    // itself uses — no character of any name is inspected by this
+    // function. A cabinet that names its segment slot anything at all
+    // (`--ES`, `--zorch`, `--tape_dst_page`) gets routed identically.
+    let Some(cmp) = descriptor.comparison_shape.as_ref() else {
+        return ApplyOutcome::Unsupported("comparison_shape not captured");
+    };
+    let dst_seg_value =
+        read_prop(program, state, slots, &cmp.dst_seg_property).unwrap_or(0) & 0xFFFF;
+    let dst_seg_base = (dst_seg_value as i64) * 16;
     let dst_entry = &descriptor.pointers[0];
     let Some(dst_ptr) = read_prop(program, state, slots, &dst_entry.self_property) else {
         return ApplyOutcome::Unsupported("dst pointer unresolved");
@@ -851,37 +819,63 @@ pub(crate) fn apply_read_only_with_commit(
     let df_active = ((flags >> dst_entry.flag_bit) & 1) != 0;
     let step: i32 = dst_entry.base_step;
     let signed_step: i32 = if df_active { -step } else { step };
-    let is_word = step == 2;
+    let is_word = cmp.width == 2;
 
     // CMPS gets its source pointer from the second pointer entry.
-    // SCAS gets its source from the AL/AX accumulator.
+    // SCAS gets its source from an accumulator slot (the one named by
+    // the comparison shape's ComparisonSource::Accumulator).
     let is_cmps = p_count == 2;
-    let (src_ptr_opt, src_seg_base, scas_acc) = if is_cmps {
-        let src_entry = &descriptor.pointers[1];
-        // Sanity: CMPS-shape pointers must share step + direction flag.
-        if src_entry.base_step != step
-            || src_entry.flag_property != dst_entry.flag_property
-            || src_entry.flag_bit != dst_entry.flag_bit
-        {
-            return ApplyOutcome::Unsupported(
-                "CMPS-shape pointers disagree on step / direction flag",
-            );
+    let (src_ptr_opt, src_seg_base, scas_acc) = match &cmp.source {
+        crate::pattern::loop_descriptor::ComparisonSource::Pointer { seg_property, .. } => {
+            // CMPS-shape. Sanity: comparison's pointer source must
+            // match descriptor.pointers[1], and both pointers must share
+            // step + direction flag.
+            if !is_cmps {
+                return ApplyOutcome::Unsupported(
+                    "comparison_shape says Pointer source but descriptor has 1 pointer",
+                );
+            }
+            let src_entry = &descriptor.pointers[1];
+            if src_entry.base_step != step
+                || src_entry.flag_property != dst_entry.flag_property
+                || src_entry.flag_bit != dst_entry.flag_bit
+            {
+                return ApplyOutcome::Unsupported(
+                    "CMPS-shape pointers disagree on step / direction flag",
+                );
+            }
+            let Some(src_ptr) = read_prop(program, state, slots, &src_entry.self_property) else {
+                return ApplyOutcome::Unsupported("src pointer unresolved");
+            };
+            let src_seg = read_prop(program, state, slots, seg_property).unwrap_or(0) & 0xFFFF;
+            (Some(src_ptr & 0xFFFF), (src_seg as i64) * 16, 0)
         }
-        let Some(src_ptr) = read_prop(program, state, slots, &src_entry.self_property) else {
-            return ApplyOutcome::Unsupported("src pointer unresolved");
-        };
-        let src_seg = read_prop(program, state, slots, "--DS").unwrap_or(0) & 0xFFFF;
-        (Some(src_ptr & 0xFFFF), (src_seg as i64) * 16, 0)
-    } else {
-        // SCAS. Accumulator: AX for word, AL for byte.
-        let acc = if is_word {
-            read_prop(program, state, slots, "--AX").unwrap_or(0) & 0xFFFF
-        } else {
-            read_prop(program, state, slots, "--AL").unwrap_or(0) & 0xFF
-        };
-        (None, 0i64, acc)
+        crate::pattern::loop_descriptor::ComparisonSource::Accumulator {
+            byte_property,
+            word_property,
+        } => {
+            if is_cmps {
+                return ApplyOutcome::Unsupported(
+                    "comparison_shape says Accumulator source but descriptor has 2 pointers",
+                );
+            }
+            let acc_slot = if is_word { word_property } else { byte_property };
+            let raw = read_prop(program, state, slots, acc_slot).unwrap_or(0);
+            let acc = if is_word { raw & 0xFFFF } else { raw & 0xFF };
+            (None, 0i64, acc)
+        }
     };
-    let rep_type = read_prop(program, state, slots, "--repType").unwrap_or(0);
+    // REPE / REPNE selector: resolved through the comparison shape's
+    // rep_type_property slot. When the recogniser couldn't identify a
+    // discriminator slot (a cabinet with a single unconditional
+    // continue-while-equal polarity, for example), we default to 0,
+    // which makes both REPE-stop and REPNE-stop branches below quiet:
+    // the loop runs all `n` iterations.
+    let rep_type = cmp
+        .rep_type_property
+        .as_ref()
+        .and_then(|slot| read_prop(program, state, slots, slot))
+        .unwrap_or(0);
 
     // Per-iter walk. Same shape as `rep_fast_forward_cmps_scas`. We don't
     // mutate memory (no `bulk_store_byte` or `bulk_fill` here); state-var
@@ -1157,6 +1151,7 @@ mod tests {
             bulk_class: BulkClass::Fill,
             per_iter_cycles: Some(10),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
+            comparison_shape: None,
         }
     }
 
@@ -1214,6 +1209,7 @@ mod tests {
             bulk_class: BulkClass::Fill,
             per_iter_cycles: Some(10),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
+            comparison_shape: None,
         }
     }
 
@@ -1525,6 +1521,7 @@ mod tests {
             bulk_class: BulkClass::Fill,
             per_iter_cycles: Some(10),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
+            comparison_shape: None,
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state = rigged_state(&["alpha", "beta", "epsilon", "delta", "gamma"]);
@@ -1698,6 +1695,7 @@ mod tests {
             bulk_class: BulkClass::Copy,
             per_iter_cycles: Some(17),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
+            comparison_shape: None,
         }
     }
 
@@ -1772,6 +1770,7 @@ mod tests {
             bulk_class: BulkClass::Copy,
             per_iter_cycles: Some(17),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
+            comparison_shape: None,
         }
     }
 
@@ -2087,6 +2086,7 @@ mod tests {
             bulk_class: BulkClass::Copy,
             per_iter_cycles: Some(17),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
+            comparison_shape: None,
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state =
@@ -2244,6 +2244,7 @@ mod tests {
             bulk_class: BulkClass::ReadOnly,
             per_iter_cycles: Some(15),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
+            comparison_shape: None,
         }
     }
 
@@ -2287,6 +2288,16 @@ mod tests {
             bulk_class: BulkClass::ReadOnly,
             per_iter_cycles: Some(22),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
+            comparison_shape: Some(crate::pattern::loop_descriptor::ComparisonShape {
+                width: 1,
+                dst_seg_property: "--ES".to_string(),
+                dst_ptr_property: "--DI".to_string(),
+                source: crate::pattern::loop_descriptor::ComparisonSource::Pointer {
+                    seg_property: "--DS".to_string(),
+                    ptr_property: "--SI".to_string(),
+                },
+                rep_type_property: Some("--repType".to_string()),
+            }),
         }
     }
 
@@ -2296,6 +2307,9 @@ mod tests {
         d.key_value = 0xA7;
         d.pointers[0].base_step = 2;
         d.pointers[1].base_step = 2;
+        if let Some(cs) = d.comparison_shape.as_mut() {
+            cs.width = 2;
+        }
         d
     }
 
@@ -2330,6 +2344,16 @@ mod tests {
             bulk_class: BulkClass::ReadOnly,
             per_iter_cycles: Some(15),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
+            comparison_shape: Some(crate::pattern::loop_descriptor::ComparisonShape {
+                width: 1,
+                dst_seg_property: "--ES".to_string(),
+                dst_ptr_property: "--DI".to_string(),
+                source: crate::pattern::loop_descriptor::ComparisonSource::Accumulator {
+                    byte_property: "--AL".to_string(),
+                    word_property: "--AX".to_string(),
+                },
+                rep_type_property: Some("--repType".to_string()),
+            }),
         }
     }
 
@@ -2338,6 +2362,9 @@ mod tests {
         let mut d = scasb_descriptor();
         d.key_value = 0xAF;
         d.pointers[0].base_step = 2;
+        if let Some(cs) = d.comparison_shape.as_mut() {
+            cs.width = 2;
+        }
         d
     }
 
@@ -2709,6 +2736,7 @@ mod tests {
             bulk_class: BulkClass::ReadOnly,
             per_iter_cycles: Some(15),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
+            comparison_shape: None,
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state = rigged_state(&["alpha", "beta", "gamma"]);

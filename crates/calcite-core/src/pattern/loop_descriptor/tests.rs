@@ -2551,3 +2551,455 @@ fn ip_extra_advance_slot_none_when_outer_add_is_literal() {
         descs[0].ip_extra_advance_slot,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3 wart 3: ComparisonShape structural capture.
+// ---------------------------------------------------------------------------
+//
+// CMPS/SCAS comparison metadata moved off literal-name reads in the applier
+// onto a `comparison_shape: Option<ComparisonShape>` field on the descriptor.
+// The recogniser identifies the comparison member by finding a family member
+// whose per-key body for this opcode has shape `Calc(Sub(a, b))` (or a
+// `FunctionCall(_, [a, b])` with the same dependency shape), where the
+// operands trace through pointer mirrors / intermediate slots.
+
+/// Build a CMPSB-shape cabinet that includes a `--_cmpDiff`-style
+/// comparison dispatch. The comparison member's body for the rep opcode
+/// is `calc(var(srcByte) - var(dstByte))` where `srcByte` / `dstByte`
+/// are intermediate slots that read memory through DS:SI / ES:DI.
+fn cabinet_cmps_shape_with_comparison(
+    ip_prop: &str,
+    op_key: f64,
+    si_mirror: &str,
+    di_mirror: &str,
+    ds_seg: &str,
+    es_seg: &str,
+    src_byte: &str,
+    dst_byte: &str,
+    cmp_diff: &str,
+    rep_type: &str,
+    zf_bit: &str,
+    flags_slot: &str,
+) -> Vec<Assignment> {
+    let branch_a = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq(rep_type, 1.0),
+        style_eq(zf_bit, 1.0),
+    ]);
+    let branch_b = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq(rep_type, 2.0),
+        style_eq(zf_bit, 0.0),
+    ]);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasRep", 1.0),
+        style_eq("--repInactive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--op",
+        vec![(op_key, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            op_key,
+            ip_body_multi(
+                vec![branch_a.clone(), branch_b.clone()],
+                ip_prop,
+                var("--pl"),
+                1,
+            ),
+        )],
+        keep_self(ip_prop),
+    );
+    let ip_wrapped = add(ip_inner, var("--pl"));
+    let di_dispatch = dispatch(
+        "--op",
+        vec![(
+            op_key,
+            pointer_body(
+                active_guard.clone(),
+                di_mirror,
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self(di_mirror),
+    );
+    let si_dispatch = dispatch(
+        "--op",
+        vec![(
+            op_key,
+            pointer_body(
+                active_guard.clone(),
+                si_mirror,
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self(si_mirror),
+    );
+
+    // The comparison member: `calc(var(src_byte) - var(dst_byte))` for
+    // this opcode key. Other opcode keys land in the fallback (constant).
+    let cmp_diff_dispatch = dispatch(
+        "--op",
+        vec![(op_key, sub(var(src_byte), var(dst_byte)))],
+        lit(1.0),
+    );
+
+    // Intermediate byte reads — these are NOT part of the dispatch
+    // family. The cabinet emits them as top-level assignments whose
+    // bodies are function calls that read memory through SI / DI.
+    let src_byte_body = call("--readMem", vec![add(mul(var(ds_seg), lit(16.0)), var(si_mirror))]);
+    let dst_byte_body = call("--readMem", vec![add(mul(var(es_seg), lit(16.0)), var(di_mirror))]);
+
+    // Flags slot: also part of the dispatch family (keyed on --op).
+    // For this opcode key, its body depends on `cmp_diff` (so the
+    // rep_type-vs-zf-bit identification can distinguish them).
+    let flags_dispatch = dispatch(
+        "--op",
+        vec![(op_key, var(cmp_diff))],
+        keep_self("--flags0"),
+    );
+
+    // zf_bit slot — top-level assignment that depends on `--flags`
+    // (and transitively on `cmp_diff` via the flags slot). The
+    // discriminator-identification rule uses this dependency to peel
+    // it away from the rep_type slot.
+    let zf_body = call("--bit", vec![var(flags_slot), lit(6.0)]);
+
+    // rep_type slot — top-level assignment whose body does NOT depend
+    // on the comparison output. A simple style-condition or a leaf var.
+    let rep_type_body = call("--readByte", vec![lit(0.0)]);
+
+    vec![
+        assign("--cx", cx_dispatch),
+        assign("--ip", ip_wrapped),
+        assign("--di", di_dispatch),
+        assign("--si", si_dispatch),
+        assign(cmp_diff, cmp_diff_dispatch),
+        assign(flags_slot, flags_dispatch),
+        assign(src_byte, src_byte_body),
+        assign(dst_byte, dst_byte_body),
+        assign(zf_bit, zf_body),
+        assign(rep_type, rep_type_body),
+    ]
+}
+
+#[test]
+fn comparison_shape_extracted_for_cmps_with_two_pointers() {
+    let asns = cabinet_cmps_shape_with_comparison(
+        "--ip0",
+        0xA6 as f64,
+        "--si0",
+        "--di0",
+        "--ds",
+        "--es",
+        "--srcByte",
+        "--dstByte",
+        "--cmpDiff",
+        "--repType",
+        "--zfBit",
+        "--flags",
+    );
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    let cmp = d
+        .comparison_shape
+        .as_ref()
+        .expect("comparison shape captured for CMPS");
+    assert_eq!(cmp.width, 1, "byte-step pointer → width 1");
+    // Pointer alphabetic sort: --di0 < --si0, so dst = di0, src = si0.
+    assert_eq!(cmp.dst_ptr_property, "--di0");
+    assert_eq!(cmp.dst_seg_property, "--es");
+    match &cmp.source {
+        ComparisonSource::Pointer { seg_property, ptr_property } => {
+            assert_eq!(ptr_property, "--si0");
+            assert_eq!(seg_property, "--ds");
+        }
+        other => panic!("expected ComparisonSource::Pointer, got {:?}", other),
+    }
+}
+
+#[test]
+fn comparison_shape_renaming_blind() {
+    // Identical structural cabinet, every slot renamed. The recogniser
+    // must produce a comparison shape using the new names — no character
+    // inspection.
+    let asns = cabinet_cmps_shape_with_comparison(
+        "--zorch_ip",
+        0xCC as f64,
+        "--zorch_src_ptr",
+        "--zorch_dst_ptr",
+        "--zorch_src_seg",
+        "--zorch_dst_seg",
+        "--zorch_src_byte",
+        "--zorch_dst_byte",
+        "--zorch_cmp_diff",
+        "--zorch_rep_type",
+        "--zorch_zf_bit",
+        "--zorch_flags",
+    );
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    let cmp = d
+        .comparison_shape
+        .as_ref()
+        .expect("comparison shape captured under renamed slots");
+    assert_eq!(cmp.width, 1);
+    // dst sort order: alphabetic. --zorch_dst_ptr < --zorch_src_ptr,
+    // so dst = zorch_dst_ptr.
+    assert_eq!(cmp.dst_ptr_property, "--zorch_dst_ptr");
+    assert_eq!(cmp.dst_seg_property, "--zorch_dst_seg");
+    match &cmp.source {
+        ComparisonSource::Pointer { seg_property, ptr_property } => {
+            assert_eq!(ptr_property, "--zorch_src_ptr");
+            assert_eq!(seg_property, "--zorch_src_seg");
+        }
+        other => panic!("expected ComparisonSource::Pointer, got {:?}", other),
+    }
+}
+
+#[test]
+fn comparison_shape_rep_type_property_identified_by_non_flag_dependence() {
+    let asns = cabinet_cmps_shape_with_comparison(
+        "--ip0",
+        0xA6 as f64,
+        "--si0",
+        "--di0",
+        "--ds",
+        "--es",
+        "--srcByte",
+        "--dstByte",
+        "--cmpDiff",
+        "--repType",
+        "--zfBit",
+        "--flags",
+    );
+    let descs = recognise_loops(&asns);
+    let d = &descs[0];
+    let cmp = d.comparison_shape.as_ref().expect("comparison shape captured");
+    assert_eq!(
+        cmp.rep_type_property.as_deref(),
+        Some("--repType"),
+        "rep_type slot identified as the predicate slot that varies across \
+         disjunctive branches AND whose body does not depend on the comparison output",
+    );
+}
+
+/// Build a SCAS-shape cabinet: one pointer (DI) + accumulator (AL).
+fn cabinet_scas_shape_with_comparison(
+    op_key: f64,
+    accumulator: &str,
+    di_mirror: &str,
+    es_seg: &str,
+    dst_byte: &str,
+    cmp_diff: &str,
+) -> Vec<Assignment> {
+    let branch_a = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq("--repType", 1.0),
+        style_eq("--zfBit", 1.0),
+    ]);
+    let branch_b = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq("--repType", 2.0),
+        style_eq("--zfBit", 0.0),
+    ]);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasRep", 1.0),
+        style_eq("--repInactive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--op",
+        vec![(op_key, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            op_key,
+            ip_body_multi(
+                vec![branch_a.clone(), branch_b.clone()],
+                "--ip0",
+                var("--pl"),
+                1,
+            ),
+        )],
+        keep_self("--ip0"),
+    );
+    let ip_wrapped = add(ip_inner, var("--pl"));
+    let di_dispatch = dispatch(
+        "--op",
+        vec![(
+            op_key,
+            pointer_body(
+                active_guard.clone(),
+                di_mirror,
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self(di_mirror),
+    );
+
+    // Comparison: `calc(var(accumulator) - var(dst_byte))`.
+    let cmp_diff_dispatch = dispatch(
+        "--op",
+        vec![(op_key, sub(var(accumulator), var(dst_byte)))],
+        lit(1.0),
+    );
+
+    // Intermediate dst byte read (through ES:DI).
+    let dst_byte_body = call("--readMem", vec![add(mul(var(es_seg), lit(16.0)), var(di_mirror))]);
+
+    // Flags slot depends on cmp_diff.
+    let flags_dispatch = dispatch(
+        "--op",
+        vec![(op_key, var(cmp_diff))],
+        keep_self("--flags0"),
+    );
+
+    let zf_body = call("--bit", vec![var("--flags"), lit(6.0)]);
+    let rep_type_body = call("--readByte", vec![lit(0.0)]);
+
+    vec![
+        assign("--cx", cx_dispatch),
+        assign("--ip", ip_wrapped),
+        assign("--di", di_dispatch),
+        assign(cmp_diff, cmp_diff_dispatch),
+        assign("--flags", flags_dispatch),
+        assign(dst_byte, dst_byte_body),
+        assign("--zfBit", zf_body),
+        assign("--repType", rep_type_body),
+    ]
+}
+
+#[test]
+fn comparison_shape_extracted_for_scas_with_accumulator() {
+    let asns = cabinet_scas_shape_with_comparison(
+        0xAE as f64,
+        "--AL",
+        "--di0",
+        "--es",
+        "--dstByte",
+        "--cmpDiff",
+    );
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    let cmp = d
+        .comparison_shape
+        .as_ref()
+        .expect("comparison shape captured for SCAS");
+    assert_eq!(cmp.width, 1);
+    assert_eq!(cmp.dst_ptr_property, "--di0");
+    assert_eq!(cmp.dst_seg_property, "--es");
+    match &cmp.source {
+        ComparisonSource::Accumulator { byte_property, word_property } => {
+            assert_eq!(byte_property, "--AL");
+            assert_eq!(word_property, "--AL");
+        }
+        other => panic!("expected ComparisonSource::Accumulator, got {:?}", other),
+    }
+}
+
+#[test]
+fn comparison_shape_none_when_no_comparison_member() {
+    // The CMPS test from earlier in the file builds a cabinet WITHOUT
+    // a --_cmpDiff-style member. The recogniser should set
+    // comparison_shape to None.
+    let descs = recognise_loops(&cabinet_cmps_shape());
+    assert_eq!(descs.len(), 1);
+    let d = &descs[0];
+    assert!(d.flag_conditioned, "predicate has multiple slots — flag_conditioned");
+    assert!(
+        d.comparison_shape.is_none(),
+        "no comparison member in the family → comparison_shape is None, got {:?}",
+        d.comparison_shape,
+    );
+}
+
+#[test]
+fn comparison_shape_none_for_non_flag_conditioned_loop() {
+    // STOSB-shape (Fill class): no comparison expected even if the
+    // cabinet happens to have a Sub-shaped slot elsewhere.
+    let descs = recognise_loops(&cabinet_a());
+    let stosb = descs.iter().find(|d| d.key_value == 0xAA).unwrap();
+    assert!(
+        stosb.comparison_shape.is_none(),
+        "STOSB is Fill-class, not flag-conditioned → no comparison shape",
+    );
+}
+
+#[test]
+fn comparison_shape_brainfuck_cabinet_extracts_equivalent_structure() {
+    // Cardinal-rule probe at the source: a cabinet using brainfuck-style
+    // slot names with the same structural shape must produce a
+    // structurally equivalent ComparisonShape (only the slot-name
+    // payloads differ).
+    let x86 = cabinet_cmps_shape_with_comparison(
+        "--ip0",
+        0xA6 as f64,
+        "--si0",
+        "--di0",
+        "--ds",
+        "--es",
+        "--srcByte",
+        "--dstByte",
+        "--cmpDiff",
+        "--repType",
+        "--zfBit",
+        "--flags",
+    );
+    let brainfuck = cabinet_cmps_shape_with_comparison(
+        "--tape_ip",
+        0x42 as f64,
+        "--tape_src_head",
+        "--tape_dst_head",
+        "--tape_src_page",
+        "--tape_dst_page",
+        "--tape_src_cell",
+        "--tape_dst_cell",
+        "--tape_diff",
+        "--tape_mode",
+        "--tape_zero_flag",
+        "--tape_status",
+    );
+    let dx = recognise_loops(&x86);
+    let db = recognise_loops(&brainfuck);
+    assert_eq!(dx.len(), 1);
+    assert_eq!(db.len(), 1);
+    let cx = dx[0].comparison_shape.as_ref().expect("x86 shape");
+    let cb = db[0].comparison_shape.as_ref().expect("brainfuck shape");
+    assert_eq!(cx.width, cb.width);
+    // Same shape variant (Pointer / Pointer).
+    assert!(
+        matches!(
+            (&cx.source, &cb.source),
+            (ComparisonSource::Pointer { .. }, ComparisonSource::Pointer { .. })
+        ),
+        "both must classify the source as Pointer",
+    );
+    // Both extract a rep_type slot (the one that varies across
+    // disjunctive branches AND doesn't depend on the comparison output).
+    assert!(cx.rep_type_property.is_some());
+    assert!(cb.rep_type_property.is_some());
+}
