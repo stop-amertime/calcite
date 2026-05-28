@@ -120,19 +120,12 @@ pub struct Evaluator {
     /// One entry per state-var slot that any edge writes to.
     input_edge_groups: Option<Vec<InputEdgeGroup>>,
     /// "Last apply wrote a non-zero value to at least one slot" flag.
-    /// Combined with `state.pseudo_active.is_empty()`, lets the per-tick
-    /// fast path short-circuit when nothing's pressed AND nothing was
-    /// pressed last tick (so no clear-to-zero is needed). Without this,
-    /// we'd have to write zero to every grouped slot on every empty
-    /// tick, which is the regression behaviour we're fixing.
+    /// Lets the apply path skip the clear-to-zero pre-pass when last
+    /// tick wrote nothing AND the active set is empty now. The dirty
+    /// bit on State (`pseudo_active_dirty`) gates entry to the apply
+    /// path; this flag refines the inner fast-out for "set is empty
+    /// and stays empty across reset frames" cases.
     last_apply_was_nonzero: bool,
-    /// Last observed `state.pseudo_active_gen` from a real apply.
-    /// `apply_input_edges` recomputes the per-slot sum and bumps this;
-    /// the gate skips the recompute when the generation hasn't changed.
-    /// During doomLoad the active set is stable for ~50 K ticks between
-    /// pulse-release boundaries — without the gen check we re-summed 59
-    /// edges every tick to produce the same result.
-    last_apply_gen: u32,
 }
 
 /// Compiled form of a `ParsedProgram::input_edges` entry. The
@@ -600,7 +593,6 @@ impl Evaluator {
             input_edge_bindings,
             input_edge_groups: None,
             last_apply_was_nonzero: false,
-            last_apply_gen: u32::MAX, // sentinel: forces first-tick recompute
         }
     }
 
@@ -626,41 +618,26 @@ impl Evaluator {
     /// call site so cabinets that never touch the input-edge path pay
     /// **zero** function-call overhead in the hot loop.
     ///
-    /// Returns true if the slow path must run. The conditions match
-    /// what the slow path would short-circuit on:
+    /// Steady-state cost: **one bool load + branch**. The gate state
+    /// lives on `State` (`pseudo_active_dirty`) and is flipped by
+    /// `set_pseudo_class_active`. The evaluator's
+    /// `input_edge_bindings.is_empty()` check is also a single
+    /// `Vec::len() == 0` so the overall sequence on a doom8088 doomLoad
+    /// tick is: load `Vec.len` (nonzero), short-circuit out via dirty
+    /// bit (false) — done.
     ///
-    /// - `input_edge_bindings.is_empty()` → no edges to apply (carts
-    ///   without `&:has(...)` rules; entire smoke set except doom8088).
-    /// - `pseudo_active.is_empty() && !last_apply_was_nonzero` → nothing
-    ///   pressed and nothing written non-zero last tick, so no slot
-    ///   needs clearing either. The common case on doom8088 during
-    ///   boot, level-load, and ingame-idle ticks.
-    ///
-    /// Crucially this is a sub-100-byte function with no loops and no
-    /// allocations — the inliner takes it at every call site, leaving
-    /// the per-tick cost as a handful of field-load-and-compare wasm
-    /// ops. The original `apply_input_edges` was too large for the
-    /// inliner's default heuristic, so calling it added a real
-    /// function-call frame to every tick (~50 wasm ops × 34M ticks ≈
-    /// ~4 seconds of overhead measured 2026-05-22 on doom-loading
-    /// web bench, recovered to master parity by this split).
+    /// We removed the `pseudo_active_gen` u32 counter that previously
+    /// gated this — it required loading two u32s + a compare. A bool
+    /// is half the bandwidth and the compiler folds it directly into a
+    /// `test/jz` (x86) / `i32.eqz` (wasm).
     #[inline(always)]
     fn needs_input_edge_apply(&self, state: &State) -> bool {
         if self.input_edge_bindings.is_empty() {
             return false;
         }
-        // Cheap per-tick gate: skip the apply if the active set hasn't
-        // changed since our last recompute AND we don't need to clear
-        // last tick's writes. The gen counter on State is bumped only
-        // by `set_pseudo_class_active` mutations, so 99 %+ of doomLoad
-        // ticks short-circuit here. (Sentinel `u32::MAX` on first call
-        // forces a recompute so lazy grouping happens.)
-        if state.pseudo_active_gen == self.last_apply_gen {
-            return false;
-        }
-        // Generation moved (or sentinel/first-call). Drop into the
-        // slow path unless we know there's literally nothing to do.
-        !(state.pseudo_active.is_empty() && !self.last_apply_was_nonzero)
+        // Dirty bit set by `set_pseudo_class_active` on real mutation.
+        // Stays cleared while the host doesn't touch the active set.
+        state.pseudo_active_dirty
     }
 
     /// Apply input-edge bindings to state vars. For each gated state-var
@@ -759,9 +736,10 @@ impl Evaluator {
             }
         }
         self.last_apply_was_nonzero = any_nonzero;
-        // Record the generation we just reflected; future ticks with
-        // the same gen skip the recompute via `needs_input_edge_apply`.
-        self.last_apply_gen = state.pseudo_active_gen;
+        // Clear the host-side dirty bit: we've now reflected the active
+        // set into the gated slots. Subsequent ticks short-circuit at
+        // the gate until `set_pseudo_class_active` flips it back.
+        state.pseudo_active_dirty = false;
     }
 
     /// Register a pre-tick hook that is called before each tick.
@@ -2405,7 +2383,6 @@ mod tests {
             input_edge_bindings: Vec::new(),
             input_edge_groups: None,
             last_apply_was_nonzero: false,
-            last_apply_gen: u32::MAX, // sentinel: forces first-tick recompute
         };
         (evaluator, state)
     }

@@ -109,13 +109,16 @@ pub struct State {
     /// (`apply_input_edges` in the evaluator) can short-circuit on
     /// `pseudo_active.is_empty()` without allocating lookup keys.
     pub pseudo_active: std::collections::HashSet<(String, String)>,
-    /// Monotonic counter bumped on every mutation of `pseudo_active`.
-    /// The evaluator caches `apply_input_edges` results keyed by this
-    /// generation, so unchanged-set ticks skip recomputation entirely.
-    /// During doomLoad the active set stays stable for tens of thousands
-    /// of ticks at a time between pulse releases; without this cache,
-    /// we re-summed 59 edges every tick for no observable change.
-    pub pseudo_active_gen: u32,
+    /// Single-bit dirty flag: `true` when the active set has mutated
+    /// since the last `apply_input_edges`. Set by `set_pseudo_class_active`
+    /// on a real change; cleared by `apply_input_edges` after it processes
+    /// the new state. The per-tick gate collapses to a single bool load.
+    ///
+    /// Starts `true` so the very first tick triggers lazy-init of the
+    /// evaluator's `input_edge_groups`. After that, doomLoad's tens of
+    /// thousands of ticks between pulses all see `false` and skip the
+    /// slow path without touching the HashSet or comparing counters.
+    pub pseudo_active_dirty: bool,
 }
 
 /// A "window of bytes addressed by an in-memory key" — a CSS shape where a
@@ -167,7 +170,8 @@ impl State {
             packed_cell_size: 0,
             windowed_byte_array: None,
             pseudo_active: std::collections::HashSet::new(),
-            pseudo_active_gen: 0,
+            // Start dirty so the first tick triggers lazy edge-group init.
+            pseudo_active_dirty: true,
         }
     }
 
@@ -277,7 +281,7 @@ impl State {
             self.pseudo_active.remove(&(pseudo.to_string(), selector.to_string()))
         };
         if changed {
-            self.pseudo_active_gen = self.pseudo_active_gen.wrapping_add(1);
+            self.pseudo_active_dirty = true;
         }
     }
 
