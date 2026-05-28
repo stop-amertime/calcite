@@ -471,6 +471,7 @@ fn main() {
     let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
     evaluator.wire_state_for_packed_memory(&mut state);
     evaluator.wire_state_for_windowed_byte_array(&mut state);
+    evaluator.wire_state_for_input_edges(&mut state);
     if let Some(path) = &args.restore {
         match std::fs::read(path) {
             Ok(bytes) => match state.restore(&bytes) {
@@ -538,6 +539,7 @@ fn main() {
             evaluator = calcite_core::Evaluator::from_parsed(&parsed);
             evaluator.wire_state_for_packed_memory(&mut state);
             evaluator.wire_state_for_windowed_byte_array(&mut state);
+            evaluator.wire_state_for_input_edges(&mut state);
             if let Some(path) = &args.restore {
                 if let Ok(bytes) = std::fs::read(path) {
                     state.restore(&bytes).ok();

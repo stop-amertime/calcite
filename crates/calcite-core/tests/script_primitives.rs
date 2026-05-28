@@ -71,7 +71,7 @@ fn stride_fires_every_n_ticks_against_real_engine() {
     let mut reg = WatchRegistry::new();
     reg.register(WatchSpec {
         name: "every100".to_string(),
-        kind: WatchKind::Stride { every: 100 },
+        kind: WatchKind::Stride { every: 100, last_fired_at: Cell::new(0) },
         gate: None,
         actions: vec![Action::Emit],
         sample_vars: vec!["n".to_string()],
@@ -97,7 +97,7 @@ fn cond_fires_once_when_byte_predicate_holds() {
     // Cheap stride watch that gates the expensive cond.
     reg.register(WatchSpec {
         name: "poll".to_string(),
-        kind: WatchKind::Stride { every: 50 },
+        kind: WatchKind::Stride { every: 50, last_fired_at: Cell::new(0) },
         gate: None,
         actions: vec![],
         sample_vars: vec![],
@@ -147,7 +147,7 @@ fn edge_fires_on_zero_to_one_transition() {
     let mut reg = WatchRegistry::new();
     reg.register(WatchSpec {
         name: "poll".to_string(),
-        kind: WatchKind::Stride { every: 1 },
+        kind: WatchKind::Stride { every: 1, last_fired_at: Cell::new(0) },
         gate: None,
         actions: vec![],
         sample_vars: vec![],
@@ -277,7 +277,7 @@ fn cond_with_byte_pattern_at() {
     let mut reg = WatchRegistry::new();
     reg.register(WatchSpec {
         name: "poll".to_string(),
-        kind: WatchKind::Stride { every: 25 },
+        kind: WatchKind::Stride { every: 25, last_fired_at: Cell::new(0) },
         gate: None,
         actions: vec![],
         sample_vars: vec![],
@@ -487,7 +487,7 @@ fn sustain_cond_pulse_alternates_make_and_break_at_2x_poll_stride() {
     // stride the doom bench uses; same shape, faster test).
     reg.register(WatchSpec {
         name: "poll".to_string(),
-        kind: WatchKind::Stride { every: 100 },
+        kind: WatchKind::Stride { every: 100, last_fired_at: Cell::new(0) },
         gate: None,
         actions: vec![],
         sample_vars: vec![],

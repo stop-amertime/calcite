@@ -11,6 +11,154 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-28 — input-edge apply moved off per-tick path (Phase 4)
+
+Branch `feat/keyboard-pseudo-input`. Cross-link: CSS-DOS LOGBOOK
+2026-05-28.
+
+The per-tick `needs_input_edge_apply` gate + `apply_input_edges` body
+ran on every tick (~34 M times per doom-loading run). After the 2026-05-26
+fix the gate was cheap (a gen-counter compare, then a bool fast-path),
+but the bandwidth still cost something on the web bench: 9-run avg
+~377 K t/s vs the 2026-05-08 master baseline of ~446 K t/s.
+
+Two commits in this session:
+
+1. **`dcc7dd5` — Phase 1: collapse gate to single bool field load.**
+   Replaced `pseudo_active_gen: u32` on State + `last_apply_gen: u32`
+   on Evaluator with `pseudo_active_dirty: bool` on State. The gate
+   read becomes one byte load + branch instead of two u32 loads +
+   compare. Native A/B (6 runs) showed wash within noise — confirmed
+   the gate cost was not the binding constraint. Kept anyway: simpler
+   shape, sets up Phase 4.
+
+2. **`f4da585` — Phase 4: apply-on-transition.** Moved the entire
+   apply path off the per-tick loop. `State::set_pseudo_class_active`
+   now directly recomputes the affected gated state-var slots at the
+   moment of mutation. Per-tick cost is zero — no gate, no apply.
+
+   Mechanics:
+   - `State::input_edge_groups: Vec<InputEdgeGroup>` installed by
+     `Evaluator::wire_state_for_input_edges(&mut state)` at engine
+     construction (and on `reset()`). Same wiring pattern as
+     `wire_state_for_packed_memory` / `windowed_byte_array`.
+   - `set_pseudo_class_active` toggles HashSet membership, then for
+     each group sums values of edges whose `(pseudo, selector)` is
+     currently active and writes the slot. Inverted iteration over
+     the small active set avoids HashSet allocations.
+
+   Deletions: `needs_input_edge_apply` gate, `apply_input_edges`
+   body, `build_input_edge_groups` helper, `InputEdgeGroup` /
+   `InputEdgeGroupEntry` structs (moved to state.rs, pub),
+   `input_edge_groups` / `last_apply_was_nonzero` / `pseudo_active_dirty`
+   fields, 4 per-tick call sites. Net −73 lines.
+
+Web doom-loading bench (4 runs after Phase 4):
+- 394 K / 87.0 s
+- 431 K / 79.4 s
+- 436 K / 79.5 s
+- 432 K / 79.9 s
+
+Median ~432 K / ~79.5 s, vs 2026-05-08 master baseline 446 K / 77.1 s.
+**Within ~3 % of master** on doomLoad-shape work. Smoke 7/7 PASS.
+Unit + integration input-edge tests pass.
+
+Cabinet-genericity preserved: the apply path operates over CSS pseudo
+classes, selectors, and state-var slots — no knowledge of what those
+slots represent above the CSS layer.
+
+---
+
+## 2026-05-26 — apply_input_edges hot-path: inversion + gen cache (doomLoad fix)
+
+Branch `feat/keyboard-pseudo-input`. Cross-link: CSS-DOS LOGBOOK
+2026-05-26.
+
+The 2026-05-22 inline-gate fix (`763d6cd`) recovered the boot path but
+did NOT fix the doomLoad-phase regression. Root cause for the residual:
+during doomLoad the `doom-all` bench's `title_tap` watch fires every
+poll (cond `menuactive=0,gamestate=3,bdamode=0x13,repeat`), so
+`pseudo_active` is non-empty most of the time and the body of
+`apply_input_edges` runs every tick. Each tick walked all 59 input
+edges and called `state.pseudo_class_active_pair(&pseudo, &selector)`,
+which did `self.pseudo_active.contains(&(p.to_string(), s.to_string()))`
+— two `String::from(&str)` allocations per lookup, 118 allocations per
+tick, ~30 M/sec at 250 K t/s. **That** was the doomLoad bottleneck.
+
+Two changes in this commit:
+
+1. **Inverted iteration.** The slow path now walks `pseudo_active`
+   (small — 0-2 entries during gameplay) and looks up matching edges
+   by reference-compare, rather than walking every edge and probing
+   the HashSet. Zero allocations on the hot path.
+
+2. **Generation cache.** Added `State::pseudo_active_gen` bumped on
+   every mutation, and `Evaluator::last_apply_gen` recording the gen
+   at the last apply. `needs_input_edge_apply` now short-circuits on
+   `gen == last_apply_gen` — so during the long quiet stretches
+   between pulse-release boundaries (~50 K ticks at a time), we skip
+   the recompute entirely.
+
+Bench numbers on doom-all web (5 runs each, post-fix vs the fresh-wasm
+pre-fix baseline established the same day):
+
+| Metric          | pre-fix avg | post-fix avg | master 2026-05-08 |
+|-----------------|------------:|-------------:|------------------:|
+| runMsToInGame   | 174.6 s     | ~92 s        | 77.1 s            |
+| doomLoad        | 155.1 s     | ~78 s        | 70.0 s            |
+| ticksPerSecAvg  | 193 K       | ~377 K       | ~446 K            |
+| ingameFps       | 0.50        | 0.9-1.7      | ~1.9              |
+
+Most of the 1.78× regression closed. Residual ~12 % gap vs master is
+within the range plausibly explained by struct-layout cache effects
+from the additional `pseudo_active` HashSet field — not worth chasing
+unless it widens.
+
+Files: `crates/calcite-core/src/{eval.rs,state.rs}`. Unit tests:
+`input_edges_drive_state_var` still passes (it tests the apply path
+end-to-end including the new inversion + gen-cache).
+
+## 2026-05-19 — script: WatchKind::Stride regression fix (wasm poll cadence)
+
+Branch `feat/keyboard-pseudo-input`. Cross-link: CSS-DOS
+`docs/logbook/LOGBOOK.md` 2026-05-19 (same investigation, the
+companion bridge fix lives there).
+
+`baf3086` ("keyboard: :active pseudo-class input model, split from
+genericity bundle") silently reverted `WatchKind::Stride` from the
+elapsed-since-last-fire form (introduced by `e442f74`) back to
+`tick % every == 0`. The CLI watch runner is immune — it advances
+its cursor in `min_stride`-sized steps, so the tick passed to
+`poll()` is always a multiple of `every`. The wasm path
+(`run_batch_watched`) polls at `frame_counter + cumulative chunk`
+boundaries that are adaptively sized and essentially never a
+multiple of 50_000, so `tick % 50_000 == 0` was almost never true:
+the `poll` stride watch never fired, every `gate=poll` cond watch
+(title/menu/loading/ingame in the CSS-DOS doom-loading profile)
+starved, and the web bench appeared stuck even though the engine
+was executing fine (1B+ cycles, mode 0x13).
+
+Fix: restored the elapsed-since-last-fire `Stride { every,
+last_fired_at: Cell<u32> }` form across `script.rs` (enum + doc),
+`script_eval.rs` (evaluate logic), `script_spec.rs` (parse
+constructor + test pattern), `tests/script_primitives.rs` (5
+constructors), and the `calcite-cli` `min_stride` match arm
+(`{ every, .. }`). Added `script_eval::tests::
+stride_fires_on_unaligned_poll_cadence` — polls at a 137-tick
+cadence (never a multiple of `every`) and asserts the watch still
+fires, reproducing the exact wasm failure mode (would fail on the
+`% ` form, passes now). 17 script tests green.
+
+This was not a keyboard bug. The keyboard input model
+(`:has(#kb-X:active)` → input-edge recogniser → pre-tick
+`apply_input_edges`) is sound: a clean CLI `doom-loading` run
+reaches in-game at tick 34,650,000 — exact parity with the
+2026-05-02 `setvar_pulse` baseline. The prior "keyboard stuck at
+title" finding was wrong; the symptom was this stride regression
+(web) plus a CSS-DOS-side bench-run watch-wipe (logged CSS-DOS
+side). Post-fix the web `doom-loading` bench reaches in-game at
+tick 34,294,512 (`ok:true`, all six stages fire).
+
 ## 2026-05-18 — genericity↔perf cost isolated (cross-cutting)
 
 Cross-link: CSS-DOS

@@ -36,8 +36,15 @@ pub fn poll(reg: &mut WatchRegistry, state: &mut State, tick: u32) {
         let mut keep: Vec<PendingRelease> = Vec::with_capacity(reg.pending_releases.len());
         for pr in std::mem::take(&mut reg.pending_releases) {
             if tick >= pr.release_tick {
-                state.set_var(&pr.var_name, 0);
-                reg.released_this_poll.push(pr.var_name);
+                match &pr.kind {
+                    PendingReleaseKind::Var { name } => {
+                        state.set_var(name, 0);
+                    }
+                    PendingReleaseKind::Pseudo { pseudo, selector } => {
+                        state.set_pseudo_class_active(pseudo, selector, false);
+                    }
+                }
+                reg.released_this_poll.push(pr.kind);
             } else {
                 keep.push(pr);
             }
@@ -280,21 +287,49 @@ fn evaluate_watch(
                 // sees: pulse → batch ticks → release → batch ticks
                 // → pulse → ... — a clean make/break/make/break
                 // cadence at 2× the gating poll-stride.
+                let target = PendingReleaseKind::Var { name: name.clone() };
                 let already_pending = reg.pending_releases
                     .iter()
-                    .any(|pr| pr.var_name == *name)
+                    .any(|pr| pr.kind.same_target(&target))
                     || pending_pulse_releases
                         .iter()
-                        .any(|pr| pr.var_name == *name);
+                        .any(|pr| pr.kind.same_target(&target));
                 let just_released = reg.released_this_poll
                     .iter()
-                    .any(|n| n == name);
+                    .any(|k| k.same_target(&target));
                 if !already_pending && !just_released {
                     // Make edge: write the value now.
                     state.set_var(name, *value);
                     pending_pulse_releases.push(PendingRelease {
                         release_tick: tick.saturating_add(*hold_ticks),
-                        var_name: name.clone(),
+                        kind: target,
+                    });
+                }
+            }
+            Action::PseudoActivePulse { pseudo, selector, hold_ticks } => {
+                // Same skip-if-pending shape as SetVarPulse but on the
+                // pseudo-class surface. `set_pseudo_class_active` flips
+                // the host-state edge; calcite's input-edge recogniser
+                // converts that into the cabinet's CSS-declared property
+                // value at the next `apply_input_edges` (pre-tick).
+                let target = PendingReleaseKind::Pseudo {
+                    pseudo: pseudo.clone(),
+                    selector: selector.clone(),
+                };
+                let already_pending = reg.pending_releases
+                    .iter()
+                    .any(|pr| pr.kind.same_target(&target))
+                    || pending_pulse_releases
+                        .iter()
+                        .any(|pr| pr.kind.same_target(&target));
+                let just_released = reg.released_this_poll
+                    .iter()
+                    .any(|k| k.same_target(&target));
+                if !already_pending && !just_released {
+                    state.set_pseudo_class_active(pseudo, selector, true);
+                    pending_pulse_releases.push(PendingRelease {
+                        release_tick: tick.saturating_add(*hold_ticks),
+                        kind: target,
                     });
                 }
             }
@@ -418,6 +453,37 @@ mod tests {
     }
 
     #[test]
+    fn stride_fires_on_unaligned_poll_cadence() {
+        // Regression: the wasm bridge calls poll() at adaptive batch
+        // boundaries that are NOT multiples of `every`. A `tick % every
+        // == 0` check would never fire here; elapsed-since-last-fire
+        // must. Poll cadence below is deliberately coprime-ish to 100.
+        let mut reg = WatchRegistry::new();
+        reg.register(WatchSpec {
+            name: "tick100".to_string(),
+            kind: WatchKind::Stride { every: 100, last_fired_at: std::cell::Cell::new(0) },
+            gate: None,
+            actions: vec![Action::Emit],
+            sample_vars: Vec::new(),
+        });
+        let mut state = empty_state();
+        let mut count = 0;
+        // Poll at 137, 274, 411, ... — never a multiple of 100.
+        let mut tick = 0u32;
+        while tick <= 10_000 {
+            tick += 137;
+            poll(&mut reg, &mut state, tick);
+            count += reg.drain_events().len();
+        }
+        // 10_000 / 100 = 100 stride windows; with a 137-tick poll step
+        // the watch fires once per poll once a full `every` has elapsed
+        // since the last fire. It must fire substantially (not zero,
+        // which is the bug) — at least once per ~137-tick window past
+        // the first, i.e. ~70+.
+        assert!(count >= 70, "stride starved on unaligned poll: only {count} fires");
+    }
+
+    #[test]
     fn burst_fires_count_consecutive() {
         let mut reg = WatchRegistry::new();
         reg.register(WatchSpec {
@@ -455,6 +521,39 @@ mod tests {
         }
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tick, 500);
+    }
+
+    #[test]
+    fn pseudo_pulse_make_then_release() {
+        // Schedule a pseudo_pulse at tick 100 with hold=50. Verify
+        // (a) the (active, kb-1) edge flips on at tick 100,
+        // (b) it stays on through tick 149,
+        // (c) it flips off at tick ≥ 150.
+        let mut reg = WatchRegistry::new();
+        reg.register(WatchSpec {
+            name: "tap".to_string(),
+            kind: WatchKind::At { tick: 100 },
+            gate: None,
+            actions: vec![Action::PseudoActivePulse {
+                pseudo: "active".to_string(),
+                selector: "kb-1".to_string(),
+                hold_ticks: 50,
+            }],
+            sample_vars: Vec::new(),
+        });
+        let mut state = empty_state();
+        // Pre-fire: edge inactive.
+        poll(&mut reg, &mut state, 99);
+        assert!(!state.pseudo_class_active("active", "kb-1"));
+        // At tick 100 the watch fires; make-edge flips on.
+        poll(&mut reg, &mut state, 100);
+        assert!(state.pseudo_class_active("active", "kb-1"));
+        // Mid-hold: still active.
+        poll(&mut reg, &mut state, 149);
+        assert!(state.pseudo_class_active("active", "kb-1"));
+        // Past release_tick (100+50=150): release flips off.
+        poll(&mut reg, &mut state, 150);
+        assert!(!state.pseudo_class_active("active", "kb-1"));
     }
 
     #[test]

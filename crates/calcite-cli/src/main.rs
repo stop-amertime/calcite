@@ -116,16 +116,20 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     framebuffer_out: Option<String>,
 
-    /// Inject keyboard events at specific ticks.
+    /// Inject pseudo-class press/release events at specific ticks.
     ///
-    /// Format: TICK:VALUE,TICK:VALUE,...
-    /// VALUE is (scancode<<8)|ascii in decimal or 0x hex.
-    /// Use VALUE=0 for key release.
+    /// Format: TICK:[+|-]SELECTOR,TICK:[+|-]SELECTOR,...
+    /// `+` (or no prefix) presses; `-` releases. SELECTOR is the id-
+    /// selector text without the leading `#` (e.g. `kb-a`). The event
+    /// flips the (`active`, SELECTOR) pseudo-class match edge on
+    /// `state.pseudo_active`; the cabinet's
+    /// `&:has(#SELECTOR:active) { --PROP: V }` rule produces V via
+    /// calcite's input-edge recogniser.
     ///
-    /// Example: --key-events=50:0x1E61,100:0
-    /// Injects key 'a' (scan=0x1E, ascii=0x61) at tick 50, release at tick 100.
+    /// Example: `--press-events=50:kb-a,100:-kb-a`
+    /// Presses kb-a at tick 50, releases at tick 100.
     #[arg(long, value_name = "EVENTS")]
-    key_events: Option<String>,
+    press_events: Option<String>,
 
     /// Dump a flat byte range of guest memory to a binary file at end of run.
     ///
@@ -269,6 +273,77 @@ struct Cli {
     measure_out: Option<PathBuf>,
 }
 
+
+/// Map a crossterm key event to a CSS-DOS-style id selector
+/// (`kb-X`) without the leading `#`. Returns `None` for unmapped
+/// keys. Mirrors the selector set kiln emits via
+/// `template.mjs::KEYBOARD_KEYS`. The cabinet's
+/// `&:has(#SEL:active) { --keyboard: V }` rules supply the
+/// (scancode<<8)|ascii value when calcite flips the pseudo edge.
+fn key_to_selector(key: &KeyEvent) -> Option<&'static str> {
+    use KeyCode::*;
+    Some(match key.code {
+        Esc => "kb-esc",
+        Char('1') | Char('!') => "kb-1",
+        Char('2') | Char('@') => "kb-2",
+        Char('3') | Char('#') => "kb-3",
+        Char('4') | Char('$') => "kb-4",
+        Char('5') | Char('%') => "kb-5",
+        Char('6') | Char('^') => "kb-6",
+        Char('7') | Char('&') => "kb-7",
+        Char('8') | Char('*') => "kb-8",
+        Char('9') | Char('(') => "kb-9",
+        Char('0') | Char(')') => "kb-0",
+        Backspace => "kb-bksp",
+        Tab => "kb-tab",
+        Char('q') | Char('Q') => "kb-q",
+        Char('w') | Char('W') => "kb-w",
+        Char('e') | Char('E') => "kb-e",
+        Char('r') | Char('R') => "kb-r",
+        Char('t') | Char('T') => "kb-t",
+        Char('y') | Char('Y') => "kb-y",
+        Char('u') | Char('U') => "kb-u",
+        Char('i') | Char('I') => "kb-i",
+        Char('o') | Char('O') => "kb-o",
+        Char('p') | Char('P') => "kb-p",
+        Enter => "kb-enter",
+        Char('a') | Char('A') => "kb-a",
+        Char('s') | Char('S') => "kb-s",
+        Char('d') | Char('D') => "kb-d",
+        Char('f') | Char('F') => "kb-f",
+        Char('g') | Char('G') => "kb-g",
+        Char('h') | Char('H') => "kb-h",
+        Char('j') | Char('J') => "kb-j",
+        Char('k') | Char('K') => "kb-k",
+        Char('l') | Char('L') => "kb-l",
+        Char('z') | Char('Z') => "kb-z",
+        Char('x') | Char('X') => "kb-x",
+        Char('c') | Char('C') => "kb-c",
+        Char('v') | Char('V') => "kb-v",
+        Char('b') | Char('B') => "kb-b",
+        Char('n') | Char('N') => "kb-n",
+        Char('m') | Char('M') => "kb-m",
+        Char(',') | Char('<') => "kb-comma",
+        Char('.') | Char('>') => "kb-period",
+        Char('/') | Char('?') => "kb-slash",
+        Char(' ') => "kb-space",
+        Up => "kb-up",
+        Down => "kb-down",
+        Left => "kb-left",
+        Right => "kb-right",
+        F(1) => "kb-f1",
+        F(2) => "kb-f2",
+        F(3) => "kb-f3",
+        F(4) => "kb-f4",
+        F(5) => "kb-f5",
+        F(6) => "kb-f6",
+        F(7) => "kb-f7",
+        F(8) => "kb-f8",
+        F(9) => "kb-f9",
+        F(10) => "kb-f10",
+        _ => return None,
+    })
+}
 
 /// Map a crossterm key event to DOS keyboard value: (scancode << 8) | ascii.
 /// Returns 0 for unmapped keys.
@@ -518,6 +593,11 @@ fn main() {
             // flat-array dispatch — see
             // Evaluator::wire_state_for_windowed_byte_array.
             evaluator.wire_state_for_windowed_byte_array(&mut state);
+            // Input-edge groups: resolve `&:has(#X:pseudo) { --P: V }`
+            // bindings to their target state-var slots so
+            // `state.set_pseudo_class_active(...)` can write the slot
+            // directly. No per-tick apply path needed after this.
+            evaluator.wire_state_for_input_edges(&mut state);
 
             // --restore: replay a previously-captured execution state into
             // the freshly-wired engine. This must run AFTER load_properties
@@ -572,23 +652,44 @@ fn main() {
                 }
             });
 
-            // Parse --key-events=TICK:VALUE,TICK:VALUE,...
-            let key_events: Vec<(u32, i32)> = cli.key_events.as_ref().map(|s| {
+            /// Apply any press-events scheduled for `tick` to `state`.
+            /// Each event is (tick, selector, active); only events
+            /// whose tick matches fire.
+            fn apply_press_events(
+                events: &[(u32, String, bool)],
+                tick: u32,
+                state: &mut calcite_core::State,
+            ) {
+                for (ev_tick, sel, active) in events {
+                    if *ev_tick == tick {
+                        state.set_pseudo_class_active("active", sel, *active);
+                    }
+                }
+            }
+
+            // Parse --press-events=TICK:[+|-]SELECTOR,TICK:[+|-]SELECTOR,...
+            // Each event is (tick, selector, active). `+` or no prefix
+            // means press; `-` means release. The pseudo-class is
+            // always "active".
+            let press_events: Vec<(u32, String, bool)> = cli.press_events.as_ref().map(|s| {
                 s.split(',')
                     .filter(|part| !part.is_empty())
                     .map(|part| {
-                        let (tick_str, val_str) = part.split_once(':')
-                            .unwrap_or_else(|| panic!("Invalid key-event format: {}", part));
+                        let (tick_str, sel_part) = part.split_once(':')
+                            .unwrap_or_else(|| panic!("Invalid press-event format: {part:?}"));
                         let tick: u32 = tick_str.parse()
-                            .unwrap_or_else(|_| panic!("Invalid tick in key-event: {}", tick_str));
-                        let val: i32 = if val_str.starts_with("0x") || val_str.starts_with("0X") {
-                            i32::from_str_radix(&val_str[2..], 16)
-                                .unwrap_or_else(|_| panic!("Invalid hex value in key-event: {}", val_str))
+                            .unwrap_or_else(|_| panic!("Invalid tick in press-event: {tick_str:?}"));
+                        let (active, sel) = if let Some(rest) = sel_part.strip_prefix('-') {
+                            (false, rest.to_string())
+                        } else if let Some(rest) = sel_part.strip_prefix('+') {
+                            (true, rest.to_string())
                         } else {
-                            val_str.parse()
-                                .unwrap_or_else(|_| panic!("Invalid value in key-event: {}", val_str))
+                            (true, sel_part.to_string())
                         };
-                        (tick, val)
+                        if sel.is_empty() {
+                            panic!("Empty selector in press-event: {part:?}");
+                        }
+                        (tick, sel, active)
                     })
                     .collect()
             }).unwrap_or_default();
@@ -776,13 +877,9 @@ fn main() {
                 for &target in &dump_targets {
                     // Advance from cursor to target. Run tick-by-tick when key events
                     // need injection; otherwise use run_batch + a final tick.
-                    if !key_events.is_empty() {
+                    if !press_events.is_empty() {
                         for tick in cursor..target {
-                            for &(ev_tick, ev_val) in &key_events {
-                                if ev_tick == tick {
-                                    state.set_var("keyboard", ev_val);
-                                }
-                            }
+                            apply_press_events(&press_events, tick, &mut state);
                             evaluator.tick(&mut state);
                         }
                     } else if target > cursor {
@@ -990,9 +1087,7 @@ fn main() {
                 println!(" | {} {}", cs0, ip0);
 
                 for tick in 1..=ticks_limit {
-                    for &(ev_tick, ev_val) in &key_events {
-                        if ev_tick == tick { state.set_var("keyboard", ev_val); }
-                    }
+                    apply_press_events(&press_events, tick, &mut state);
                     evaluator.tick(&mut state);
                     let mut any_change = false;
                     let mut now: Vec<i32> = Vec::with_capacity(watched.len());
@@ -1051,9 +1146,7 @@ fn main() {
                 let mut prev_halt: i32 = halt_slot.map(|i| state.state_vars[i]).unwrap_or(0);
                 eprintln!("# trace-halt: running tick-by-tick from {} to {}", start_tick, ticks_limit);
                 for tick in start_tick..=ticks_limit {
-                    for &(ev_tick, ev_val) in &key_events {
-                        if ev_tick == tick { state.set_var("keyboard", ev_val); }
-                    }
+                    apply_press_events(&press_events, tick, &mut state);
                     evaluator.tick(&mut state);
                     // Read each watched state-var.
                     let vals: Vec<i32> = slots.iter()
@@ -1093,12 +1186,7 @@ fn main() {
                 let halt_check = halt_addr;
                 print!("[");
                 for tick in 0..ticks_limit {
-                    // Inject keyboard events at the right tick
-                    for &(ev_tick, ev_val) in &key_events {
-                        if ev_tick == tick {
-                            state.set_var("keyboard", ev_val);
-                        }
-                    }
+                    apply_press_events(&press_events, tick, &mut state);
                     evaluator.tick(&mut state);
                     if tick > 0 { print!(","); }
                     print!("{{\"tick\":{}", tick);
@@ -1122,7 +1210,7 @@ fn main() {
             let mut ticks_run: u32 = 0;
             let mut first_frame = true;
             let screen_interval = cli.screen_interval;
-            let needs_per_tick = cli.verbose || halt_addr.is_some() || (interactive && screen_interval > 0) || !key_events.is_empty();
+            let needs_per_tick = cli.verbose || halt_addr.is_some() || (interactive && screen_interval > 0) || !press_events.is_empty();
 
             // Rolling speed measurement: track ticks at the last render
             let mut last_render_time = t2;
@@ -1187,6 +1275,7 @@ fn main() {
                 // not enough on its own.
                 const KBD_HOLD_TICKS: u32 = 5000;
                 let mut pending_release_tick: Option<u32> = None;
+                let mut held_selector: Option<&'static str> = None;
                 while tick < ticks_limit {
                     if interactive {
                         // Poll keyboard non-blocking.
@@ -1199,38 +1288,45 @@ fn main() {
                                         quit = true;
                                         break;
                                     }
-                                    let dos_key = key_to_dos(&key_event);
-                                    if dos_key != 0 {
-                                        // Press: drive --keyboard. The CSS
-                                        // edge detector fires IRQ 1, the ISR
-                                        // (corduroy or DOOM-installed) reads
-                                        // port 0x60 and processes the scan
-                                        // code. Also push into the BDA ring
-                                        // for INT 16h-based programs.
-                                        state.set_var("keyboard", dos_key);
-                                        state.bda_push_key(dos_key);
+                                    if let Some(sel) = key_to_selector(&key_event) {
+                                        // Press: flip the (active, kb-X) edge.
+                                        // The cabinet's
+                                        // `&:has(#kb-X:active) { --keyboard: V }`
+                                        // rule produces V via calcite's
+                                        // input-edge recogniser; the engine's
+                                        // edge detector then fires IRQ 1, etc.
+                                        // BDA ring push covers INT 16h-only
+                                        // programs that don't hook IRQ 1.
+                                        state.set_pseudo_class_active("active", sel, true);
+                                        let dos_key = key_to_dos(&key_event);
+                                        if dos_key != 0 {
+                                            state.bda_push_key(dos_key);
+                                        }
+                                        held_selector = Some(sel);
                                         pending_release_tick = Some(tick.saturating_add(KBD_HOLD_TICKS));
                                     }
                                 }
                             }
                         }
                         if quit { break; }
-                        // Fire scheduled release: --keyboard back to 0 so
-                        // --_kbdRelease edge fires, port 0x60 returns the
-                        // break code (scan|0x80) on the resulting IRQ 1.
+                        // Fire scheduled release: pseudo edge inactive so the
+                        // cabinet sees --keyboard return to 0 and
+                        // `--_kbdRelease` fires.
                         if let Some(rt) = pending_release_tick {
                             if tick >= rt {
-                                state.set_var("keyboard", 0);
+                                if let Some(sel) = held_selector.take() {
+                                    state.set_pseudo_class_active("active", sel, false);
+                                }
                                 pending_release_tick = None;
                             }
                         }
                     }
 
                     // Determine this batch's size: capped by remaining ticks and
-                    // by the next scripted key_event (if any).
+                    // by the next scripted press-event (if any).
                     let mut batch = batch_cap.min(ticks_limit - tick);
-                    for &(ev_tick, _) in &key_events {
-                        if ev_tick >= tick && ev_tick < tick + batch {
+                    for (ev_tick, _, _) in &press_events {
+                        if *ev_tick >= tick && *ev_tick < tick + batch {
                             batch = ev_tick - tick;
                             if batch == 0 { batch = 1; break; } // fire this tick immediately
                         }
@@ -1245,12 +1341,8 @@ fn main() {
                     }
                     if batch == 0 { batch = 1; }
 
-                    // Fire any scripted keyboard events scheduled for this tick.
-                    for &(ev_tick, ev_val) in &key_events {
-                        if ev_tick == tick {
-                            state.set_var("keyboard", ev_val);
-                        }
-                    }
+                    // Fire any scripted press-events scheduled for this tick.
+                    apply_press_events(&press_events, tick, &mut state);
 
                     // We push keys exactly once on press (in the event loop
                     // above). Re-pushing here would look like a repeat —

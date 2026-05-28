@@ -98,6 +98,53 @@ pub struct State {
     /// no CLI-only loading path; calcite-cli and calcite-wasm both use this
     /// path identically.
     pub windowed_byte_array: Option<WindowedByteArray>,
+    /// Host-supplied pseudo-class state. Keyed by `(pseudo, selector)`
+    /// (e.g. `("active", "kb-1")`); presence means the host has
+    /// reported the gate as active. Read by gated assignments synthesised
+    /// from `ParsedProgram::input_edges`. The host calls
+    /// `set_pseudo_class_active` to flip an entry. Sparse — only edges
+    /// the host actually drives appear here.
+    ///
+    /// Stored as a `HashSet` so the per-tick fast path
+    /// (`apply_input_edges` in the evaluator) can short-circuit on
+    /// `pseudo_active.is_empty()` without allocating lookup keys.
+    pub pseudo_active: std::collections::HashSet<(String, String)>,
+    /// Resolved input-edge groups, one per gated state-var slot.
+    /// Installed by `Evaluator::wire_state_for_input_edges` once at
+    /// engine construction (after state vars are loaded). Empty for
+    /// cabinets without `&:has(…:pseudo)` rules — the entire smoke
+    /// set except doom8088.
+    ///
+    /// With this installed, `set_pseudo_class_active` writes the gated
+    /// slot directly at the moment of mutation, eliminating the
+    /// per-tick gate + apply path entirely. The per-tick cost for a
+    /// cabinet with input edges is the same as for one without: zero.
+    pub input_edge_groups: Vec<InputEdgeGroup>,
+}
+
+/// One gated state-var slot's worth of input edges. The slot is
+/// resolved from the binding's bare property name via
+/// `state.var_slot()` at wiring time; the `edges` list carries the
+/// `(pseudo, selector) → value` mapping for every edge that targets
+/// this slot. `set_pseudo_class_active` recomputes the slot value by
+/// summing the values of edges whose `(pseudo, selector)` is currently
+/// active.
+#[derive(Debug, Clone)]
+pub struct InputEdgeGroup {
+    /// The state-var slot all `edges` in this group write to.
+    pub slot: usize,
+    /// Edges whose `bare(property)` resolved to `slot`.
+    pub edges: Vec<InputEdgeGroupEntry>,
+}
+
+/// A single `&:has(#SELECTOR:PSEUDO) { --PROP: VAL }` rule, resolved to
+/// the bare strings (no `#` / no `--`) and the literal value extracted
+/// at compile time.
+#[derive(Debug, Clone)]
+pub struct InputEdgeGroupEntry {
+    pub pseudo: String,
+    pub selector: String,
+    pub value: i32,
 }
 
 /// A "window of bytes addressed by an in-memory key" — a CSS shape where a
@@ -148,6 +195,8 @@ impl State {
             packed_cell_table: Vec::new(),
             packed_cell_size: 0,
             windowed_byte_array: None,
+            pseudo_active: std::collections::HashSet::new(),
+            input_edge_groups: Vec::new(),
         }
     }
 
@@ -234,6 +283,102 @@ impl State {
     /// Look up the slot index for a state variable name.
     pub fn var_slot(&self, name: &str) -> Option<usize> {
         self.state_var_index.get(name).copied()
+    }
+
+    /// Report a pseudo-class match edge as active or inactive. The
+    /// (pseudo, selector) pair must match an InputEdge the cabinet's
+    /// CSS declared via `&:has(#SELECTOR:PSEUDO) { ... }`. Any gated
+    /// state-var slot whose value depends on this edge is **recomputed
+    /// in this call**, so by the time the next tick runs the slot
+    /// already reflects the new active set.
+    ///
+    /// `value=true` means "the host considers this pseudo-class active
+    /// on this element right now"; `value=false` means inactive. The
+    /// host is responsible for sending matching false edges (release).
+    ///
+    /// Apply-on-transition is cheap because mutations are rare (one
+    /// per real key event; sub-200 mutations across a 34M-tick
+    /// doom-loading run). Each call sums values from
+    /// `input_edge_groups`, which is small (1-3 groups on doom-style
+    /// cabinets) — orders of magnitude less work than the previous
+    /// per-tick gate + apply path it replaces.
+    pub fn set_pseudo_class_active(&mut self, pseudo: &str, selector: &str, value: bool) {
+        let changed = if value {
+            // HashSet's API forces an owned key on insert; lookups below
+            // can avoid this with a tuple-of-refs query but inserts can't.
+            self.pseudo_active.insert((pseudo.to_string(), selector.to_string()))
+        } else {
+            self.pseudo_active.remove(&(pseudo.to_string(), selector.to_string()))
+        };
+        if !changed {
+            return;
+        }
+        // Recompute every gated slot from scratch. Each slot's value is
+        // the saturating sum of its active edges' literal values.
+        //
+        // Why recompute from scratch rather than delta-add/subtract?
+        // Multiple `&:has(#X:active) { --P: V }` rules can target the
+        // same slot with the same key but different values (cabinet
+        // authoring quirk). CSS semantics for such cases are "last rule
+        // wins" via cascade, but the recogniser collects all of them.
+        // Summing-from-scratch preserves the pre-existing
+        // saturating-add behaviour of `apply_input_edges` without
+        // needing to enforce uniqueness.
+        for group in &self.input_edge_groups {
+            let slot = group.slot;
+            if slot >= self.state_vars.len() {
+                continue;
+            }
+            let mut sum: i32 = 0;
+            // Inverted iteration: walk active set (small — 0-2 entries
+            // in steady state), match against this group's edges.
+            // For each (pseudo, selector) currently active, sum the
+            // values of edges that match. String compares by
+            // reference; no allocations.
+            for (active_pseudo, active_selector) in &self.pseudo_active {
+                for entry in &group.edges {
+                    if entry.pseudo == *active_pseudo
+                        && entry.selector == *active_selector
+                    {
+                        sum = sum.saturating_add(entry.value);
+                    }
+                }
+            }
+            self.state_vars[slot] = sum;
+        }
+    }
+
+    /// Read whether a pseudo-class match edge is currently active.
+    ///
+    /// Hot path: called once per input edge per tick during
+    /// `apply_input_edges`. Avoid allocating the lookup key — the
+    /// caller passes pre-owned `String`s and we look up by reference.
+    pub fn pseudo_class_active(&self, pseudo: &str, selector: &str) -> bool {
+        // Borrow trait on `(String, String)` lets `&(&str, &str)` query
+        // without allocating. The HashSet stores owned tuples.
+        // Note: HashSet::contains takes `&Q` where `(String, String): Borrow<Q>`,
+        // and the standard library implements `Borrow<(str, str)>` for
+        // `(String, String)` only in very recent Rust; safer to construct
+        // the lookup pair explicitly with refs through `get`. Use the
+        // by-ref helper.
+        self.pseudo_class_active_pair(pseudo, selector)
+    }
+
+    /// Like `pseudo_class_active` but a fast inlined path used internally
+    /// by `apply_input_edges`. Allocates if the Borrow trait route can't
+    /// avoid it; in practice the standard library does support `Borrow<(str, str)>`
+    /// for `(String, String)` since 1.84 — this helper papers over MSRV
+    /// without a feature gate.
+    #[inline]
+    pub fn pseudo_class_active_pair(&self, pseudo: &str, selector: &str) -> bool {
+        // Empty-set fast path.
+        if self.pseudo_active.is_empty() {
+            return false;
+        }
+        // We pay one allocation per lookup here (same as before). The
+        // big win comes from the empty-set fast path above: 99 % of
+        // ticks never reach this line.
+        self.pseudo_active.contains(&(pseudo.to_string(), selector.to_string()))
     }
 
     /// Number of state variables.

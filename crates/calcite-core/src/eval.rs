@@ -106,6 +106,27 @@ pub struct Evaluator {
     pub(crate) compiled: CompiledProgram,
     /// Slot array reused across ticks (avoids per-tick allocation).
     slots: Vec<i32>,
+    /// Input-edge bindings recognised from nested `:has(…:pseudo)` rules.
+    /// Each entry compiles a single `&:has(#SELECTOR:PSEUDO) { --PROP: VAL; }`
+    /// rule into something we can apply per-tick. `value` is pre-evaluated
+    /// at compile time as a literal i32 — non-literal RHS values fall back
+    /// to 0 with a warning (the recogniser is structural; the value-side
+    /// expression evaluator isn't worth the complexity for the current
+    /// shapes kiln emits).
+    pub(crate) input_edge_bindings: Vec<InputEdgeBinding>,
+}
+
+/// Compiled form of a `ParsedProgram::input_edges` entry. The
+/// state-var slot is resolved at `wire_state_for_input_edges` time
+/// (right after state vars are loaded) and the result is installed on
+/// `State::input_edge_groups`; the Evaluator only keeps the raw
+/// bindings for host introspection via `input_edges_for_host`.
+#[derive(Debug, Clone)]
+pub(crate) struct InputEdgeBinding {
+    pub property: String,
+    pub pseudo: String,
+    pub selector: String,
+    pub value: i32,
 }
 
 /// Granular timing breakdown from [`Evaluator::tick_profiled`].
@@ -493,6 +514,37 @@ impl Evaluator {
 
         let slot_count = compiled.slot_count as usize;
         let properties_capacity = assignments.len();
+
+        // Compile input edges. Only literal values are supported in v1;
+        // non-literal RHS expressions are skipped with a warning.
+        let mut input_edge_bindings = Vec::with_capacity(program.input_edges.len());
+        for edge in &program.input_edges {
+            let value = match &edge.value {
+                Expr::Literal(v) => *v as i32,
+                _ => {
+                    log::warn!(
+                        "input edge {}:{} on {} has non-literal value; skipping",
+                        edge.pseudo,
+                        edge.selector,
+                        edge.property,
+                    );
+                    continue;
+                }
+            };
+            input_edge_bindings.push(InputEdgeBinding {
+                property: edge.property.clone(),
+                pseudo: edge.pseudo.clone(),
+                selector: edge.selector.clone(),
+                value,
+            });
+        }
+        if !input_edge_bindings.is_empty() {
+            log::info!(
+                "Compiled {} input edges (pseudo-class gated assignments)",
+                input_edge_bindings.len(),
+            );
+        }
+
         Evaluator {
             functions,
             assignments,
@@ -507,7 +559,72 @@ impl Evaluator {
             string_property_names,
             compiled,
             slots: Vec::with_capacity(slot_count),
+            input_edge_bindings,
         }
+    }
+
+    /// Return the input edges the recogniser bound, as
+    /// `(property, pseudo, selector, value)` tuples. Hosts use this to
+    /// know which edges they can drive via `set_pseudo_class_active`.
+    /// The strings are owned to make the wasm boundary easy.
+    pub fn input_edges_for_host(&self) -> Vec<(String, String, String, i32)> {
+        self.input_edge_bindings
+            .iter()
+            .map(|b| {
+                (
+                    b.property.clone(),
+                    b.pseudo.clone(),
+                    b.selector.clone(),
+                    b.value,
+                )
+            })
+            .collect()
+    }
+
+    /// Resolve the parsed input-edge bindings against the live
+    /// `state.state_var_index` and install the grouped form on
+    /// `state.input_edge_groups`. After this, the host's calls to
+    /// `state.set_pseudo_class_active(...)` directly write the
+    /// affected gated slots — there is no per-tick apply path.
+    ///
+    /// Call once at engine construction, after
+    /// `state.load_properties`. Idempotent: re-running rebuilds the
+    /// groups (useful after `engine.reset()`).
+    ///
+    /// Bindings whose `bare(property)` doesn't resolve to a slot are
+    /// silently dropped — they correspond to recogniser hits on
+    /// properties the host's filter (e.g. `program.json`) excluded,
+    /// which is rare but possible.
+    pub fn wire_state_for_input_edges(&self, state: &mut crate::State) {
+        use std::collections::HashMap;
+        if self.input_edge_bindings.is_empty() {
+            state.input_edge_groups = Vec::new();
+            return;
+        }
+        let mut by_slot: HashMap<usize, Vec<crate::state::InputEdgeGroupEntry>> =
+            HashMap::new();
+        for b in &self.input_edge_bindings {
+            let bare = to_bare_name(&b.property);
+            let slot = match state.var_slot(bare) {
+                Some(s) => s,
+                None => continue,
+            };
+            by_slot
+                .entry(slot)
+                .or_default()
+                .push(crate::state::InputEdgeGroupEntry {
+                    pseudo: b.pseudo.clone(),
+                    selector: b.selector.clone(),
+                    value: b.value,
+                });
+        }
+        let mut groups: Vec<crate::state::InputEdgeGroup> = by_slot
+            .into_iter()
+            .map(|(slot, edges)| crate::state::InputEdgeGroup { slot, edges })
+            .collect();
+        // Stable order by slot for predictable diagnostics.
+        groups.sort_by_key(|g| g.slot);
+        state.input_edge_groups = groups;
     }
 
     /// Register a pre-tick hook that is called before each tick.
@@ -525,6 +642,12 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
+
+        // Input-edge values were written directly into gated state-var
+        // slots at `state.set_pseudo_class_active(...)` time, so the
+        // per-tick path no longer needs an apply step. Removed
+        // 2026-05-28 — see `wire_state_for_input_edges` and
+        // `State::set_pseudo_class_active`.
 
         // Snapshot state vars for change detection
         let prev_vars = state.state_vars.clone();
@@ -658,6 +781,8 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
+        // Input-edge values are written at set_pseudo_class_active time;
+        // no per-tick apply needed.
         compile::execute(&self.compiled, state, &mut self.slots);
         if !self.string_assignments.is_empty() {
             self.properties.clear();
@@ -699,6 +824,9 @@ impl Evaluator {
         }
         let t1 = Instant::now();
         profile.hooks += t1.duration_since(t0).as_secs_f64();
+
+        // Input-edge slots are written at set_pseudo_class_active time;
+        // no per-tick apply needed.
 
         // Snapshot
         let prev_vars = state.state_vars.clone();
@@ -762,6 +890,9 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
+
+        // Input-edge slots are written at set_pseudo_class_active time;
+        // no per-tick apply needed.
 
         self.properties.clear();
         self.call_depth = 0;
@@ -1399,12 +1530,6 @@ pub fn property_to_address(name: &str) -> Option<i32> {
     // Generic fallback: --m{N} → memory address N
     if let Some(rest) = canonical.strip_prefix('m') {
         return parse_mem_address(rest);
-    }
-
-    // keyboard / __1keyboard / __2keyboard → linear address 0x500.
-    // The CSS-DOS BIOS polls address 0x500 (word) for keystrokes.
-    if canonical == "keyboard" || canonical == "__1keyboard" || canonical == "__2keyboard" {
-        return Some(0x500);
     }
 
     None
@@ -2106,6 +2231,7 @@ mod tests {
             string_property_names: HashSet::new(),
             compiled,
             slots: Vec::new(),
+            input_edge_bindings: Vec::new(),
         };
         (evaluator, state)
     }
@@ -2319,6 +2445,71 @@ mod tests {
         assert_eq!(state.memory[0], 255);
         assert_eq!(result.ticks_executed, 1);
         assert!(!result.changes.is_empty());
+    }
+
+    #[test]
+    fn input_edges_drive_state_var() {
+        // Verifies apply-on-transition: each set_pseudo_class_active
+        // call writes the gated slot directly, no per-tick apply
+        // needed. Tests the Phase 4 path landed 2026-05-28.
+        use crate::types::{InputEdge, PropertyDef};
+        let program = ParsedProgram {
+            properties: vec![PropertyDef {
+                name: "--keyboard".to_string(),
+                syntax: crate::types::PropertySyntax::Integer,
+                inherits: true,
+                initial_value: Some(crate::types::CssValue::Integer(0)),
+            }],
+            functions: vec![],
+            assignments: vec![],
+            input_edges: vec![
+                InputEdge {
+                    property: "--keyboard".to_string(),
+                    pseudo: "active".to_string(),
+                    selector: "kb-1".to_string(),
+                    value: Expr::Literal(561.0),
+                },
+                InputEdge {
+                    property: "--keyboard".to_string(),
+                    pseudo: "active".to_string(),
+                    selector: "kb-a".to_string(),
+                    value: Expr::Literal(7777.0),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut state = State::default();
+        state.load_properties(&program.properties);
+        let evaluator = Evaluator::from_parsed(&program);
+
+        // Bindings compiled from the input edges.
+        assert_eq!(evaluator.input_edge_bindings.len(), 2);
+
+        // Wire the resolved groups onto State. After this, every
+        // set_pseudo_class_active call writes the slot directly.
+        evaluator.wire_state_for_input_edges(&mut state);
+        assert_eq!(state.input_edge_groups.len(), 1, "one gated slot (--keyboard)");
+        assert_eq!(state.input_edge_groups[0].edges.len(), 2);
+
+        // Nothing pressed → slot stays at 0.
+        assert_eq!(state.get_var("keyboard").unwrap(), 0);
+
+        // Press kb-1 → 561 written immediately.
+        state.set_pseudo_class_active("active", "kb-1", true);
+        assert_eq!(state.get_var("keyboard").unwrap(), 561);
+
+        // Hold kb-1, also press kb-a → sum to 8338.
+        state.set_pseudo_class_active("active", "kb-a", true);
+        assert_eq!(state.get_var("keyboard").unwrap(), 8338);
+
+        // Release kb-a → back to 561.
+        state.set_pseudo_class_active("active", "kb-a", false);
+        assert_eq!(state.get_var("keyboard").unwrap(), 561);
+
+        // Release kb-1 → cleared to 0.
+        state.set_pseudo_class_active("active", "kb-1", false);
+        assert_eq!(state.get_var("keyboard").unwrap(), 0);
     }
 
     #[test]

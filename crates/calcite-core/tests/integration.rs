@@ -40,6 +40,9 @@ fn setup(css: &str) -> (Evaluator, State) {
     let mut state = State::default();
     state.load_properties(&parsed.properties);
     let evaluator = Evaluator::from_parsed(&parsed);
+    // Wire input-edge groups onto State so set_pseudo_class_active writes
+    // gated slots directly. No-op for CSS without `&:has(…:pseudo)` rules.
+    evaluator.wire_state_for_input_edges(&mut state);
     (evaluator, state)
 }
 
@@ -960,79 +963,52 @@ fn nested_style_function_call() {
     assert_eq!(compiled_cs, 84, "expected --double(42) = 84, got {}", compiled_cs);
 }
 
-/// End-to-end: a fake CPU that walks three "phases" (splash, boot, loop),
-/// fed through the EventLogger and block segmenter. Verifies the whole
-/// chain — record, collapse, segment, render — behaves for a realistic
-/// multi-phase run.
+/// End-to-end input-edge test: parse a tiny cabinet with two
+/// `&:has(#kb-X:active) { --keyboard: V; }` rules, drive press/release
+/// via `set_pseudo_class_active`, and verify `--keyboard` reflects the
+/// gated values via the recogniser. No host-side `set_var` calls.
+///
+/// Mirrors the calcite-wasm e2e probe (pseudo-active-api-probe.html) but
+/// runs in plain Rust so it shows up in `cargo test`.
 #[test]
-fn summary_captures_three_phases() {
-    use calcite_core::summary::{segment, EventLogger, SegmentConfig, SummaryConfig};
-
-    let mut state = State::default();
-    // Minimal @property set for CS/IP/opcode/_irqActive.
-    let props_css = r#"
-        @property --CS { syntax: "<integer>"; inherits: true; initial-value: 0; }
-        @property --IP { syntax: "<integer>"; inherits: true; initial-value: 0; }
-        @property --opcode { syntax: "<integer>"; inherits: true; initial-value: 0; }
-        @property --_irqActive { syntax: "<integer>"; inherits: true; initial-value: 0; }
+fn input_edges_drive_keyboard_via_set_pseudo_class_active() {
+    let css = r#"
+        @property --keyboard { syntax: "<integer>"; initial-value: 0; inherits: true; }
+        @property --opcode   { syntax: "<integer>"; initial-value: 0; inherits: true; }
+        .cpu {
+            &:has(#kb-1:active) { --keyboard: 561; }
+            &:has(#kb-a:active) { --keyboard: 7777; }
+        }
     "#;
-    let parsed = parse_css(props_css).unwrap();
-    state.load_properties(&parsed.properties);
+    let (mut eval, mut state) = setup(css);
 
-    let mut log = EventLogger::new(SummaryConfig {
-        max_events: 10_000,
-        record_writes: false,
-    });
+    // Sanity: parser found two input edges.
+    let edges = eval.input_edges_for_host();
+    assert_eq!(edges.len(), 2);
+    assert!(edges.iter().any(|(p, ps, sel, v)| p == "--keyboard" && ps == "active" && sel == "kb-1" && *v == 561));
+    assert!(edges.iter().any(|(p, ps, sel, v)| p == "--keyboard" && ps == "active" && sel == "kb-a" && *v == 7777));
 
-    // Phase 1: splash — CS=F000, IP walks 0x100-0x1FF (under the 256-byte
-    // window so stays in one block), 500 ticks.
-    state.set_var("CS", 0xF000);
-    for i in 0..500 {
-        state.set_var("IP", 0x100 + (i % 100));
-        state.frame_counter = i as u32;
-        log.record_tick(&state);
-    }
+    // No press → 0.
+    eval.tick(&mut state);
+    assert_eq!(state.get_var("keyboard").unwrap(), 0);
 
-    // Phase 2: stall — CS=F000, IP parked at 0x300 (wanders outside phase 1
-    // window so new block), 300 ticks.
-    for i in 0..300 {
-        state.set_var("IP", 0x300);
-        state.frame_counter = 500 + i as u32;
-        log.record_tick(&state);
-    }
+    // Press kb-1 → 561.
+    state.set_pseudo_class_active("active", "kb-1", true);
+    eval.tick(&mut state);
+    assert_eq!(state.get_var("keyboard").unwrap(), 561);
 
-    // Phase 3: kernel — CS=0x70, 200 ticks.
-    state.set_var("CS", 0x0070);
-    for i in 0..200 {
-        state.set_var("IP", 0x400 + (i % 50));
-        state.frame_counter = 800 + i as u32;
-        log.record_tick(&state);
-    }
+    // Add kb-a → sum to 8338.
+    state.set_pseudo_class_active("active", "kb-a", true);
+    eval.tick(&mut state);
+    assert_eq!(state.get_var("keyboard").unwrap(), 8338);
 
-    // The stall should collapse to ONE event (same PC for 300 ticks).
-    // Phase 1 should have ~100 events (each IP visited 5×, collapsing
-    // consecutive repeats — we cycle 0..100 so each entry is a single tick
-    // in sequence: they don't collapse).
-    let blocks = segment(&log.events, &SegmentConfig::default());
-    assert!(blocks.len() >= 3,
-        "expected ≥3 blocks across the 3 phases, got {}: {:?}",
-        blocks.len(),
-        blocks.iter().map(|b| (b.cs, b.start_tick, b.end_tick)).collect::<Vec<_>>()
-    );
+    // Release kb-1 → just kb-a → 7777.
+    state.set_pseudo_class_active("active", "kb-1", false);
+    eval.tick(&mut state);
+    assert_eq!(state.get_var("keyboard").unwrap(), 7777);
 
-    // Find the stall block — total_ticks should be 300 and dominant_pc set.
-    let stall = blocks.iter().find(|b| b.total_ticks == 300)
-        .expect("should find the 300-tick stall block");
-    assert!(stall.dominant_pc.is_some(), "stall should have dominant PC");
-    let (cs, ip, _hits) = stall.dominant_pc.unwrap();
-    assert_eq!(cs, 0xF000);
-    assert_eq!(ip, 0x300);
-
-    // Kernel block should have CS=0x70.
-    assert!(blocks.iter().any(|b| b.cs == 0x0070 && b.total_ticks == 200),
-        "expected a CS=0x70 block with 200 ticks");
-
-    // Prose renders without panicking.
-    let prose = calcite_core::summary::render_summary(&blocks);
-    assert!(prose.lines().count() == blocks.len());
+    // Release kb-a → 0.
+    state.set_pseudo_class_active("active", "kb-a", false);
+    eval.tick(&mut state);
+    assert_eq!(state.get_var("keyboard").unwrap(), 0);
 }

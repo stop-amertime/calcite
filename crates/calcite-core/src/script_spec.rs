@@ -30,6 +30,13 @@
 //! - `setvar_pulse=NAME,VALUE,HOLD_TICKS`  (make→break edge pair;
 //!                                          writes VALUE now, schedules
 //!                                          write-of-0 after HOLD_TICKS)
+//! - `pseudo_pulse=PSEUDO,SELECTOR,HOLD_TICKS`
+//!                                         (pseudo-class make→break;
+//!                                          flips edge active now,
+//!                                          schedules release after
+//!                                          HOLD_TICKS — drives the
+//!                                          cabinet's `:has(...:pseudo)`
+//!                                          input-edge rules)
 //! - `dump=ADDR,LEN[,PATH]`     (PATH supports `{tick}` / `{name}`)
 //! - `snapshot[=PATH]`
 //!
@@ -142,6 +149,31 @@ fn parse_action(tok: &str) -> Result<Action, String> {
                 Ok(Action::SetVarPulse {
                     name: parts[0].to_string(),
                     value,
+                    hold_ticks,
+                })
+            } else if let Some(rest) = tok.strip_prefix("pseudo_pulse=") {
+                // pseudo_pulse=PSEUDO,SELECTOR,HOLD_TICKS — flip the
+                // (PSEUDO, SELECTOR) match edge active now, schedule a
+                // release HOLD_TICKS later. Generic edge-pair primitive
+                // for the pseudo-class input surface; CSS-DOS-side
+                // profiles use it for click-driven keyboard taps that
+                // exercise the cabinet's `&:has(#SEL:PSEUDO) { --PROP: V }`
+                // rules through calcite's input-edge recogniser.
+                let parts: Vec<&str> = rest.split(',').collect();
+                if parts.len() != 3 {
+                    return Err(format!(
+                        "pseudo_pulse expects PSEUDO,SELECTOR,HOLD_TICKS; got {rest:?}"
+                    ));
+                }
+                let hold_ticks = parse_int(parts[2], "HOLD_TICKS")? as u32;
+                if hold_ticks == 0 {
+                    return Err(format!(
+                        "pseudo_pulse HOLD_TICKS must be > 0 (would never release): {rest:?}"
+                    ));
+                }
+                Ok(Action::PseudoActivePulse {
+                    pseudo: parts[0].to_string(),
+                    selector: parts[1].to_string(),
                     hold_ticks,
                 })
             } else if let Some(rest) = tok.strip_prefix("dump=") {
@@ -306,7 +338,7 @@ mod tests {
         let w = parse_watch("tick:stride:every=100").unwrap();
         assert_eq!(w.name, "tick");
         match w.kind {
-            WatchKind::Stride { every } => assert_eq!(every, 100),
+            WatchKind::Stride { every, .. } => assert_eq!(every, 100),
             _ => panic!("wrong kind"),
         }
     }
@@ -372,6 +404,32 @@ mod tests {
             }
             _ => panic!("wrong action"),
         }
+    }
+
+    #[test]
+    fn parse_pseudo_pulse_action() {
+        let w = parse_watch(
+            "tap:at:tick=500:then=pseudo_pulse=active,kb-enter,50000",
+        )
+        .unwrap();
+        match &w.actions[0] {
+            Action::PseudoActivePulse {
+                pseudo,
+                selector,
+                hold_ticks,
+            } => {
+                assert_eq!(pseudo, "active");
+                assert_eq!(selector, "kb-enter");
+                assert_eq!(*hold_ticks, 50_000);
+            }
+            other => panic!("wrong action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_pseudo_pulse_rejects_bad_arity() {
+        assert!(parse_watch("t:at:tick=1:then=pseudo_pulse=foo,bar").is_err());
+        assert!(parse_watch("t:at:tick=1:then=pseudo_pulse=foo,bar,0").is_err());
     }
 
     #[test]

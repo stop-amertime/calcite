@@ -11,12 +11,16 @@
  *         framebuffer into the shared buffer and omit the per-frame
  *         transfer. Requires a cross-origin-isolated page.
  *
- *   NOTE on keyboard: the CSS-DOS output has pure-CSS `:has(button:active)`
- *   rules that drive --keyboard in Chrome. Calcite can't evaluate selector
- *   matching (no DOM, no :active) so for the web runner we bridge the
- *   on-screen buttons through JS — pointerdown/pointerup on each button
- *   post a message here, and we write the key into BDA via set_keyboard().
- *   The pure-CSS path still works when the .css is opened in Chrome directly.
+ *   NOTE on keyboard: the CSS-DOS cabinet has pure-CSS
+ *   `&:has(#kb-X:active) { --keyboard: V }` rules that drive --keyboard
+ *   in raw Chrome. Calcite-wasm doesn't itself evaluate selectors with
+ *   :active, so for the web runner we bridge on-screen buttons through
+ *   JS: pointerdown/pointerup post a `press` message here with
+ *   `{selector, active}` and the worker calls
+ *   `engine.set_pseudo_class_active('active', selector, active)`.
+ *   Calcite's input-edge recogniser converts the host-side state into
+ *   the cabinet's CSS-declared property value at the next tick. The
+ *   pure-CSS path still works when the .css is opened in Chrome directly.
  *
  *   Worker → Main:
  *     { type: 'ready', video: { text, gfx } }
@@ -343,9 +347,10 @@ self.onmessage = async function (event) {
         break;
       }
 
-      case 'keyboard': {
-        if (engine) {
-          engine.set_keyboard(data.key || 0);
+      case 'press': {
+        // {selector: 'kb-X', active: true|false}
+        if (engine && data.selector) {
+          engine.set_pseudo_class_active('active', data.selector, !!data.active);
         }
         break;
       }

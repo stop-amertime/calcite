@@ -280,6 +280,29 @@ pub struct ParsedProgram {
     /// filters these out of `assignments` and broadcast-write phase 2 by
     /// union with `BroadcastResult::absorbed_properties`.
     pub fast_path_absorbed: std::collections::HashSet<String>,
+    /// Input edges recognised from nested `&:has(#ID:pseudo) { --PROP: V; }`
+    /// rules. Each edge says: when the host reports `(pseudo, selector)` is
+    /// active, the gated property takes `value`. The compile pass collapses
+    /// all edges sharing a property into a single synthesised assignment.
+    pub input_edges: Vec<InputEdge>,
+}
+
+/// A gated assignment recognised from a nested `:has(...:pseudo)` rule.
+///
+/// The host (page JS / service worker) reports edge state via
+/// `set_pseudo_class_active(pseudo, selector, value)`. The recogniser is
+/// structural — it doesn't look at property names or values, only at the
+/// shape `&:has(#ID:PSEUDO) { --PROP: EXPR; }` inside an outer style rule.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InputEdge {
+    /// The custom property the gated rule writes (e.g., `"--keyboard"`).
+    pub property: String,
+    /// The pseudo-class the gate watches (e.g., `"active"`).
+    pub pseudo: String,
+    /// The id-selector text without the leading `#` (e.g., `"kb-1"`).
+    pub selector: String,
+    /// Value to apply when the gate is active.
+    pub value: Expr,
 }
 
 /// A single property assignment: `--name: <expr>`.
