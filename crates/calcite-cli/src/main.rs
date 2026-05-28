@@ -593,6 +593,11 @@ fn main() {
             // flat-array dispatch — see
             // Evaluator::wire_state_for_windowed_byte_array.
             evaluator.wire_state_for_windowed_byte_array(&mut state);
+            // Input-edge groups: resolve `&:has(#X:pseudo) { --P: V }`
+            // bindings to their target state-var slots so
+            // `state.set_pseudo_class_active(...)` can write the slot
+            // directly. No per-tick apply path needed after this.
+            evaluator.wire_state_for_input_edges(&mut state);
 
             // --restore: replay a previously-captured execution state into
             // the freshly-wired engine. This must run AFTER load_properties

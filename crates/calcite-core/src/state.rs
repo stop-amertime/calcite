@@ -109,16 +109,42 @@ pub struct State {
     /// (`apply_input_edges` in the evaluator) can short-circuit on
     /// `pseudo_active.is_empty()` without allocating lookup keys.
     pub pseudo_active: std::collections::HashSet<(String, String)>,
-    /// Single-bit dirty flag: `true` when the active set has mutated
-    /// since the last `apply_input_edges`. Set by `set_pseudo_class_active`
-    /// on a real change; cleared by `apply_input_edges` after it processes
-    /// the new state. The per-tick gate collapses to a single bool load.
+    /// Resolved input-edge groups, one per gated state-var slot.
+    /// Installed by `Evaluator::wire_state_for_input_edges` once at
+    /// engine construction (after state vars are loaded). Empty for
+    /// cabinets without `&:has(…:pseudo)` rules — the entire smoke
+    /// set except doom8088.
     ///
-    /// Starts `true` so the very first tick triggers lazy-init of the
-    /// evaluator's `input_edge_groups`. After that, doomLoad's tens of
-    /// thousands of ticks between pulses all see `false` and skip the
-    /// slow path without touching the HashSet or comparing counters.
-    pub pseudo_active_dirty: bool,
+    /// With this installed, `set_pseudo_class_active` writes the gated
+    /// slot directly at the moment of mutation, eliminating the
+    /// per-tick gate + apply path entirely. The per-tick cost for a
+    /// cabinet with input edges is the same as for one without: zero.
+    pub input_edge_groups: Vec<InputEdgeGroup>,
+}
+
+/// One gated state-var slot's worth of input edges. The slot is
+/// resolved from the binding's bare property name via
+/// `state.var_slot()` at wiring time; the `edges` list carries the
+/// `(pseudo, selector) → value` mapping for every edge that targets
+/// this slot. `set_pseudo_class_active` recomputes the slot value by
+/// summing the values of edges whose `(pseudo, selector)` is currently
+/// active.
+#[derive(Debug, Clone)]
+pub struct InputEdgeGroup {
+    /// The state-var slot all `edges` in this group write to.
+    pub slot: usize,
+    /// Edges whose `bare(property)` resolved to `slot`.
+    pub edges: Vec<InputEdgeGroupEntry>,
+}
+
+/// A single `&:has(#SELECTOR:PSEUDO) { --PROP: VAL }` rule, resolved to
+/// the bare strings (no `#` / no `--`) and the literal value extracted
+/// at compile time.
+#[derive(Debug, Clone)]
+pub struct InputEdgeGroupEntry {
+    pub pseudo: String,
+    pub selector: String,
+    pub value: i32,
 }
 
 /// A "window of bytes addressed by an in-memory key" — a CSS shape where a
@@ -170,8 +196,7 @@ impl State {
             packed_cell_size: 0,
             windowed_byte_array: None,
             pseudo_active: std::collections::HashSet::new(),
-            // Start dirty so the first tick triggers lazy edge-group init.
-            pseudo_active_dirty: true,
+            input_edge_groups: Vec::new(),
         }
     }
 
@@ -262,26 +287,64 @@ impl State {
 
     /// Report a pseudo-class match edge as active or inactive. The
     /// (pseudo, selector) pair must match an InputEdge the cabinet's
-    /// CSS declared via `&:has(#SELECTOR:PSEUDO) { ... }`. The next
-    /// tick's evaluation of the gated property will see the new state.
+    /// CSS declared via `&:has(#SELECTOR:PSEUDO) { ... }`. Any gated
+    /// state-var slot whose value depends on this edge is **recomputed
+    /// in this call**, so by the time the next tick runs the slot
+    /// already reflects the new active set.
     ///
     /// `value=true` means "the host considers this pseudo-class active
     /// on this element right now"; `value=false` means inactive. The
     /// host is responsible for sending matching false edges (release).
+    ///
+    /// Apply-on-transition is cheap because mutations are rare (one
+    /// per real key event; sub-200 mutations across a 34M-tick
+    /// doom-loading run). Each call sums values from
+    /// `input_edge_groups`, which is small (1-3 groups on doom-style
+    /// cabinets) — orders of magnitude less work than the previous
+    /// per-tick gate + apply path it replaces.
     pub fn set_pseudo_class_active(&mut self, pseudo: &str, selector: &str, value: bool) {
         let changed = if value {
             // HashSet's API forces an owned key on insert; lookups below
             // can avoid this with a tuple-of-refs query but inserts can't.
-            // Acceptable: the host calls this rarely (one make + one break
-            // per key event). The hot path is the per-tick lookup, not this.
             self.pseudo_active.insert((pseudo.to_string(), selector.to_string()))
         } else {
-            // HashSet doesn't have a remove-by-borrowed-tuple API, so
-            // fall back to allocation here too. Same trade-off as insert.
             self.pseudo_active.remove(&(pseudo.to_string(), selector.to_string()))
         };
-        if changed {
-            self.pseudo_active_dirty = true;
+        if !changed {
+            return;
+        }
+        // Recompute every gated slot from scratch. Each slot's value is
+        // the saturating sum of its active edges' literal values.
+        //
+        // Why recompute from scratch rather than delta-add/subtract?
+        // Multiple `&:has(#X:active) { --P: V }` rules can target the
+        // same slot with the same key but different values (cabinet
+        // authoring quirk). CSS semantics for such cases are "last rule
+        // wins" via cascade, but the recogniser collects all of them.
+        // Summing-from-scratch preserves the pre-existing
+        // saturating-add behaviour of `apply_input_edges` without
+        // needing to enforce uniqueness.
+        for group in &self.input_edge_groups {
+            let slot = group.slot;
+            if slot >= self.state_vars.len() {
+                continue;
+            }
+            let mut sum: i32 = 0;
+            // Inverted iteration: walk active set (small — 0-2 entries
+            // in steady state), match against this group's edges.
+            // For each (pseudo, selector) currently active, sum the
+            // values of edges that match. String compares by
+            // reference; no allocations.
+            for (active_pseudo, active_selector) in &self.pseudo_active {
+                for entry in &group.edges {
+                    if entry.pseudo == *active_pseudo
+                        && entry.selector == *active_selector
+                    {
+                        sum = sum.saturating_add(entry.value);
+                    }
+                }
+            }
+            self.state_vars[slot] = sum;
         }
     }
 

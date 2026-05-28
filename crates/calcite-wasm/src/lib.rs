@@ -103,6 +103,10 @@ impl CalciteEngine {
         // from the cabinet's compiled flat-array dispatch — no separate
         // sidecar load is required.
         evaluator.wire_state_for_windowed_byte_array(&mut state);
+        // Install input-edge groups on State. After this,
+        // `state.set_pseudo_class_active(...)` writes the gated state-var
+        // slot(s) directly — no per-tick apply path is needed.
+        evaluator.wire_state_for_input_edges(&mut state);
 
         let initial_properties = parsed.properties;
         // Wasm builds use the in-memory dump sink because the SW /
@@ -143,6 +147,7 @@ impl CalciteEngine {
         }
         self.evaluator.wire_state_for_packed_memory(&mut self.state);
         self.evaluator.wire_state_for_windowed_byte_array(&mut self.state);
+        self.evaluator.wire_state_for_input_edges(&mut self.state);
         // Watch registry: drop every registered watch and any pending
         // events. Hosts re-register after reset() if they want them.
         let mut new_reg = calcite_core::script::WatchRegistry::new();

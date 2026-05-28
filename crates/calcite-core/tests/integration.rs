@@ -40,6 +40,9 @@ fn setup(css: &str) -> (Evaluator, State) {
     let mut state = State::default();
     state.load_properties(&parsed.properties);
     let evaluator = Evaluator::from_parsed(&parsed);
+    // Wire input-edge groups onto State so set_pseudo_class_active writes
+    // gated slots directly. No-op for CSS without `&:has(…:pseudo)` rules.
+    evaluator.wire_state_for_input_edges(&mut state);
     (evaluator, state)
 }
 
