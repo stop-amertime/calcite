@@ -225,6 +225,11 @@ pub(crate) fn apply_fill_with_commit(
     if descriptor.bulk_class != BulkClass::Fill {
         return ApplyOutcome::Unsupported("not Fill class");
     }
+    if let Some(pre) = descriptor.precondition.as_ref() {
+        if !crate::pattern::loop_descriptor::evaluate_precondition(pre, program, state, slots) {
+            return ApplyOutcome::PreconditionNotMet;
+        }
+    }
     let Some(per_iter) = descriptor.per_iter_cycles else {
         return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
     };
@@ -424,6 +429,11 @@ pub(crate) fn apply_copy_with_commit(
 ) -> ApplyOutcome {
     if descriptor.bulk_class != BulkClass::Copy {
         return ApplyOutcome::Unsupported("not Copy class");
+    }
+    if let Some(pre) = descriptor.precondition.as_ref() {
+        if !crate::pattern::loop_descriptor::evaluate_precondition(pre, program, state, slots) {
+            return ApplyOutcome::PreconditionNotMet;
+        }
     }
     let Some(per_iter) = descriptor.per_iter_cycles else {
         return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
@@ -725,6 +735,11 @@ pub(crate) fn apply_read_only_with_commit(
 ) -> ApplyOutcome {
     if descriptor.bulk_class != BulkClass::ReadOnly {
         return ApplyOutcome::Unsupported("not ReadOnly class");
+    }
+    if let Some(pre) = descriptor.precondition.as_ref() {
+        if !crate::pattern::loop_descriptor::evaluate_precondition(pre, program, state, slots) {
+            return ApplyOutcome::PreconditionNotMet;
+        }
     }
     let Some(per_iter) = descriptor.per_iter_cycles else {
         return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
@@ -1152,6 +1167,7 @@ mod tests {
             per_iter_cycles: Some(10),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
+            precondition: None,
         }
     }
 
@@ -1210,6 +1226,7 @@ mod tests {
             per_iter_cycles: Some(10),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
+            precondition: None,
         }
     }
 
@@ -1522,6 +1539,7 @@ mod tests {
             per_iter_cycles: Some(10),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
+            precondition: None,
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state = rigged_state(&["alpha", "beta", "epsilon", "delta", "gamma"]);
@@ -1696,6 +1714,7 @@ mod tests {
             per_iter_cycles: Some(17),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
+            precondition: None,
         }
     }
 
@@ -1771,6 +1790,7 @@ mod tests {
             per_iter_cycles: Some(17),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
+            precondition: None,
         }
     }
 
@@ -2087,6 +2107,7 @@ mod tests {
             per_iter_cycles: Some(17),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
+            precondition: None,
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state =
@@ -2245,6 +2266,7 @@ mod tests {
             per_iter_cycles: Some(15),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
+            precondition: None,
         }
     }
 
@@ -2298,6 +2320,7 @@ mod tests {
                 },
                 rep_type_property: Some("--repType".to_string()),
             }),
+            precondition: None,
         }
     }
 
@@ -2354,6 +2377,7 @@ mod tests {
                 },
                 rep_type_property: Some("--repType".to_string()),
             }),
+            precondition: None,
         }
     }
 
@@ -2737,6 +2761,7 @@ mod tests {
             per_iter_cycles: Some(15),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
+            precondition: None,
         };
         let prog = empty_program_with_descriptor(desc.clone());
         let mut state = rigged_state(&["alpha", "beta", "gamma"]);
@@ -3136,5 +3161,91 @@ mod tests {
         let _ = apply_fill(&desc, &prog, &mut state_a, &[]);
         let _ = apply_fill_with_commit(&desc, &prog, &mut state_b, &[], CommitMode::MemoryOnly);
         assert_eq!(state_a.memory, state_b.memory);
+    }
+
+    // -----------------------------------------------------------------
+    // Precondition (Wart 6) — applier reports PreconditionNotMet (NOT
+    // Unsupported) when the cabinet's outer-guard predicate evaluates
+    // false against runtime state. The dispatcher reads this as
+    // "silently bail" rather than "panic".
+    // -----------------------------------------------------------------
+
+    /// When the descriptor carries a precondition whose override slot
+    /// reads non-zero in state, the applier returns
+    /// `ApplyOutcome::PreconditionNotMet`. The cabinet's CSS already
+    /// produced the correct single-iter post-state on this tick, so
+    /// the applier has nothing to do.
+    #[test]
+    fn precondition_not_met_returns_precondition_not_met_not_unsupported() {
+        use crate::pattern::loop_descriptor::Precondition;
+        let mut desc = stosb_descriptor();
+        desc.precondition = Some(Precondition::NoOverrides(vec![StyleTest::Single {
+            property: "--_irqActive".to_string(),
+            value: Expr::Literal(1.0),
+        }]));
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "ES", "AL", "flags", "_irqActive"]);
+        state.set_var("CX", 64);
+        state.set_var("DI", 0x10);
+        state.set_var("ES", 0xA000);
+        state.set_var("AL", 0x42);
+        state.set_var("flags", 0);
+        // Override fires → precondition NOT met.
+        state.set_var("_irqActive", 1);
+
+        let outcome = apply_fill(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::PreconditionNotMet);
+        // Crucially: this is a different variant from Unsupported. The
+        // dispatcher treats them differently (silent bail vs panic).
+        assert!(!matches!(outcome, ApplyOutcome::Unsupported(_)));
+        // No memory was written.
+        for i in 0..64 {
+            assert_eq!(state.memory[0xA0010 + i], 0);
+        }
+    }
+
+    /// When the override slots all read zero, the precondition is met
+    /// and the applier runs normally. Same descriptor + state as the
+    /// failing case above, but with `_irqActive = 0`.
+    #[test]
+    fn precondition_met_runs_normally() {
+        use crate::pattern::loop_descriptor::Precondition;
+        let mut desc = stosb_descriptor();
+        desc.precondition = Some(Precondition::NoOverrides(vec![StyleTest::Single {
+            property: "--_irqActive".to_string(),
+            value: Expr::Literal(1.0),
+        }]));
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "ES", "AL", "flags", "_irqActive"]);
+        state.set_var("CX", 64);
+        state.set_var("DI", 0x10);
+        state.set_var("ES", 0xA000);
+        state.set_var("AL", 0x42);
+        state.set_var("flags", 0);
+        state.set_var("_irqActive", 0); // override does NOT fire
+
+        let outcome = apply_fill(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 64 });
+        for i in 0..64 {
+            assert_eq!(state.memory[0xA0010 + i], 0x42);
+        }
+    }
+
+    /// `precondition = None` means the descriptor has no outer guard
+    /// (brainfuck / no-override cabinet shape) — applier proceeds
+    /// unconditionally.
+    #[test]
+    fn precondition_none_runs_normally() {
+        let desc = stosb_descriptor(); // precondition = None
+        assert!(desc.precondition.is_none());
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "ES", "AL", "flags"]);
+        state.set_var("CX", 8);
+        state.set_var("DI", 0x10);
+        state.set_var("ES", 0xA000);
+        state.set_var("AL", 0x55);
+        state.set_var("flags", 0);
+        let outcome = apply_fill(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 8 });
     }
 }

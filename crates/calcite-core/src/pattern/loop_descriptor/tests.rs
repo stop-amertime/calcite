@@ -3003,3 +3003,366 @@ fn comparison_shape_brainfuck_cabinet_extracts_equivalent_structure() {
     assert!(cx.rep_type_property.is_some());
     assert!(cb.rep_type_property.is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Precondition (Wart 6) — outer-guard predicate capture.
+// ---------------------------------------------------------------------------
+
+/// Build a CMPS-shape cabinet whose IP slot is wrapped in an outer
+/// `if(<override-A>: var(self); <override-B>: var(self); else: <dispatch>)`
+/// guard. Two override branches; both gate the normal dispatch.
+///
+/// `override_a_slot` / `override_b_slot` are the slot names the guard
+/// branches test against (each tests for equality with `1`). Naming
+/// them as parameters lets us test the renaming-blind property.
+fn cabinet_with_outer_ip_guard(
+    override_a_slot: &str,
+    override_b_slot: &str,
+) -> Vec<Assignment> {
+    let pred = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--inhibit", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--op",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--prevCount"))],
+        keep_self("--prevCount"),
+    );
+    let ip_dispatch = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            ip_body(pred.clone(), "--prevPC", var("--introBytes"), 1),
+        )],
+        keep_self("--prevPC"),
+    );
+    let di_dispatch = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--prevHand",
+                1,
+                "--prevMood",
+                10,
+                "--clampLow",
+                "--bitN",
+            ),
+        )],
+        keep_self("--prevHand"),
+    );
+
+    // Wrap the IP dispatch in an outer guard.
+    let ip_wrapped = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq(override_a_slot, 1.0),
+                then: var("--prevPC"),
+            },
+            StyleBranch {
+                condition: style_eq(override_b_slot, 1.0),
+                then: var("--prevPC"),
+            },
+        ],
+        fallback: Box::new(ip_dispatch),
+    };
+
+    vec![
+        assign("--count", cx_dispatch),
+        assign("--pc", ip_wrapped),
+        assign("--hand", di_dispatch),
+    ]
+}
+
+/// Cabinet identical to `cabinet_a` but without any outer-wrapper on
+/// the IP slot: its IP assignment is `Calc::Add(<dispatch>, ...)`, where
+/// `<dispatch>` is a bare single-key dispatch. No StyleCondition wrapper
+/// gates the dispatch. This is the "brainfuck cabinet without override
+/// plumbing" shape — precondition must be `None`.
+fn cabinet_no_outer_ip_guard() -> Vec<Assignment> {
+    cabinet_a()
+}
+
+#[test]
+fn precondition_captured_from_outer_ip_guard() {
+    let asns = cabinet_with_outer_ip_guard("--trapMode", "--alarmActive");
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor, got {:?}", descs);
+    let pre = descs[0]
+        .precondition
+        .as_ref()
+        .expect("outer-wrapped IP should produce a precondition");
+    let Precondition::NoOverrides(tests) = pre;
+    assert_eq!(
+        tests.len(),
+        2,
+        "both override branches should be captured: {:?}",
+        tests,
+    );
+    // Verify the captured slot names are the wrapper's verbatim
+    // (cardinal-rule: no name mangling).
+    let captured_slots: Vec<&str> = tests
+        .iter()
+        .map(|t| match t {
+            StyleTest::Single { property, .. } => property.as_str(),
+            _ => panic!("expected Single tests, got {:?}", t),
+        })
+        .collect();
+    assert!(captured_slots.contains(&"--trapMode"));
+    assert!(captured_slots.contains(&"--alarmActive"));
+}
+
+/// Cardinal-rule probe: renaming the override slots produces a
+/// structurally-equivalent precondition with the new names —
+/// no character-level inspection of slot names anywhere.
+#[test]
+fn precondition_renaming_blind() {
+    let a = recognise_loops(&cabinet_with_outer_ip_guard("--trapMode", "--alarmActive"));
+    let b = recognise_loops(&cabinet_with_outer_ip_guard("--zorch", "--quux"));
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), 1);
+    let pa = a[0].precondition.as_ref().expect("a precondition");
+    let pb = b[0].precondition.as_ref().expect("b precondition");
+    let Precondition::NoOverrides(ta) = pa;
+    let Precondition::NoOverrides(tb) = pb;
+    // Same count of override branches, both Single shape — structurally
+    // equivalent. Slot names differ as expected.
+    assert_eq!(ta.len(), tb.len());
+    let extract = |ts: &[StyleTest]| -> Vec<String> {
+        ts.iter()
+            .map(|t| match t {
+                StyleTest::Single { property, .. } => property.clone(),
+                _ => unreachable!(),
+            })
+            .collect()
+    };
+    let names_a = extract(ta);
+    let names_b = extract(tb);
+    assert!(names_a.contains(&"--trapMode".to_string()));
+    assert!(names_a.contains(&"--alarmActive".to_string()));
+    assert!(names_b.contains(&"--zorch".to_string()));
+    assert!(names_b.contains(&"--quux".to_string()));
+    // The structurally renamed cabinet must produce zero name overlap
+    // with the original — proves no name was hardcoded by the
+    // recogniser.
+    for n in &names_a {
+        assert!(
+            !names_b.contains(n),
+            "renamed cabinet should not share any slot names: {} appeared in both",
+            n,
+        );
+    }
+}
+
+#[test]
+fn precondition_none_when_no_outer_wrapper() {
+    // cabinet_a's IP is `Calc::Add(<bare dispatch>, var(--prefixLen))`
+    // — no StyleCondition wrapper around the dispatch. The
+    // recogniser must report `precondition = None`, not an empty
+    // `NoOverrides(vec![])`.
+    let descs = recognise_loops(&cabinet_no_outer_ip_guard());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        assert!(
+            d.precondition.is_none(),
+            "cabinet_a has no outer IP wrapper; descriptor for 0x{:x} should have precondition=None, got {:?}",
+            d.key_value,
+            d.precondition,
+        );
+    }
+}
+
+#[test]
+fn precondition_captured_for_outer_wrappers_are_stripped_shape() {
+    // Sanity check: the existing `outer_wrappers_are_stripped` test
+    // builds a cabinet whose IP wrapper has branches keyed on
+    // --trapMode / --alarmActive. That test asserts the loop is still
+    // recognised; this test asserts the wrapper branches end up as
+    // the descriptor's precondition.
+    let pred = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--inhibit", 0.0),
+    ]);
+    let cx_inner = dispatch(
+        "--op",
+        vec![(0xAA as f64, counter_body(no_rep, "--prevCount"))],
+        keep_self("--prevCount"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            ip_body(pred.clone(), "--prevPC", var("--introBytes"), 1),
+        )],
+        keep_self("--prevPC"),
+    );
+    let di_inner = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--prevHand",
+                1,
+                "--prevMood",
+                10,
+                "--clampLow",
+                "--bitN",
+            ),
+        )],
+        keep_self("--prevHand"),
+    );
+    let ip_passthrough = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--trapMode", 1.0),
+                then: var("--prevPC"),
+            },
+            StyleBranch {
+                condition: style_eq("--alarmActive", 1.0),
+                then: var("--prevPC"),
+            },
+        ],
+        fallback: Box::new(ip_inner),
+    };
+    // The IP is then wrapped in calc(... + var(introBytes)) — the
+    // recogniser must descend through Calc *and* the StyleCondition.
+    let ip_wrapped = add(ip_passthrough, var("--introBytes"));
+    let cx_wrapped = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--trapMode", 1.0),
+                then: var("--prevCount"),
+            },
+            StyleBranch {
+                condition: style_eq("--alarmActive", 1.0),
+                then: var("--prevCount"),
+            },
+        ],
+        fallback: Box::new(cx_inner),
+    };
+    let di_wrapped = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--trapMode", 1.0),
+                then: var("--prevHand"),
+            },
+            StyleBranch {
+                condition: style_eq("--alarmActive", 1.0),
+                then: var("--prevHand"),
+            },
+        ],
+        fallback: Box::new(di_inner),
+    };
+    let asns = vec![
+        assign("--count", cx_wrapped),
+        assign("--pc", ip_wrapped),
+        assign("--hand", di_wrapped),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1);
+    let pre = descs[0]
+        .precondition
+        .as_ref()
+        .expect("calc-wrapped style-wrapped IP should still produce precondition");
+    let Precondition::NoOverrides(tests) = pre;
+    assert_eq!(tests.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Precondition runtime evaluation.
+// ---------------------------------------------------------------------------
+
+/// Build a minimal CompiledProgram with the given property→slot
+/// mapping. Only `property_slots` and `slot_count` are populated —
+/// the precondition evaluator never touches the rest.
+fn program_with_slots(slots: &[&str]) -> crate::compile::CompiledProgram {
+    use std::collections::HashMap;
+    let mut property_slots: HashMap<String, u32> = HashMap::new();
+    for (i, name) in slots.iter().enumerate() {
+        property_slots.insert((*name).to_string(), i as u32);
+    }
+    crate::compile::CompiledProgram {
+        ops: Vec::new(),
+        slot_count: slots.len() as u32,
+        writeback: Vec::new(),
+        broadcast_writes: Vec::new(),
+        packed_broadcast_writes: Vec::new(),
+        packed_cell_tables: Vec::new(),
+        packed_exception_tables: Vec::new(),
+        dispatch_tables: Vec::new(),
+        chain_tables: Vec::new(),
+        flat_dispatch_arrays: Vec::new(),
+        property_slots,
+        functions: Vec::new(),
+        windowed_byte_array: None,
+        loop_descriptors: Vec::new(),
+    }
+}
+
+#[test]
+fn evaluate_precondition_no_overrides_all_false_returns_true() {
+    // Precondition: "dispatch fires iff no override is true". When
+    // every override slot reads 0, dispatch fires → returns true.
+    let pre = Precondition::NoOverrides(vec![
+        style_eq("--trap", 1.0),
+        style_eq("--alarm", 1.0),
+    ]);
+    let prog = program_with_slots(&["--trap", "--alarm"]);
+    let state = crate::state::State::new(1 << 10);
+    let slots = [0, 0]; // both override slots = 0
+    assert!(evaluate_precondition(&pre, &prog, &state, &slots));
+}
+
+#[test]
+fn evaluate_precondition_no_overrides_one_true_returns_false() {
+    let pre = Precondition::NoOverrides(vec![
+        style_eq("--trap", 1.0),
+        style_eq("--alarm", 1.0),
+    ]);
+    let prog = program_with_slots(&["--trap", "--alarm"]);
+    let state = crate::state::State::new(1 << 10);
+
+    // --trap = 1 → override fires → dispatch did NOT fire → precondition false.
+    let slots = [1, 0];
+    assert!(!evaluate_precondition(&pre, &prog, &state, &slots));
+
+    // --alarm = 1 → same.
+    let slots = [0, 1];
+    assert!(!evaluate_precondition(&pre, &prog, &state, &slots));
+
+    // Both set: still false.
+    let slots = [1, 1];
+    assert!(!evaluate_precondition(&pre, &prog, &state, &slots));
+}
+
+#[test]
+fn evaluate_precondition_resolves_through_state_vars_when_slot_missing() {
+    // Override slot lives in state_vars (the read_mem / state_var
+    // routing applier shares). The evaluator's read_prop_runtime
+    // tries property_slots first, then state.get_var by bare name.
+    use crate::types::{CssValue, PropertyDef, PropertySyntax};
+    let pre = Precondition::NoOverrides(vec![style_eq("--_irqActive", 1.0)]);
+    let prog = program_with_slots(&[]); // no slot for --_irqActive
+    let mut state = crate::state::State::new(1 << 10);
+    state.load_properties(&[PropertyDef {
+        name: "--_irqActive".to_string(),
+        syntax: PropertySyntax::Integer,
+        inherits: false,
+        initial_value: Some(CssValue::Integer(0)),
+    }]);
+    let slots: [i32; 0] = [];
+
+    // _irqActive = 0 → precondition holds.
+    assert!(evaluate_precondition(&pre, &prog, &state, &slots));
+
+    // _irqActive = 1 → override fires.
+    state.set_var("_irqActive", 1);
+    assert!(!evaluate_precondition(&pre, &prog, &state, &slots));
+}

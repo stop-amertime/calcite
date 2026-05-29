@@ -191,6 +191,59 @@ pub struct LoopDescriptor {
     /// panics, which is correct because the flag-conditioned ReadOnly
     /// shape MUST have a comparison source somewhere in the cabinet.
     pub comparison_shape: Option<ComparisonShape>,
+    /// The cabinet's own outer-guard predicate for whether the rep
+    /// dispatch's normal branch fires this tick. Captured structurally
+    /// from the `StyleCondition` wrappers that the recogniser strips on
+    /// its way down to the dispatch (see `find_inner_dispatch`'s
+    /// fallback-descent rule): every wrapper whose `fallback` contains
+    /// the inner dispatch contributes its branch conditions to a set
+    /// of "override conditions". The dispatch fires iff none of those
+    /// conditions match the current state — i.e., the wrapper's
+    /// fallback (else) branch was reached.
+    ///
+    /// `Some(Precondition::NoOverrides(tests))` when at least one
+    /// outer wrapper was stripped on the way to the inner dispatch.
+    /// `None` when the IP slot's assignment was already a bare
+    /// single-key dispatch with no wrappers (a brainfuck / 6502
+    /// cabinet without TF/IRQ override plumbing). In the `None`
+    /// case the applier treats the precondition as trivially true
+    /// and proceeds — fast-forward is always safe per shape alone.
+    ///
+    /// **Cardinal-rule probe.** The `StyleTest`s captured here are the
+    /// cabinet's own wrapper-branch conditions, opaque slot names and
+    /// all. A cabinet whose wrappers use entirely different slot names
+    /// (or none at all) produces a structurally-equivalent
+    /// `Precondition` (or `None`) without any character-level
+    /// inspection of slot names by the recogniser.
+    pub precondition: Option<Precondition>,
+}
+
+/// The cabinet's own outer-guard predicate for whether a recognised
+/// self-loop's dispatch body fires this tick.
+///
+/// Stored separately from `predicate` (which is the *inner* loop-
+/// continuation predicate read off the IP body's `StyleCondition`):
+/// `Precondition` describes the *outer* `StyleCondition` wrappers
+/// that the recogniser stripped to find the dispatch in the first
+/// place. The dispatch fires iff this precondition holds, evaluated
+/// against the post-tick slot view.
+///
+/// Currently only one shape is captured (`NoOverrides`); adding more
+/// shapes is a matter of extending this enum and the matching
+/// evaluator arm in [`evaluate_precondition`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Precondition {
+    /// "None of the listed wrapper-branch conditions hold." Captures
+    /// the structural fact that the recogniser descended into a
+    /// `StyleCondition`'s `fallback` to find the dispatch: that
+    /// fallback fires iff every branch condition above it evaluated
+    /// false.
+    ///
+    /// An empty `Vec` is degenerate — it means the precondition is
+    /// trivially true. The recogniser doesn't emit an empty
+    /// `NoOverrides`; the enclosing `Option<Precondition>` is `None`
+    /// in that case.
+    NoOverrides(Vec<StyleTest>),
 }
 
 /// How a flag-conditioned ReadOnly loop (CMPS / SCAS family) performs
@@ -949,6 +1002,8 @@ fn recognise_one_opcode<'a>(
         None
     };
 
+    let precondition = extract_precondition(assignment_index, ip_prop);
+
     Some(LoopDescriptor {
         key_property: family.key_property.clone(),
         key_value,
@@ -965,7 +1020,224 @@ fn recognise_one_opcode<'a>(
         per_iter_cycles,
         ip_extra_advance_slot,
         comparison_shape,
+        precondition,
     })
+}
+
+/// Walk the IP slot's top-level assignment expression and capture every
+/// `StyleCondition` wrapper whose `fallback` is what gets descended into
+/// to find the inner dispatch. The branches of each such wrapper are
+/// "override conditions": each branch's `condition` is a `StyleTest`
+/// that, when true, replaces the dispatch's normal result for this
+/// tick. The dispatch fires iff *none* of those branch conditions
+/// match the current state — that's the cabinet's own outer guard.
+///
+/// **Cardinal-rule shape.** This matcher inspects only:
+/// - `Expr` node shape (`StyleCondition`, `Calc`).
+/// - The downstream `find_inner_dispatch` rule (used to identify which
+///   side of a wrapper contains the dispatch).
+///
+/// It does NOT inspect any character of any property name. The returned
+/// `StyleTest`s carry whatever opaque slot names the cabinet used. A
+/// cabinet with no outer wrappers (a bare dispatch on the IP slot)
+/// produces `None`. A cabinet whose wrappers test different slot names
+/// produces `Some(Precondition::NoOverrides(<those tests verbatim>))`
+/// — renaming the override slots does not affect the extraction.
+fn extract_precondition(
+    assignment_index: &HashMap<&str, &Expr>,
+    ip_prop: &str,
+) -> Option<Precondition> {
+    let top = *assignment_index.get(ip_prop)?;
+    let mut overrides: Vec<StyleTest> = Vec::new();
+    collect_override_branches(top, &mut overrides);
+    if overrides.is_empty() {
+        None
+    } else {
+        Some(Precondition::NoOverrides(overrides))
+    }
+}
+
+/// Recursively walk an expression, collecting any `StyleCondition`
+/// wrapper-branch conditions encountered on the way down to the inner
+/// dispatch. A wrapper is identified by the same rule
+/// `find_inner_dispatch` uses for descent: the dispatch lives in the
+/// `fallback`, and the branches are "override" cases that produce a
+/// non-dispatch result.
+///
+/// Mirrors `find_inner_dispatch`'s descent rule. Differs only in what
+/// it returns — instead of the inner dispatch `Expr`, it collects
+/// override branch conditions along the way.
+fn collect_override_branches(expr: &Expr, out: &mut Vec<StyleTest>) {
+    // Direct dispatch — no wrapper at this level, stop.
+    if is_single_key_dispatch(expr) {
+        return;
+    }
+    // Descend through Calc — record nothing; calc wrappers don't
+    // gate the dispatch.
+    if let Expr::Calc(op) = expr {
+        descend_calc_for_overrides(op, out);
+        return;
+    }
+    // StyleCondition: if the fallback contains the inner dispatch, the
+    // branch conditions here are override gates.
+    if let Expr::StyleCondition { branches, fallback } = expr {
+        if !branches.is_empty() {
+            if find_inner_dispatch(fallback).is_some() {
+                for b in branches {
+                    out.push(b.condition.clone());
+                }
+                collect_override_branches(fallback, out);
+                return;
+            }
+            // The other accepted shape in find_inner_dispatch:
+            // mixed-key StyleCondition with a dominant dispatch key.
+            // In this case the dispatch IS the StyleCondition itself
+            // (with some branches being wrapper overrides folded into
+            // the same chain). The folded wrapper branches are NOT
+            // captured as preconditions here — they're already part of
+            // the dispatch structure that the per-key body extraction
+            // skips over. Treat as no-wrapper-at-this-level.
+        }
+    }
+}
+
+fn descend_calc_for_overrides(op: &CalcOp, out: &mut Vec<StyleTest>) {
+    match op {
+        CalcOp::Add(a, b)
+        | CalcOp::Sub(a, b)
+        | CalcOp::Mul(a, b)
+        | CalcOp::Div(a, b)
+        | CalcOp::Mod(a, b)
+        | CalcOp::Pow(a, b) => {
+            if find_inner_dispatch(a).is_some() {
+                collect_override_branches(a, out);
+            } else if find_inner_dispatch(b).is_some() {
+                collect_override_branches(b, out);
+            }
+        }
+        CalcOp::Min(args) | CalcOp::Max(args) => {
+            for arg in args {
+                if find_inner_dispatch(arg).is_some() {
+                    collect_override_branches(arg, out);
+                    break;
+                }
+            }
+        }
+        CalcOp::Clamp(a, b, c) => {
+            for arg in [a.as_ref(), b.as_ref(), c.as_ref()] {
+                if find_inner_dispatch(arg).is_some() {
+                    collect_override_branches(arg, out);
+                    break;
+                }
+            }
+        }
+        CalcOp::Round(_, a, b) => {
+            if find_inner_dispatch(a).is_some() {
+                collect_override_branches(a, out);
+            } else if find_inner_dispatch(b).is_some() {
+                collect_override_branches(b, out);
+            }
+        }
+        CalcOp::Sign(a) | CalcOp::Abs(a) | CalcOp::Negate(a) => {
+            collect_override_branches(a, out);
+        }
+    }
+}
+
+/// Evaluate a captured [`Precondition`] against the current runtime
+/// slot view. Used by the applier at entry to decide whether the
+/// cabinet's normal dispatch branch is what just fired this tick —
+/// when this returns `false`, the cabinet's outer wrapper took over
+/// and produced its own (correct) post-state; the applier has
+/// nothing to do.
+///
+/// Cardinal-rule note: only slot identity (whole-name lookup via
+/// `program.property_slots` / `state.state_vars`) is used to read
+/// each tested slot's value. The `Expr` on the right-hand side of a
+/// `StyleTest::Single` is evaluated by [`evaluate_style_test_rhs`],
+/// which handles the literal-only shapes the recogniser captures.
+pub(crate) fn evaluate_precondition(
+    pre: &Precondition,
+    program: &crate::compile::CompiledProgram,
+    state: &crate::state::State,
+    slots: &[i32],
+) -> bool {
+    match pre {
+        Precondition::NoOverrides(overrides) => {
+            // Dispatch fires iff *every* override condition is false.
+            !overrides
+                .iter()
+                .any(|t| evaluate_style_test_runtime(t, program, state, slots))
+        }
+    }
+}
+
+/// Evaluate a single [`StyleTest`] against the runtime slot view.
+///
+/// Mirrors the resolver inside `rep_applier::read_prop`: try
+/// `program.property_slots` first, then `state.state_vars` by bare
+/// name. Comparison is integer equality (consistent with how the rest
+/// of calcite-core evaluates `style()` tests — see
+/// `Evaluator::eval_style_test`).
+///
+/// `StyleTest::Single` is the only shape the precondition recogniser
+/// emits today (outer wrapper branch conditions are always single
+/// `style(--prop: value)` tests in kiln-emitted cabinets), but
+/// `And`/`Or` are handled too so the evaluator works on hand-built
+/// test descriptors.
+fn evaluate_style_test_runtime(
+    test: &StyleTest,
+    program: &crate::compile::CompiledProgram,
+    state: &crate::state::State,
+    slots: &[i32],
+) -> bool {
+    match test {
+        StyleTest::Single { property, value } => {
+            let prop_val = read_prop_runtime(program, state, slots, property);
+            let test_val = evaluate_style_test_rhs(value);
+            prop_val == test_val
+        }
+        StyleTest::And(tests) => tests
+            .iter()
+            .all(|t| evaluate_style_test_runtime(t, program, state, slots)),
+        StyleTest::Or(tests) => tests
+            .iter()
+            .any(|t| evaluate_style_test_runtime(t, program, state, slots)),
+    }
+}
+
+/// Resolve a property name's current value through the same
+/// program-slots-then-state-vars routing the applier uses for every
+/// other slot read. Missing slots resolve to 0 (matches the
+/// `Evaluator::resolve_property` default for unset numeric slots).
+fn read_prop_runtime(
+    program: &crate::compile::CompiledProgram,
+    state: &crate::state::State,
+    slots: &[i32],
+    name: &str,
+) -> i64 {
+    if let Some(&s) = program.property_slots.get(name) {
+        return slots[s as usize] as i64;
+    }
+    let bare = name.strip_prefix("--").unwrap_or(name);
+    state.get_var(bare).map(|v| v as i64).unwrap_or(0)
+}
+
+/// Evaluate the RHS of a `StyleTest::Single`. The recogniser only
+/// captures `Expr::Literal` RHS values (cabinet outer wrappers test
+/// against constants like `1` / `0`). Anything else is treated as
+/// the comparison failing — the captured shape didn't fit a literal,
+/// so we conservatively report "this override fired" by returning a
+/// value the LHS can never match.
+fn evaluate_style_test_rhs(value: &Expr) -> i64 {
+    match value {
+        Expr::Literal(v) => *v as i64,
+        // Captured wrapper conditions today only test against literals.
+        // If a future cabinet shape emits a non-literal RHS we'd need
+        // a richer evaluator; for now bail to a sentinel that won't
+        // match any LHS slot read.
+        _ => i64::MIN,
+    }
 }
 
 /// Extract the name of an extra-add slot wrapping the IP slot's dispatch.
