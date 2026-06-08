@@ -11,6 +11,67 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-06-08 — FINDING: rep-generic dispatcher landed, but recogniser's ip_extra_advance_slot shape is wrong for real cabinets
+
+Branch `feat/rep-generic` (commit `247b274`, recovered from a wedged
+2026-05-29 session that hung awaiting a never-delivered task
+notification). Cross-link: CSS-DOS LOGBOOK / STATUS 2026-06-08.
+
+**What landed (recovered + committed + pushed):** the Task 3.5
+descriptor-driven dispatcher rewrite in `compile.rs` `rep_fast_forward`
+(+120 / −522): deletes the hardcoded x86 opcode-table path, routes
+purely through a `LoopDescriptor` lookup keyed by opcode value →
+`BulkClass` → `apply_{fill,copy,read_only}_with_commit`. No
+`matches!(opcode, 0xAA | ...)`, no env toggle, "this is the only path";
+unsupported/`PerIter` shapes panic loudly (no silent slow path). Also
+deleted the now-obsolete `tests/rep_fast_forward.rs` integration test
+(it asserted the deleted opcode-table behaviour). Full lib unit suite
+green: 281 + 28 + 7 + 5 + 10, 0 failed. calcite-core / calcite-cli /
+calcite-debugger all build.
+
+**The gap (verified against real cabinet CSS, not argued):** smoke
+6/7 carts panic —
+`rep_fast_forward: applier-unsupported — REPE/REP STOSW (op=0xab) ...
+ip_extra_advance_slot not captured`. `hello-text` passes (little REP
+work). Root cause is a **recogniser shape mismatch**, not the
+dispatcher:
+
+- `extract_ip_extra_advance_slot` (`pattern/loop_descriptor.rs:1266`)
+  models IP-advance as a top-level `Calc(Add(dispatch, bareVar))` and
+  captures the `Var` as `ip_extra_advance_slot`. The
+  `ip_extra_advance_slot_*` unit tests all hand-build exactly that
+  shape (`add(ip_dispatch, var("--prefixLen"))`) → they pass while
+  every real cabinet panics. The tests encode the recogniser's *wrong
+  model*, so green unit tests gave false confidence.
+- The real cabinet (cga4-stripes, `--IP` assignment) is a different
+  shape entirely: `--IP: if(--_tf; --_irqActive; else: calc(<dispatch
+  on --opcode>))`, and the **per-opcode body** for STOSW (171) is
+  `if(--_repContinue:1 : calc(__1IP − prefixLen); else: calc(__1IP +
+  1))`. So `prefixLen` appears as a **subtraction inside a
+  `_repContinue`-gated per-key body** (IP backs up by prefixLen to
+  re-run the REP each iteration; +1 after the loop ends) — NOT as a
+  top-level `Add(dispatch, Var)`.
+
+**Why it's not a one-liner.** Grabbing the slot name is trivial;
+modelling it *correctly* is not. The applier must reproduce Chrome's
+post-REP IP, which here is the `else` branch (`__1IP + 1`) reached when
+`_repContinue` goes false. The descriptor + applier have to model that
+two-branch IP semantics, not just capture a name — getting it wrong
+silently corrupts IP after every REP. This is correctness-critical
+recogniser design the dead session never reached; my first hypothesis
+(just descend through the TF/IRQ `StyleCondition` wrappers, reusing
+`collect_override_branches`) was **disproven** by the real CSS — the
+wrapper descent isn't the issue, the per-key gated-subtraction shape
+is.
+
+**Next step (unfinished):** teach the recogniser the
+`_repContinue ? IP − prefixLen : IP + 1` per-key IP body shape, capture
+`prefixLen` from the subtraction, and make the applier commit the
+post-REP `+1` branch. Then re-run smoke 7/7 and the ±1% perf bench
+(neither has passed yet — do NOT call this branch "landed"). Open
+question still unaddressed: whether all 6 failing carts share this one
+shape or there are further independent recogniser gaps behind it.
+
 ## 2026-05-28 — input-edge apply moved off per-tick path (Phase 4)
 
 Branch `feat/keyboard-pseudo-input`. Cross-link: CSS-DOS LOGBOOK
