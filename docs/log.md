@@ -11,6 +11,45 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-06-09 — FINDING: per-tick op profile — 845 ops/tick, >⅓ pure data movement; copy elimination is the biggest unlisted lever
+
+Read-only analysis on `main` `8de61a8`, no code changes. Cross-link:
+CSS-DOS LOGBOOK 2026-06-09 (this entry + the doomLoad tick-share
+correction — kernel ~49%, `__I4D` ~22%, not 46%).
+
+Measured with the existing `--op-profile` (doom8088, 2M-tick boot
+window, 1.69 G dispatched ops) — first time anyone pulled the
+per-tick magnitude from it:
+
+- **845 dispatched ops per tick** (= per guest instruction). The
+  "280 K ops" figure is program size; branches skip most of it.
+- **LoadSlot 27.9% + LoadLit 8.3% — over ⅓ of runtime is moves.**
+  #2 adjacency overall is LoadSlot→LoadSlot (10%): copy *chains*.
+  Sources read from the emit code: `flatten_calls` copies args into
+  per-function shared param slots and the result back out
+  (`compile.rs:3450`/`3461` on `8de61a8`); dispatch entries copy
+  `entry_result` → dispatch dst. **Proposed pass:** per-call-site
+  copy propagation at inline time + dead-copy elimination over the
+  flat stream. Linear-time, shape-only, zero cardinal-rule surface.
+- Branch/dispatch machinery ≈30%: BIfNEL 20.9%, DispatchChain 4.1%
+  (35/tick), Dispatch 2.8% (24/tick — the 2026-05-14 list's "~50
+  probes/tick" guess was accurate), Jump 2.3%.
+- Per-op cost ≈2.6 ns in WASM at ~448 K t/s — the interpreter is
+  already lean per op. The lever is op *count* (845 → ~50
+  semantically needed): copy elimination first, per-dispatch-key
+  specialisation as the structural follow-up, load-time WASM codegen
+  as the long-arc multiplier.
+
+Corrections to the record: (1) the 2026-05-14 list's item 5
+("bounds-checked Vec<i64> slot access", rated easiest win) was stale
+when written — unchecked slot macros landed 2026-04-14 (`490a8bf`)
+and slots are `i32`; that explains the "item 5 → −30%, never retry"
+DEAD entry (it re-attempted a done thing). (2) `COLUMN_DRAWER_BODY`
+(`compile.rs` ~5787) hardcodes 21 bytes of Doom's x86 column drawer
+in the engine — default-off and dead on wasm32, but it is upstream
+knowledge; delete at genericity-ship time alongside
+`rep_fast_forward`.
+
 ## 2026-06-08 — FINDING: rep-generic dispatcher landed, but recogniser's ip_extra_advance_slot shape is wrong for real cabinets
 
 Branch `feat/rep-generic` (commit `247b274`, recovered from a wedged
