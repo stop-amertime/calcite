@@ -131,23 +131,42 @@ pub(crate) enum CommitMode {
 // See `LoopDescriptor::ip_extra_advance_slot` and the resolution in
 // `commit_ip_and_cycles` below.)
 
-/// Look up a property name's current value. Mirrors the resolver inside
-/// `compile.rs::rep_fast_forward`: try the compiled program's
-/// `property_slots` first (which resolves slot-allocated CSS properties),
-/// then fall back to `state.state_vars` by bare name (which resolves the
-/// register-shaped state vars the cabinet wires through `--CX`/`--DI`/
-/// etc.). Returns `None` if neither table has the name.
+/// Look up a property name's current value, using the same routing the
+/// compiler gives reads of that name (`compile.rs::resolve_property`):
+///
+/// 1. Buffer-copy names (`is_buffer_copy`) skip the slot table — the
+///    engine compiles those reads as loads of the committed state
+///    address, so we resolve them through `property_to_address` +
+///    `state.read_mem` (negative addresses are state vars). This is what
+///    makes the cabinet's prior-tick pointer mirrors (the
+///    `self_property` of a PointerEntry) resolvable here.
+/// 2. Every other name tries the compiled `property_slots` (current-tick
+///    slot view), then the state-var table by bare name, then the
+///    engine's address map as a last resort.
+///
+/// Matching the compiler's routing is what keeps the applier's view of a
+/// slot equal to what the cabinet's own compiled reads would see —
+/// i.e. what Chrome computes. Returns `None` if no table has the name.
 fn read_prop(
     program: &CompiledProgram,
     state: &State,
     slots: &[i32],
     name: &str,
 ) -> Option<i32> {
-    if let Some(&s) = program.property_slots.get(name) {
-        return Some(slots[s as usize]);
+    if !crate::eval::is_buffer_copy(name) {
+        if let Some(&s) = program.property_slots.get(name) {
+            return Some(slots[s as usize]);
+        }
+        let bare = name.strip_prefix("--").unwrap_or(name);
+        if let Some(v) = state.get_var(bare) {
+            return Some(v);
+        }
     }
-    let bare = name.strip_prefix("--").unwrap_or(name);
-    state.get_var(bare)
+    let addr = crate::eval::property_to_address(name)?;
+    if addr < 0 {
+        return Some(state.read_mem(addr));
+    }
+    None
 }
 
 /// Resolve a `val_expr` to its current i32 value, structurally.
@@ -545,16 +564,16 @@ pub(crate) fn apply_copy_with_commit(
         .as_ref()
         .map(|(s, _)| s.as_str())
         .unwrap();
-    let src_seg_name_opt = descriptor.writes[0]
-        .val_indirect_read
-        .as_ref()
-        .and_then(|ir| ir.seg_property.as_deref());
+    let src_ir0 = descriptor.writes[0].val_indirect_read.as_ref();
+    let src_seg_name_opt = src_ir0.and_then(|ir| ir.seg_property.as_deref());
     let Some(src_seg_name) = src_seg_name_opt else {
         return ApplyOutcome::Unsupported(
             "Copy val_indirect_read has no seg decomposition",
         );
     };
-    // Every write must agree on its decomposed segment slots too.
+    let src_seg_scaled = src_ir0.map(|ir| ir.seg_times_sixteen).unwrap_or(false);
+    // Every write must agree on its decomposed segment slots too —
+    // including whether the captured base was ×16-shaped.
     for w in &descriptor.writes {
         let dst_seg = w.addr_decomposition.as_ref().map(|(s, _)| s.as_str()).unwrap();
         if dst_seg != dst_seg_name {
@@ -566,6 +585,9 @@ pub(crate) fn apply_copy_with_commit(
             .and_then(|ir| ir.seg_property.as_deref());
         if src_seg != Some(src_seg_name) {
             return ApplyOutcome::Unsupported("Copy writes disagree on src seg");
+        }
+        if w.val_indirect_read.as_ref().map(|ir| ir.seg_times_sixteen) != Some(src_seg_scaled) {
+            return ApplyOutcome::Unsupported("Copy writes disagree on src seg scaling");
         }
     }
     let Some(dst_ptr_value) = read_prop(program, state, slots, dst_ptr_name) else {
@@ -633,7 +655,15 @@ pub(crate) fn apply_copy_with_commit(
     // hardware iteration order to preserve those semantics; this
     // applier does the same by reading and writing each byte through
     // `state.read_mem` / `bulk_store_byte` in the same order.
-    let src_seg_base = (src_seg_value as i64) * 16;
+    // Scale the source base exactly as the cabinet's own captured shape
+    // does: `var(seg)*16 + ptr` shapes scale here; `var(base) + ptr`
+    // shapes captured a slot that already holds the full addend (e.g. a
+    // segment-override-aware pre-scaled base).
+    let src_seg_base = if src_seg_scaled {
+        (src_seg_value as i64) * 16
+    } else {
+        src_seg_value as i64
+    };
     let dst_ptr_i64 = dst_ptr_value as i64;
     let src_ptr_i64 = src_ptr_value as i64;
     for i in 0..n64 {
@@ -661,6 +691,22 @@ pub(crate) fn apply_copy_with_commit(
     }
 
     ApplyOutcome::Applied { iterations: n }
+}
+
+/// Trace gate for the flag-conditioned (CMPS/SCAS-shape) walker —
+/// same env var as the deleted hardcoded path's tracer, so existing
+/// debugging workflows keep working. Prints one line per fast-forward
+/// with the fields that matter for divergence hunting (iteration
+/// count, pointer travel, the last compared pair, committed flags).
+#[cfg(not(target_arch = "wasm32"))]
+fn trace_cmps_scas_enabled() -> bool {
+    use std::sync::OnceLock;
+    static T: OnceLock<bool> = OnceLock::new();
+    *T.get_or_init(|| std::env::var("CALCITE_REP_TRACE_CMPS_SCAS").is_ok())
+}
+#[cfg(target_arch = "wasm32")]
+fn trace_cmps_scas_enabled() -> bool {
+    false
 }
 
 /// Apply a `BulkClass::ReadOnly` descriptor to state. The structural contract:
@@ -821,9 +867,16 @@ pub(crate) fn apply_read_only_with_commit(
     let Some(cmp) = descriptor.comparison_shape.as_ref() else {
         return ApplyOutcome::Unsupported("comparison_shape not captured");
     };
-    let dst_seg_value =
-        read_prop(program, state, slots, &cmp.dst_seg_property).unwrap_or(0) & 0xFFFF;
-    let dst_seg_base = (dst_seg_value as i64) * 16;
+    // Scale each base exactly as its captured shape does: ×16 shapes
+    // hold an unscaled 16-bit segment; flat shapes hold the full
+    // (up to 20-bit) addend — masking or rescaling those reads from
+    // the wrong address.
+    let dst_seg_raw = read_prop(program, state, slots, &cmp.dst_seg_property).unwrap_or(0);
+    let dst_seg_base = if cmp.dst_seg_times_sixteen {
+        ((dst_seg_raw & 0xFFFF) as i64) * 16
+    } else {
+        dst_seg_raw as i64
+    };
     let dst_entry = &descriptor.pointers[0];
     let Some(dst_ptr) = read_prop(program, state, slots, &dst_entry.self_property) else {
         return ApplyOutcome::Unsupported("dst pointer unresolved");
@@ -841,7 +894,11 @@ pub(crate) fn apply_read_only_with_commit(
     // the comparison shape's ComparisonSource::Accumulator).
     let is_cmps = p_count == 2;
     let (src_ptr_opt, src_seg_base, scas_acc) = match &cmp.source {
-        crate::pattern::loop_descriptor::ComparisonSource::Pointer { seg_property, .. } => {
+        crate::pattern::loop_descriptor::ComparisonSource::Pointer {
+            seg_property,
+            seg_times_sixteen,
+            ..
+        } => {
             // CMPS-shape. Sanity: comparison's pointer source must
             // match descriptor.pointers[1], and both pointers must share
             // step + direction flag.
@@ -862,8 +919,13 @@ pub(crate) fn apply_read_only_with_commit(
             let Some(src_ptr) = read_prop(program, state, slots, &src_entry.self_property) else {
                 return ApplyOutcome::Unsupported("src pointer unresolved");
             };
-            let src_seg = read_prop(program, state, slots, seg_property).unwrap_or(0) & 0xFFFF;
-            (Some(src_ptr & 0xFFFF), (src_seg as i64) * 16, 0)
+            let src_seg_raw = read_prop(program, state, slots, seg_property).unwrap_or(0);
+            let src_base = if *seg_times_sixteen {
+                ((src_seg_raw & 0xFFFF) as i64) * 16
+            } else {
+                src_seg_raw as i64
+            };
+            (Some(src_ptr & 0xFFFF), src_base, 0)
         }
         crate::pattern::loop_descriptor::ComparisonSource::Accumulator {
             byte_property,
@@ -979,9 +1041,18 @@ pub(crate) fn apply_read_only_with_commit(
         let _ = iters;
         let new_flags = compute_sub_flags(fl_dst, fl_src, is_word, prev_flags);
         // The flag word lives on the slot named by dst_entry.flag_property
-        // (e.g. `--flags`). Commit through the same helper as pointers
-        // so writes route to property_slots first, state vars second.
+        // (the cabinet's own mirror name, e.g. `--__1flags` — resolved to
+        // its committed storage by commit_pointer's address-map routing).
         commit_pointer(state, &dst_entry.flag_property, new_flags);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if trace_cmps_scas_enabled() {
+            eprintln!(
+                "[rep_cmps_scas:gen] rep_type={} n={} iters={} dst_ptr {:#06x}->{:#06x} \
+                 last_src={:#x} last_dst={:#x} flags={:#x}",
+                rep_type, n, iters, dst_ptr & 0xFFFF, di as i32, last_src, last_dst, new_flags,
+            );
+        }
 
         // IP advance and per-iter cycle charge. The `iters` value (not
         // n) is what the hardcoded path uses for the cycle multiplier on
@@ -1011,17 +1082,31 @@ pub(crate) fn apply_read_only_with_commit(
 /// Commit a pointer (or a flag word) to its post-loop value. Used for
 /// DI/SI commits in Fill/Copy and for the flags slot in ReadOnly's
 /// CMPS/SCAS sub-shape.
+///
+/// Resolution mirrors `read_prop`: try the bare state-var name first,
+/// then route through the engine's address map. The second path is what
+/// makes mirror-named slots committable — the descriptor's
+/// `flag_property` is the cabinet's prior-tick mirror (e.g.
+/// `--__1flags`), whose committed storage is the state var the address
+/// map points at. Before this fallback existed, the CMPS/SCAS flags
+/// commit silently no-opped on real cabinets and downstream conditional
+/// jumps ran on stale flags.
 fn commit_pointer(state: &mut State, property: &str, value: i32) {
     let bare = property.strip_prefix("--").unwrap_or(property);
     if state.state_var_index.contains_key(bare) {
         state.set_var(bare, value);
+        return;
     }
-    // If neither the bare name nor the prefixed name exists as a state
-    // var, the cabinet doesn't have this slot reachable through the
-    // state-var path. The hardcoded `rep_fast_forward` only ever writes
-    // through `set_var` so we mirror that — slot-only properties fall
-    // through silently (the recogniser would have flagged a structurally
-    // invalid descriptor before we got here).
+    if let Some(addr) = crate::eval::property_to_address(property) {
+        if addr < 0 {
+            state.write_mem(addr, value);
+        }
+    }
+    // Anything else: the cabinet doesn't have this slot reachable
+    // through the state-var path. The hardcoded `rep_fast_forward` only
+    // ever wrote through `set_var` so we mirror that — slot-only
+    // properties fall through silently (the recogniser would have
+    // flagged a structurally invalid descriptor before we got here).
 }
 
 /// Commit the loop counter to its post-loop value (`0` for Fill/Copy,
@@ -1035,12 +1120,12 @@ fn commit_counter(state: &mut State, property: &str, value: i32) {
 ///     state.set_var("IP", (ip + 1 + extra) & 0xFFFF);
 ///     state.set_var("cycleCount", cc + iters * per_iter);
 ///
-/// The `+ 1` is `descriptor.ip_advance_literal` (the per-iter advance
-/// literal that the dispatch's per-key body adds — extracted
-/// structurally by the recogniser). The `+ extra` is read from
-/// `descriptor.ip_extra_advance_slot`, the cabinet's own name for the
-/// outer-wrapper addend (`Calc(Add(<dispatch>, var(extra)))` shape on
-/// the IP slot's top-level assignment).
+/// The `+ 1` is `descriptor.ip_advance_literal` (the exit branch's
+/// literal — extracted structurally by the recogniser). The `+ extra`
+/// is read from `descriptor.ip_extra_advance_slot`, the cabinet's own
+/// name for the stay branch's subtrahend (`calc(self − var(extra))`).
+/// See `LoopDescriptor::ip_extra_advance_slot` for the fixed-point
+/// argument that makes `IP + literal + extra` the exit branch's value.
 ///
 /// Caller contract: the descriptor's `ip_extra_advance_slot` MUST be
 /// `Some` and the named slot MUST resolve. Both invariants are checked
@@ -1139,6 +1224,7 @@ mod tests {
                 property: "--repContinue".to_string(),
                 value: Expr::Literal(1.0),
             },
+            predicate_means_stay: true,
             counter: Some(CounterEntry {
                 property: "--CX".to_string(),
                 self_property: "--CX_prev".to_string(),
@@ -1171,6 +1257,41 @@ mod tests {
         }
     }
 
+    /// The dispatcher's loop-continuation gate: the descriptor's
+    /// predicate, with its recorded polarity, decides whether a loop is
+    /// mid-flight. Predicate false (e.g. a single-shot run of the same
+    /// opcode, or the final iteration's tick) must NOT fast-forward —
+    /// the divergence this prevents is bulk-applying a stale counter.
+    #[test]
+    fn loop_predicate_gates_fast_forward() {
+        use crate::pattern::loop_descriptor::evaluate_loop_predicate;
+        let program = empty_program_with_descriptor(stosb_descriptor());
+        let desc = &program.loop_descriptors[0];
+        let mut state = rigged_state(&["repContinue"]);
+
+        state.set_var("repContinue", 0);
+        assert!(
+            !evaluate_loop_predicate(desc, &program, &state, &[]),
+            "predicate false (advance branch taken) must gate the fast-forward off",
+        );
+
+        state.set_var("repContinue", 1);
+        assert!(
+            evaluate_loop_predicate(desc, &program, &state, &[]),
+            "predicate true (stay branch taken) must let the fast-forward run",
+        );
+
+        // Inverted polarity: predicate true now means "the loop exited".
+        let mut inverted = stosb_descriptor();
+        inverted.predicate_means_stay = false;
+        let program2 = empty_program_with_descriptor(inverted);
+        let desc2 = &program2.loop_descriptors[0];
+        state.set_var("repContinue", 1);
+        assert!(!evaluate_loop_predicate(desc2, &program2, &state, &[]));
+        state.set_var("repContinue", 0);
+        assert!(evaluate_loop_predicate(desc2, &program2, &state, &[]));
+    }
+
     /// Build a STOSW-shape descriptor: one word-step pointer, two write
     /// entries, low byte then high byte.
     fn stosw_descriptor() -> LoopDescriptor {
@@ -1185,6 +1306,7 @@ mod tests {
                 property: "--repContinue".to_string(),
                 value: Expr::Literal(1.0),
             },
+            predicate_means_stay: true,
             counter: Some(CounterEntry {
                 property: "--CX".to_string(),
                 self_property: "--CX_prev".to_string(),
@@ -1511,6 +1633,7 @@ mod tests {
                 property: "--cont_x".to_string(),
                 value: Expr::Literal(1.0),
             },
+            predicate_means_stay: true,
             counter: Some(CounterEntry {
                 property: "--alpha".to_string(),
                 self_property: "--alpha_prev".to_string(),
@@ -1673,6 +1796,7 @@ mod tests {
                 property: "--repContinue".to_string(),
                 value: Expr::Literal(1.0),
             },
+            predicate_means_stay: true,
             counter: Some(CounterEntry {
                 property: "--CX".to_string(),
                 self_property: "--CX_prev".to_string(),
@@ -1705,6 +1829,7 @@ mod tests {
                 addr_decomposition: Some(("--ES".to_string(), "--DI".to_string())),
                 val_indirect_read: Some(IndirectRead {
                     seg_property: Some("--DS".to_string()),
+                    seg_times_sixteen: true,
                     pointer_property: "--SI".to_string(),
                     intermediate_property: "--_strSrcByte".to_string(),
                 }),
@@ -1715,6 +1840,51 @@ mod tests {
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
             precondition: None,
+        }
+    }
+
+    /// A Copy whose source base was captured from the real kiln shape
+    /// `var(base) + var(ptr)` (no ×16 in the expression): the base slot
+    /// already holds the full scaled addend (kiln's `--_strSrcSeg` is
+    /// `if(override: var(--segOverride); else: calc(var(--__1DS)*16))`).
+    /// The applier must add it as-is — scaling it again reads from an
+    /// address 16× off and silently copies garbage.
+    #[test]
+    fn apply_copy_flat_base_adds_unscaled() {
+        let mut desc = movsb_descriptor();
+        {
+            let ir = desc.writes[0].val_indirect_read.as_mut().unwrap();
+            ir.seg_property = Some("--srcBase".to_string());
+            ir.seg_times_sixteen = false;
+        }
+        let program = empty_program_with_descriptor(desc);
+        let mut state = rigged_state(&[
+            "CX", "DI", "SI", "ES", "srcBase", "flags", "IP", "cycleCount", "prefixLen",
+        ]);
+        state.set_var("CX", 4);
+        state.set_var("DI", 0x10);
+        state.set_var("SI", 0x20);
+        state.set_var("ES", 0x100); // dst linear base 0x1000
+        state.set_var("srcBase", 0x2000); // FLAT base — already scaled
+        state.set_var("flags", 0);
+        for i in 0..4 {
+            state.write_mem(0x2000 + 0x20 + i, 0xA0 + i);
+        }
+        let outcome = apply_copy_with_commit(
+            &program.loop_descriptors[0],
+            &program,
+            &mut state,
+            &[],
+            CommitMode::MemoryOnly,
+        );
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 4 });
+        for i in 0..4 {
+            assert_eq!(
+                state.read_mem(0x1000 + 0x10 + i) & 0xFF,
+                0xA0 + i,
+                "byte {} must be copied from the unscaled flat base",
+                i,
+            );
         }
     }
 
@@ -1732,6 +1902,7 @@ mod tests {
                 property: "--repContinue".to_string(),
                 value: Expr::Literal(1.0),
             },
+            predicate_means_stay: true,
             counter: Some(CounterEntry {
                 property: "--CX".to_string(),
                 self_property: "--CX_prev".to_string(),
@@ -1765,6 +1936,7 @@ mod tests {
                     addr_decomposition: Some(("--ES".to_string(), "--DI".to_string())),
                     val_indirect_read: Some(IndirectRead {
                         seg_property: Some("--DS".to_string()),
+                        seg_times_sixteen: true,
                         pointer_property: "--SI".to_string(),
                         intermediate_property: "--_strSrcByteLo".to_string(),
                     }),
@@ -1780,6 +1952,7 @@ mod tests {
                     addr_decomposition: Some(("--ES".to_string(), "--DI".to_string())),
                     val_indirect_read: Some(IndirectRead {
                         seg_property: Some("--DS".to_string()),
+                        seg_times_sixteen: true,
                         pointer_property: "--SI".to_string(),
                         intermediate_property: "--_strSrcByteHi".to_string(),
                     }),
@@ -2066,6 +2239,7 @@ mod tests {
                 property: "--cont_x".to_string(),
                 value: Expr::Literal(1.0),
             },
+            predicate_means_stay: true,
             counter: Some(CounterEntry {
                 property: "--alpha".to_string(),
                 self_property: "--alpha_prev".to_string(),
@@ -2098,6 +2272,7 @@ mod tests {
                 addr_decomposition: Some(("--epsilon".to_string(), "--beta".to_string())),
                 val_indirect_read: Some(IndirectRead {
                     seg_property: Some("--eta".to_string()),
+                    seg_times_sixteen: true,
                     pointer_property: "--zeta".to_string(),
                     intermediate_property: "--theta".to_string(),
                 }),
@@ -2248,6 +2423,7 @@ mod tests {
                 property: "--repContinue".to_string(),
                 value: Expr::Literal(1.0),
             },
+            predicate_means_stay: true,
             counter: Some(CounterEntry {
                 property: "--CX".to_string(),
                 self_property: "--CX_prev".to_string(),
@@ -2284,6 +2460,7 @@ mod tests {
                 property: "--repContinue".to_string(),
                 value: Expr::Literal(1.0),
             },
+            predicate_means_stay: true,
             counter: Some(CounterEntry {
                 property: "--CX".to_string(),
                 self_property: "--CX_prev".to_string(),
@@ -2313,9 +2490,11 @@ mod tests {
             comparison_shape: Some(crate::pattern::loop_descriptor::ComparisonShape {
                 width: 1,
                 dst_seg_property: "--ES".to_string(),
+                dst_seg_times_sixteen: true,
                 dst_ptr_property: "--DI".to_string(),
                 source: crate::pattern::loop_descriptor::ComparisonSource::Pointer {
                     seg_property: "--DS".to_string(),
+                    seg_times_sixteen: true,
                     ptr_property: "--SI".to_string(),
                 },
                 rep_type_property: Some("--repType".to_string()),
@@ -2350,6 +2529,7 @@ mod tests {
                 property: "--repContinue".to_string(),
                 value: Expr::Literal(1.0),
             },
+            predicate_means_stay: true,
             counter: Some(CounterEntry {
                 property: "--CX".to_string(),
                 self_property: "--CX_prev".to_string(),
@@ -2370,6 +2550,7 @@ mod tests {
             comparison_shape: Some(crate::pattern::loop_descriptor::ComparisonShape {
                 width: 1,
                 dst_seg_property: "--ES".to_string(),
+                dst_seg_times_sixteen: true,
                 dst_ptr_property: "--DI".to_string(),
                 source: crate::pattern::loop_descriptor::ComparisonSource::Accumulator {
                     byte_property: "--AL".to_string(),
@@ -2743,6 +2924,7 @@ mod tests {
                 property: "--cont_x".to_string(),
                 value: Expr::Literal(1.0),
             },
+            predicate_means_stay: true,
             counter: Some(CounterEntry {
                 property: "--alpha".to_string(),
                 self_property: "--alpha_prev".to_string(),

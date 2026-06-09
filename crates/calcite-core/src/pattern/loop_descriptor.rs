@@ -103,6 +103,20 @@ pub struct LoopDescriptor {
     /// `StyleCondition`. The runtime applier evaluates this against the
     /// post-tick slot view to decide whether to fast-forward at all.
     pub predicate: StyleTest,
+    /// Whether `predicate` evaluating true selects the *stay* branch of
+    /// the IP body. Captured from which orientation of the stay/advance
+    /// match succeeded (`true` = stay body was the branch `then`,
+    /// `false` = the emitter inverted the shape and stay is the
+    /// fallback). The runtime gate ([`evaluate_loop_predicate`]) uses
+    /// this polarity: the loop is mid-flight iff the predicate's
+    /// post-tick truth value equals `predicate_means_stay` — i.e. the
+    /// CSS took the stay branch this tick, so the IP slot held its
+    /// value and more iterations remain to collapse.
+    ///
+    /// **Cardinal-rule probe.** Pure shape: both orientations are
+    /// structural facts about which branch holds the `calc(self − …)`
+    /// body. No name or upstream meaning involved.
+    pub predicate_means_stay: bool,
     /// The counter slot, if one was found.
     pub counter: Option<CounterEntry>,
     /// Pointer slots and their step formulas. Order is recogniser-dependent
@@ -150,30 +164,31 @@ pub struct LoopDescriptor {
     /// the cycle counter slot (e.g. `--cycleCount` → `--zorch`) does
     /// not affect the extraction.
     pub per_iter_cycles: Option<i32>,
-    /// Name of an extra slot whose value is added to the IP slot's
-    /// post-dispatch value, when the IP slot's top-level assignment is
-    /// wrapped in `Calc(Add(<dispatch-tree>, Var(extra)))` (commutative).
+    /// Name of an extra slot whose value contributes to the IP slot's
+    /// post-loop advance, captured from the stay branch's subtrahend:
+    /// the per-key IP body `if(<pred>: calc(self − var(extra)); else:
+    /// calc(self + L))` yields `Some("--extra")`.
     ///
-    /// The cabinet's IP assignment is structurally
-    /// `--IP = calc(<style-tree-containing-dispatch> + var(extra))`.
-    /// The dispatch's per-key body already adds an opcode-length literal
-    /// (`ip_advance_literal`); the outer wrapper adds a uniform
-    /// per-instruction contribution (e.g. an optional opcode prefix's
-    /// byte length). The runtime applier needs the post-tick value of
-    /// the extra slot to commit the correct IP after fast-forwarding.
+    /// Why the subtrahend is the extra advance: on a "stay" tick the IP
+    /// slot is a fixed point — its newly assigned value equals its
+    /// current value — so `self − extra (+ any wrapper addend W) = IP`,
+    /// pinning `self = IP + extra − W`. The exit branch then produces
+    /// `self + L + W = IP + extra + L`. Wrapper contributions cancel:
+    /// the post-loop advance over the current IP is `extra + L`
+    /// (`ip_advance_literal` is `L`), derivable from the two branch
+    /// shapes alone. The runtime applier reads the extra slot's current
+    /// value and commits `IP + L + extra` after fast-forwarding.
     ///
-    /// `Some(slot_name)` when the outermost wrapper around the IP
-    /// dispatch is a bare-Var addend; `None` when the IP slot's
-    /// assignment is the dispatch alone (no outer add).
+    /// `Some(slot_name)` when the stay subtrahend is a bare `Var`;
+    /// `None` when it is any other shape (e.g. a literal) — the applier
+    /// then reports the loop unsupported rather than guessing.
     ///
-    /// **Cardinal-rule probe.** A 6502 cabinet whose IP slot has no
-    /// prefix-byte mechanism produces `None`. A brainfuck cabinet whose
-    /// equivalent wrapper names the slot anything at all (`--introBytes`,
-    /// `--zorch`, etc.) produces `Some("--zorch")` — the recogniser
+    /// **Cardinal-rule probe.** A 6502 or brainfuck cabinet whose
+    /// stay branch subtracts a slot of any name (`--introBytes`,
+    /// `--zorch`, etc.) produces `Some` of that name — the recogniser
     /// captures whatever name the cabinet used, without inspecting the
-    /// characters of that name. Renaming the slot does not affect the
-    /// match; the structural fact is "the outermost top-level Calc(Add)
-    /// has a bare-Var operand and the dispatch on the other side."
+    /// characters of that name. The structural fact is "the stay branch
+    /// is `calc(self − var(...))`"; no upstream meaning is consulted.
     pub ip_extra_advance_slot: Option<String>,
     /// Structural comparison shape for flag-conditioned ReadOnly loops
     /// (CMPS / SCAS family). `Some` when the dispatch family contains a
@@ -266,10 +281,13 @@ pub struct ComparisonShape {
     /// loop on another ISA would give a larger value.
     pub width: u8,
     /// Destination-side segment slot. Captured from the address
-    /// decomposition `var(seg) * 16 + var(ptr)` of one operand of the
-    /// comparison `Sub`. The slot name is opaque — no character of any
-    /// name is inspected.
+    /// decomposition `var(seg) * 16 + var(ptr)` or `var(base) + var(ptr)`
+    /// of one operand of the comparison `Sub`. The slot name is opaque —
+    /// no character of any name is inspected.
     pub dst_seg_property: String,
+    /// Whether the destination base sat inside a `* 16` in the captured
+    /// shape (see [`ComparisonSource::Pointer::seg_times_sixteen`]).
+    pub dst_seg_times_sixteen: bool,
     /// Destination-side pointer slot. Equals the destination pointer
     /// entry's `self_property`.
     pub dst_ptr_property: String,
@@ -303,6 +321,12 @@ pub enum ComparisonSource {
     /// (matching the descriptor's second pointer entry).
     Pointer {
         seg_property: String,
+        /// Whether the captured base sat inside a `* 16` in the shape
+        /// (`var(seg)*16 + ptr` → true; flat `var(base) + ptr` → false,
+        /// the slot already holds the full addend — e.g. the cabinet's
+        /// segment-override-aware pre-scaled base). The applier scales
+        /// exactly as the captured shape does.
+        seg_times_sixteen: bool,
         ptr_property: String,
     },
     /// SCAS-shape: source is an accumulator slot read once per iter.
@@ -456,11 +480,23 @@ pub struct WriteEntry {
 /// no character of any name is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndirectRead {
-    /// Segment slot, when the call's argument decomposes cleanly as
-    /// `var(seg) + var(ptr)`. The segment slot may itself be an
-    /// intermediate (e.g. a `StyleCondition` honouring a segment
-    /// override) — runtime resolution is the runtime's problem.
+    /// Base slot of the read address, when the call's argument
+    /// decomposes cleanly as `var(base) + var(ptr)` or
+    /// `var(seg) * 16 + var(ptr)` (either operand order, with any
+    /// trailing literal byte-offset addends peeled off — those are the
+    /// within-iteration offsets the applier models positionally). The
+    /// slot may itself be an intermediate (e.g. a `StyleCondition`
+    /// honouring a segment override and resolving to a pre-scaled
+    /// base) — runtime resolution is the runtime's problem.
     pub seg_property: Option<String>,
+    /// Whether the captured base appeared inside a `* 16` in the shape.
+    /// `true` (`var(seg) * 16 + ptr`): the slot holds an unscaled value
+    /// and the applier multiplies by 16, exactly as the CSS does.
+    /// `false` (`var(base) + ptr`): the slot already holds the full
+    /// addend and the applier adds it as-is. The scaling is a fact of
+    /// the captured shape — applying a different scaling than the
+    /// cabinet's own expression would diverge from Chrome.
+    pub seg_times_sixteen: bool,
     /// The pointer mirror slot the indirect read keys on. Always one of
     /// the descriptor's pointer `self_property` names.
     pub pointer_property: String,
@@ -994,7 +1030,7 @@ fn recognise_one_opcode<'a>(
 
     let per_iter_cycles = extract_per_iter_cycles(family, key_value);
 
-    let ip_extra_advance_slot = extract_ip_extra_advance_slot(assignment_index, ip_prop);
+    let ip_extra_advance_slot = ip_shape.extra_advance_slot.clone();
 
     let comparison_shape = if flag_conditioned && writes.is_empty() && !pointers.is_empty() {
         extract_comparison_shape(family, key_value, &pointers, &predicate, assignment_index)
@@ -1012,6 +1048,7 @@ fn recognise_one_opcode<'a>(
         ip_advance_literal: ip_shape.advance_literal,
         predicate_properties,
         predicate,
+        predicate_means_stay: ip_shape.predicate_means_stay,
         counter,
         pointers,
         writes,
@@ -1172,6 +1209,37 @@ pub(crate) fn evaluate_precondition(
     }
 }
 
+/// Evaluate the loop-continuation gate for a descriptor against the
+/// post-tick slot view: did the CSS take the *stay* branch of the IP
+/// body this tick?
+///
+/// `true` means the loop is mid-flight — the dispatch held the IP slot
+/// at its value this tick and there are remaining iterations for the
+/// applier to collapse. `false` means there is nothing to fast-forward:
+/// either the op ran as a single-shot (no active loop) or the CSS just
+/// executed the final iteration and already advanced past the loop.
+///
+/// This is the structural generalisation of the hardcoded path's
+/// "hasREP != 1 → return" and "REPE/REPNE already exited via post-tick
+/// ZF → return" entry guards: the cabinet's own continuation predicate
+/// (read off the IP body) folds all of those into one test. Evaluating
+/// it against the same post-tick slots the IP body read this tick
+/// reproduces this tick's stay/advance decision exactly.
+///
+/// Cardinal-rule note: the predicate is the cabinet's own `StyleTest`,
+/// opaque names and all; `predicate_means_stay` is a structural fact
+/// about which branch held the stay body. Nothing here reads a name's
+/// characters or assumes upstream meaning.
+pub(crate) fn evaluate_loop_predicate(
+    descriptor: &LoopDescriptor,
+    program: &crate::compile::CompiledProgram,
+    state: &crate::state::State,
+    slots: &[i32],
+) -> bool {
+    evaluate_style_test_runtime(&descriptor.predicate, program, state, slots)
+        == descriptor.predicate_means_stay
+}
+
 /// Evaluate a single [`StyleTest`] against the runtime slot view.
 ///
 /// Mirrors the resolver inside `rep_applier::read_prop`: try
@@ -1206,21 +1274,32 @@ fn evaluate_style_test_runtime(
     }
 }
 
-/// Resolve a property name's current value through the same
-/// program-slots-then-state-vars routing the applier uses for every
-/// other slot read. Missing slots resolve to 0 (matches the
-/// `Evaluator::resolve_property` default for unset numeric slots).
+/// Resolve a property name's current value through the same routing the
+/// compiler gives reads of that name (see `rep_applier::read_prop` for
+/// the full rationale): buffer-copy names skip the slot table and read
+/// the committed state address; everything else tries the compiled slot
+/// view, then state vars, then the engine's address map. Missing slots
+/// resolve to 0 (matches the `Evaluator::resolve_property` default for
+/// unset numeric slots).
 fn read_prop_runtime(
     program: &crate::compile::CompiledProgram,
     state: &crate::state::State,
     slots: &[i32],
     name: &str,
 ) -> i64 {
-    if let Some(&s) = program.property_slots.get(name) {
-        return slots[s as usize] as i64;
+    if !crate::eval::is_buffer_copy(name) {
+        if let Some(&s) = program.property_slots.get(name) {
+            return slots[s as usize] as i64;
+        }
+        let bare = name.strip_prefix("--").unwrap_or(name);
+        if let Some(v) = state.get_var(bare) {
+            return v as i64;
+        }
     }
-    let bare = name.strip_prefix("--").unwrap_or(name);
-    state.get_var(bare).map(|v| v as i64).unwrap_or(0)
+    match crate::eval::property_to_address(name) {
+        Some(addr) if addr < 0 => state.read_mem(addr) as i64,
+        _ => 0,
+    }
 }
 
 /// Evaluate the RHS of a `StyleTest::Single`. The recogniser only
@@ -1238,59 +1317,6 @@ fn evaluate_style_test_rhs(value: &Expr) -> i64 {
         // match any LHS slot read.
         _ => i64::MIN,
     }
-}
-
-/// Extract the name of an extra-add slot wrapping the IP slot's dispatch.
-///
-/// Walks the IP slot's top-level assignment expression, looking for the
-/// pattern `Calc(Add(<X>, <Y>))` where:
-/// - exactly one of `<X>`/`<Y>` is a bare `Expr::Var { name, .. }`;
-/// - the other side contains the single-key dispatch identified for the
-///   loop family (matched structurally via `find_inner_dispatch`).
-///
-/// When both conditions hold, returns `Some(name)` — the cabinet's own
-/// slot name for the extra-advance addend. Otherwise returns `None`.
-///
-/// **Cardinal-rule shape.** This matcher inspects only:
-/// - The shape of `Expr` nodes (`Calc(Add(...))`, `Var { .. }`).
-/// - Whether the non-var side contains a dispatch (delegated to the
-///   existing structural `find_inner_dispatch`).
-/// - Whole-name equality is not applied to any payload here — the
-///   returned name is the literal opaque name the cabinet used. No
-///   character of any name is inspected by this function.
-///
-/// A cabinet whose IP body has shape `calc(<dispatch> + var(extra))`
-/// returns `Some("--whatever-extra-is-named")`. A cabinet without the
-/// wrapper (bare dispatch, or `calc(<dispatch> + literal)`, or
-/// `calc(<dispatch> + non-var-tree)`) returns `None`.
-fn extract_ip_extra_advance_slot(
-    assignment_index: &HashMap<&str, &Expr>,
-    ip_prop: &str,
-) -> Option<String> {
-    let top = *assignment_index.get(ip_prop)?;
-    let Expr::Calc(CalcOp::Add(a, b)) = top else {
-        return None;
-    };
-    // Try the two orientations: (dispatch, var) and (var, dispatch).
-    if let Some(name) = ip_extra_add_orientation(a.as_ref(), b.as_ref()) {
-        return Some(name);
-    }
-    ip_extra_add_orientation(b.as_ref(), a.as_ref())
-}
-
-/// Given the two operands of a top-level `Calc(Add(...))`, return the
-/// var name from `extra_candidate` when `dispatch_candidate` contains the
-/// loop's single-key dispatch and `extra_candidate` is a bare `Var`.
-fn ip_extra_add_orientation(dispatch_candidate: &Expr, extra_candidate: &Expr) -> Option<String> {
-    let Expr::Var { name, .. } = extra_candidate else {
-        return None;
-    };
-    // The dispatch side must transitively contain a single-key dispatch
-    // (the same kind of dispatch the family walker locks onto). This is
-    // identical to the descent rule used by `find_inner_dispatch`, so we
-    // delegate to that.
-    find_inner_dispatch(dispatch_candidate)?;
-    Some(name.clone())
 }
 
 /// Extract the structural comparison shape for a flag-conditioned
@@ -1392,7 +1418,7 @@ fn extract_comparison_shape<'a>(
     } else {
         return None;
     };
-    let (dst_seg_property, dst_ptr_property) =
+    let (dst_seg_property, dst_ptr_property, dst_seg_times_sixteen) =
         trace_segmented_read(dst_operand, dst_ptr_mirror, assignment_index)?;
 
     // The OTHER operand is the source.
@@ -1401,10 +1427,11 @@ fn extract_comparison_shape<'a>(
     let source = if let Some(src_ptr_mirror) = src_ptr_mirror_opt {
         // CMPS shape: src operand must trace to the second pointer
         // mirror and decompose to a segmented memory read.
-        let (src_seg, src_ptr) =
+        let (src_seg, src_ptr, src_scaled) =
             trace_segmented_read(src_operand, src_ptr_mirror, assignment_index)?;
         ComparisonSource::Pointer {
             seg_property: src_seg,
+            seg_times_sixteen: src_scaled,
             ptr_property: src_ptr,
         }
     } else {
@@ -1421,6 +1448,7 @@ fn extract_comparison_shape<'a>(
     Some(ComparisonShape {
         width,
         dst_seg_property,
+        dst_seg_times_sixteen,
         dst_ptr_property,
         source,
         rep_type_property,
@@ -1588,7 +1616,7 @@ fn trace_segmented_read<'a>(
     expr: &Expr,
     pointer_mirror_target: &str,
     assignment_index: &HashMap<&'a str, &'a Expr>,
-) -> Option<(String, String)> {
+) -> Option<(String, String, bool)> {
     // Case 1: intermediate slot — peek through to its body.
     if let Expr::Var { name, fallback: None } = expr {
         if let Some(body) = assignment_index.get(name.as_str()) {
@@ -1598,20 +1626,23 @@ fn trace_segmented_read<'a>(
     // Case 2: FunctionCall — descend into args.
     if let Expr::FunctionCall { args, .. } = expr {
         for a in args {
-            if let Some(pair) = trace_segmented_read(a, pointer_mirror_target, assignment_index) {
-                return Some(pair);
+            if let Some(triple) = trace_segmented_read(a, pointer_mirror_target, assignment_index)
+            {
+                return Some(triple);
             }
-            // Direct decomposition at the arg level.
-            if let Some(pair) = match_seg_plus_ptr(a, pointer_mirror_target) {
-                return Some(pair);
+            // Direct ×16 decomposition at the arg level — the slot holds
+            // an unscaled segment the shape multiplies by 16.
+            if let Some((seg, ptr)) = match_seg_plus_ptr(a, pointer_mirror_target) {
+                return Some((seg, ptr, true));
             }
             // The 8086 source-side dispatches through an intermediate
             // `--_strSrcSeg = if(...: var(--segOverride); else: calc(--DS * 16))`
-            // shape — so the segment "slot" is itself a Var(intermediate).
-            // Accept that by capturing the intermediate's name and the
-            // ptr name from the surrounding shape.
-            if let Some(pair) = match_segvar_plus_ptr(a, pointer_mirror_target) {
-                return Some(pair);
+            // shape — so the base "slot" is itself a Var(intermediate)
+            // holding the already-scaled addend. Capture the
+            // intermediate's name and the ptr name from the surrounding
+            // shape, with the no-scaling flag.
+            if let Some((seg, ptr)) = match_segvar_plus_ptr(a, pointer_mirror_target) {
+                return Some((seg, ptr, false));
             }
         }
     }
@@ -1627,7 +1658,7 @@ fn calc_trace_segmented_read<'a>(
     op: &CalcOp,
     pointer_mirror_target: &str,
     assignment_index: &HashMap<&'a str, &'a Expr>,
-) -> Option<(String, String)> {
+) -> Option<(String, String, bool)> {
     match op {
         CalcOp::Add(a, b)
         | CalcOp::Sub(a, b)
@@ -2097,15 +2128,20 @@ fn recognise_indirect_read<'a>(
         }
     }
     let pointer_property = pointer_property?;
-    // Step 5: try to extract a clean `(seg, ptr)` decomposition from
-    // the first argument. If the first arg is `calc(seg + ptr)` (or the
-    // reversed orientation) where ptr matches the pointer mirror we
-    // found, capture seg too. Otherwise leave it None — the runtime
-    // can still evaluate the address argument verbatim per-iter.
-    let seg_property = decompose_indirect_addr(&args[0], &pointer_property);
+    // Step 5: try to extract a clean `(base, ptr)` decomposition from
+    // the first argument: `calc(base + ptr)` or `calc(seg*16 + ptr)`
+    // (either orientation, trailing literal offsets peeled). Otherwise
+    // leave it None — the runtime can still evaluate the address
+    // argument verbatim per-iter.
+    let decomposed = decompose_indirect_addr(&args[0], &pointer_property);
+    let (seg_property, seg_times_sixteen) = match decomposed {
+        Some((name, scaled)) => (Some(name), scaled),
+        None => (None, false),
+    };
 
     Some(IndirectRead {
         seg_property,
+        seg_times_sixteen,
         pointer_property,
         intermediate_property: intermediate_name.to_string(),
     })
@@ -2195,15 +2231,42 @@ fn first_pointer_mirror_in_test(test: &StyleTest, mirrors: &HashSet<&str>) -> Op
 /// Returns `None` for arg shapes the structural matcher can't simplify
 /// (e.g. extra arithmetic, deep nesting). The runtime falls back to
 /// evaluating the full argument expression in those cases.
-fn decompose_indirect_addr(arg: &Expr, pointer_property: &str) -> Option<String> {
+fn decompose_indirect_addr(arg: &Expr, pointer_property: &str) -> Option<(String, bool)> {
     let Expr::Calc(CalcOp::Add(left, right)) = arg else { return None };
-    // Try left = ptr, right = seg.
+    // Peel a trailing literal byte-offset addend (`<inner> + K` /
+    // `K + <inner>`): the within-iteration offset of this write's read.
+    // The applier models that offset positionally (write k reads at
+    // +k), mirroring the dst side, so only the base decomposition is
+    // captured here.
+    if matches!(right.as_ref(), Expr::Literal(_)) {
+        return decompose_indirect_addr(left, pointer_property);
+    }
+    if matches!(left.as_ref(), Expr::Literal(_)) {
+        return decompose_indirect_addr(right, pointer_property);
+    }
+    // `var(base) + var(ptr)` — the base slot contributes as-is.
     if let (Some(p), Some(s)) = (match_bare_var(left), match_bare_var(right)) {
         if p == pointer_property {
-            return Some(s);
+            return Some((s, false));
         }
         if s == pointer_property {
-            return Some(p);
+            return Some((p, false));
+        }
+    }
+    // `var(seg) * 16 + var(ptr)` — the base slot contributes ×16. Same
+    // shape grammar as the dst side's `match_segmented_address`.
+    if let Some(p) = match_bare_var(right) {
+        if p == pointer_property {
+            if let Some(seg) = match_var_times_sixteen(left) {
+                return Some((seg, true));
+            }
+        }
+    }
+    if let Some(p) = match_bare_var(left) {
+        if p == pointer_property {
+            if let Some(seg) = match_var_times_sixteen(right) {
+                return Some((seg, true));
+            }
         }
     }
     None
@@ -2289,6 +2352,23 @@ struct IpShape {
     advance_literal: i32,
     /// The predicate guarding "stay" vs "advance".
     predicate: StyleTest,
+    /// Whether `predicate` evaluating true selects the *stay* branch.
+    /// `true` when the stay body was the branch's `then`; `false` when
+    /// kiln (or another emitter) inverted the shape and the stay body
+    /// is the fallback. The runtime gate needs this to know which
+    /// polarity of the predicate means "the loop is still running".
+    predicate_means_stay: bool,
+    /// The stay branch's subtrahend, when it is a bare `Var` — the
+    /// cabinet's own slot for the extra per-instruction advance.
+    ///
+    /// Why the *subtrahend* is the extra advance: on a "stay" tick the
+    /// IP slot is a fixed point — its new value equals its old value —
+    /// so `self − S (+ any wrapper addend W) = IP_current`, which pins
+    /// `self = IP_current + S − W`. The exit branch then produces
+    /// `self + L + W = IP_current + S + L`. Any wrapper contribution W
+    /// cancels; the post-loop advance over the current IP is exactly
+    /// `S + L`, derivable from the two branch shapes alone.
+    extra_advance_slot: Option<String>,
 }
 
 /// Match an IP-body whose shape is "stay-here-or-advance".
@@ -2323,12 +2403,14 @@ fn match_ip_stay_or_advance(body: &Expr) -> Option<IpShape> {
     let else_ = fallback.as_ref();
 
     if branches.len() == 1 {
-        // Single-branch form (STOS/MOVS/LODS). Try both orientations.
+        // Single-branch form (STOS/MOVS/LODS). Try both orientations,
+        // recording which one matched: predicate-true selects stay only
+        // when the stay body was the `then`.
         let then = &branches[0].then;
-        if let Some(s) = match_ip_orientation(then, else_, &branches[0].condition) {
+        if let Some(s) = match_ip_orientation(then, else_, &branches[0].condition, true) {
             return Some(s);
         }
-        return match_ip_orientation(else_, then, &branches[0].condition);
+        return match_ip_orientation(else_, then, &branches[0].condition, false);
     }
 
     // Multi-branch form (CMPS/SCAS): all branch `then`s must be
@@ -2349,26 +2431,38 @@ fn match_ip_stay_or_advance(body: &Expr) -> Option<IpShape> {
     let synth_predicate = StyleTest::Or(conditions);
 
     // Try (then=stay, else=advance) first, then the inverse.
-    if let Some(s) = match_ip_orientation(first_then, else_, &synth_predicate) {
+    if let Some(s) = match_ip_orientation(first_then, else_, &synth_predicate, true) {
         return Some(s);
     }
-    match_ip_orientation(else_, first_then, &synth_predicate)
+    match_ip_orientation(else_, first_then, &synth_predicate, false)
 }
 
 fn match_ip_orientation(
     stay: &Expr,
     advance: &Expr,
     predicate: &StyleTest,
+    predicate_means_stay: bool,
 ) -> Option<IpShape> {
-    let (stay_self, _stay_offset) = match_calc_sub_var(stay)?;
+    let (stay_self, stay_subtrahend) = match_calc_sub_var(stay)?;
     let (advance_self, advance_lit) = match_calc_add_var_lit(advance)?;
     if stay_self != advance_self {
         return None;
     }
+    // Capture the stay subtrahend when it is a bare Var — see the
+    // `IpShape::extra_advance_slot` doc for why the subtrahend (not any
+    // outer wrapper addend) is the structurally-correct extra advance.
+    // A non-Var subtrahend yields None: the applier reports Unsupported
+    // rather than committing an IP it can't derive.
+    let extra_advance_slot = match stay_subtrahend {
+        Expr::Var { name, .. } => Some(name.clone()),
+        _ => None,
+    };
     Some(IpShape {
         self_property: stay_self,
         advance_literal: advance_lit,
         predicate: predicate.clone(),
+        predicate_means_stay,
+        extra_advance_slot,
     })
 }
 

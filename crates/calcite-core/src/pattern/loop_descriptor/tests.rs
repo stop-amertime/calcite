@@ -2105,21 +2105,22 @@ fn unresolved_intermediate_name_leaves_classification_unchanged() {
 }
 
 /// Indirect read where the call argument is a complex expression that
-/// doesn't decompose as `var(seg) + var(ptr)` — only the pointer
-/// reference is found, not a clean segment slot. The recogniser still
-/// captures the indirect read (so Copy classification fires) but with
-/// `seg_property: None`. The runtime applier later evaluates the full
-/// arg expression rather than relying on a pre-resolved seg slot.
+/// doesn't decompose as `var(base) + var(ptr)` or `var(seg)*16 +
+/// var(ptr)` — only the pointer reference is found, not a clean base
+/// slot. The recogniser still captures the indirect read (so Copy
+/// classification fires) but with `seg_property: None`. The runtime
+/// applier later evaluates the full arg expression rather than relying
+/// on a pre-resolved base slot.
 #[test]
 fn indirect_read_without_clean_seg_decomposition_still_promotes_to_copy() {
-    // Body: --readMem(calc(calc(var(--baseSeg) * 16) + var(--siMirror)))
-    // The arg has the pointer mirror in it, but the seg side is an
-    // arithmetic expression rather than a bare Var. Decomposition can't
+    // Body: --readMem(calc(var(--baseSeg) * var(--scale) + var(--siMirror)))
+    // The arg has the pointer mirror in it, but the base side multiplies
+    // two Vars — not the ×16-literal shape — so decomposition can't
     // simplify it.
     let body = call(
         "--readMem",
         vec![add(
-            mul(var("--baseSeg"), lit(16.0)),
+            mul(var("--baseSeg"), var("--scale")),
             var("--siMirror"),
         )],
     );
@@ -2133,13 +2134,50 @@ fn indirect_read_without_clean_seg_decomposition_still_promotes_to_copy() {
     assert_eq!(ir.pointer_property, "--siMirror");
     assert!(
         ir.seg_property.is_none(),
-        "non-bare-Var seg expression → seg_property is None, got {:?}",
+        "undecomposable base expression → seg_property is None, got {:?}",
         ir.seg_property,
     );
     assert_eq!(
         descs[0].bulk_class,
         BulkClass::Copy,
         "Copy promotion fires on pointer-mirror reference alone",
+    );
+}
+
+/// The two clean base shapes and their scaling capture:
+/// `var(seg)*16 + var(ptr)` → `seg_times_sixteen=true` (applier scales);
+/// `var(base) + var(ptr) + K` → `seg_times_sixteen=false` (the slot
+/// already holds the full addend — kiln's seg-override-aware
+/// `--_strSrcSeg` shape) with the literal byte offset peeled.
+#[test]
+fn indirect_read_captures_base_scaling_from_shape() {
+    let scaled = call(
+        "--readMem",
+        vec![add(mul(var("--baseSeg"), lit(16.0)), var("--siMirror"))],
+    );
+    let descs = recognise_loops(&cabinet_with_indirect_read("--strSrcByte", scaled));
+    let ir = descs[0].writes[0].val_indirect_read.as_ref().unwrap();
+    assert_eq!(ir.seg_property.as_deref(), Some("--baseSeg"));
+    assert!(ir.seg_times_sixteen, "×16 in the shape must set the scaling flag");
+
+    // The real kiln high-byte shape: flat base + ptr + literal offset.
+    let flat_offset = call(
+        "--readMem",
+        vec![add(
+            add(var("--srcBase"), var("--siMirror")),
+            lit(1.0),
+        )],
+    );
+    let descs2 = recognise_loops(&cabinet_with_indirect_read("--strSrcByte", flat_offset));
+    let ir2 = descs2[0].writes[0].val_indirect_read.as_ref().unwrap();
+    assert_eq!(
+        ir2.seg_property.as_deref(),
+        Some("--srcBase"),
+        "flat base must be captured through the peeled literal offset",
+    );
+    assert!(
+        !ir2.seg_times_sixteen,
+        "no ×16 in the shape → the slot holds the full addend",
     );
 }
 
@@ -2315,15 +2353,24 @@ fn per_iter_cycles_picks_most_populated_self_add_literal_family_member() {
 }
 
 // ---------------------------------------------------------------------------
-// ip_extra_advance_slot — structural capture of the outer-wrapper var
-// added to the IP slot's dispatch (the cabinet's per-instruction "extra
-// advance" addend; in CSS-DOS today this is `--prefixLen`, but the
-// recogniser captures whatever name the cabinet uses).
+// ip_extra_advance_slot — structural capture of the stay branch's
+// subtrahend in the per-key IP body (`if(<pred>: calc(self − var(extra));
+// else: calc(self + L))`). In CSS-DOS today the slot is `--prefixLen`,
+// but the recogniser captures whatever name the cabinet uses.
+//
+// The fixed-point rule (see `LoopDescriptor::ip_extra_advance_slot`):
+// on a stay tick the IP slot's new value equals its old value, so any
+// outer wrapper addend cancels and the exit branch's value is
+// `IP + extra + L`. The subtrahend — NOT a top-level `Add` wrapper —
+// is the structurally-correct capture. An earlier model captured the
+// wrapper addend instead; that was wrong (only accidentally right when
+// the two slots coincide) and real cabinets put the wrapper inside a
+// TF/IRQ StyleCondition where the old matcher never even found it.
 //
 // Tests:
-//   1. `ip_extra_advance_slot_captured_for_cabinet_a` — the existing x86-
-//      shaped cabinet wraps IP as `calc(<dispatch> + var(--prefixLen))`;
-//      the recogniser captures `--prefixLen`.
+//   1. `ip_extra_advance_slot_captured_for_cabinet_a` — x86-shaped
+//      cabinet's stay branch is `calc(self − var(--prefixLen))`; the
+//      recogniser captures `--prefixLen`.
 //   2. `ip_extra_advance_slot_captured_for_cabinet_b` — the brainfuck
 //      cabinet uses a completely different slot name (`--introBytes`).
 //      The recogniser captures *that* name, proving the rule is shape-
@@ -2331,11 +2378,19 @@ fn per_iter_cycles_picks_most_populated_self_add_literal_family_member() {
 //   3. `ip_extra_advance_slot_arbitrary_name` — a synthetic cabinet
 //      where we plug in a fully arbitrary opaque slot name to confirm
 //      the recogniser doesn't care what the string contains.
-//   4. `ip_extra_advance_slot_none_when_no_outer_wrapper` — a cabinet
-//      whose IP assignment is bare dispatch (no outer add) yields None.
-//   5. `ip_extra_advance_slot_none_when_outer_add_is_literal` — a
-//      cabinet whose IP outer wrapper adds a literal (not a var) yields
-//      None: the structural shape requires a bare-Var addend.
+//   4. `ip_extra_advance_slot_none_when_subtrahend_is_literal` — a
+//      cabinet whose stay branch subtracts a literal yields None (the
+//      structural shape requires a bare-Var subtrahend), regardless of
+//      whether an outer add wrapper exists.
+//   5. `ip_extra_advance_slot_real_kiln_shape` — the REAL cabinet
+//      shape, verified against cga4-stripes.css 2026-06-09: the IP
+//      assignment is a TF/IRQ-style StyleCondition whose else branch
+//      is `calc(<dispatch> + var(--prefixLen))`, and the per-key body
+//      is the `_repContinue`-gated subtraction. The recogniser must
+//      capture `--prefixLen` from the subtrahend.
+//   6. `ip_extra_advance_slot_reads_subtrahend_not_wrapper` — wrapper
+//      addend and stay subtrahend are DIFFERENT slots; the recogniser
+//      must capture the subtrahend (the fixed-point-correct one).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2434,11 +2489,11 @@ fn ip_extra_advance_slot_arbitrary_name() {
     );
 }
 
-#[test]
-fn ip_extra_advance_slot_none_when_no_outer_wrapper() {
-    // A cabinet whose IP slot is the bare dispatch — no outer
-    // `calc(<dispatch> + var(extra))` wrapper. The recogniser yields
-    // None for the extra-advance slot.
+/// Build a minimal cabinet whose IP per-key stay branch subtracts
+/// `subtrahend`, optionally wrapping the dispatch as
+/// `calc(<dispatch> + wrapper_addend)`. Used by the subtrahend-rule
+/// tests below.
+fn cabinet_with_ip_subtrahend(subtrahend: Expr, wrapper_addend: Option<Expr>) -> Vec<Assignment> {
     let pred_continue = style_eq("--_repContinue", 1.0);
     let no_rep = style_eq("--hasREP", 0.0);
     let active_guard = StyleTest::And(vec![
@@ -2451,15 +2506,199 @@ fn ip_extra_advance_slot_none_when_no_outer_wrapper() {
         vec![(0xAA as f64, counter_body(no_rep.clone(), "--__1CX"))],
         keep_self("--__1CX"),
     );
-    // No wrapping add — pass the dispatch directly. The per-key body
-    // still has `self + literal` shape (advance), so the IP-stay-or-
-    // advance match still fires; only the outer wrapper is missing.
     let ip_dispatch = dispatch(
         "--opcode",
         vec![(
             0xAA as f64,
-            ip_body(pred_continue.clone(), "--__1IP", lit(0.0), 1),
+            ip_body(pred_continue.clone(), "--__1IP", subtrahend, 1),
         )],
+        keep_self("--__1IP"),
+    );
+    let ip_value = match wrapper_addend {
+        Some(w) => add(ip_dispatch, w),
+        None => ip_dispatch,
+    };
+    let di_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--__1DI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1DI"),
+    );
+
+    vec![
+        assign("--CX", cx_dispatch),
+        assign("--IP", ip_value),
+        assign("--DI", di_dispatch),
+    ]
+}
+
+#[test]
+fn ip_extra_advance_slot_none_when_subtrahend_is_literal() {
+    // A stay branch that subtracts a literal (`calc(self - 0)`) has no
+    // extra-advance slot to capture — None, with or without an outer
+    // add wrapper. The applier reports Unsupported rather than
+    // guessing an advance it can't derive.
+    let descs = recognise_loops(&cabinet_with_ip_subtrahend(lit(0.0), None));
+    assert_eq!(descs.len(), 1);
+    assert!(
+        descs[0].ip_extra_advance_slot.is_none(),
+        "literal subtrahend must yield None, got {:?}",
+        descs[0].ip_extra_advance_slot,
+    );
+
+    let descs2 =
+        recognise_loops(&cabinet_with_ip_subtrahend(lit(0.0), Some(var("--prefixLen"))));
+    assert_eq!(descs2.len(), 1);
+    assert!(
+        descs2[0].ip_extra_advance_slot.is_none(),
+        "the outer wrapper addend must NOT be captured (it cancels on the \
+         stay fixed point); literal subtrahend means None, got {:?}",
+        descs2[0].ip_extra_advance_slot,
+    );
+}
+
+#[test]
+fn ip_extra_advance_slot_real_kiln_shape() {
+    // The REAL cabinet shape (verified against cga4-stripes.css,
+    // 2026-06-09): the IP assignment is an outer StyleCondition (the
+    // cabinet's TF/IRQ override plumbing) whose fallback is
+    // `calc(<dispatch> + var(--prefixLen))`, and the per-key body for
+    // the string op is the `_repContinue`-gated subtraction:
+    //
+    //   --IP: if(style(--_tf: 1): var(--_tfIP);
+    //            style(--_irqActive: 1): var(--_irqIP);
+    //            else: calc(if(
+    //              style(--opcode: 170): if(style(--_repContinue: 1):
+    //                  calc(var(--__1IP) - var(--prefixLen));
+    //                  else: calc(var(--__1IP) + 1));
+    //              ...
+    //              else: var(--__1IP)) + var(--prefixLen)))
+    //
+    // The earlier top-level-Add model returned None on this shape
+    // (the Add is nested inside the StyleCondition fallback) — that
+    // was the exact recogniser gap that made 6/7 smoke carts panic
+    // with "ip_extra_advance_slot not captured".
+    let pred_continue = style_eq("--_repContinue", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--__1CX"))],
+        keep_self("--__1CX"),
+    );
+    let ip_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            ip_body(pred_continue.clone(), "--__1IP", var("--prefixLen"), 1),
+        )],
+        keep_self("--__1IP"),
+    );
+    // The TF/IRQ-style outer wrapper, with the dispatch+addend in the
+    // fallback — exactly where kiln puts it.
+    let ip_value = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--_tf", 1.0),
+                then: var("--_tfIP"),
+            },
+            StyleBranch {
+                condition: style_eq("--_irqActive", 1.0),
+                then: var("--_irqIP"),
+            },
+        ],
+        fallback: Box::new(add(ip_dispatch, var("--prefixLen"))),
+    };
+    let di_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--__1DI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1DI"),
+    );
+
+    let asns = vec![
+        assign("--CX", cx_dispatch),
+        assign("--IP", ip_value),
+        assign("--DI", di_dispatch),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "real kiln IP shape must still recognise: {:?}", descs);
+    assert_eq!(
+        descs[0].ip_extra_advance_slot.as_deref(),
+        Some("--prefixLen"),
+        "the stay subtrahend must be captured through the TF/IRQ wrapper",
+    );
+    assert_eq!(descs[0].ip_advance_literal, 1);
+    assert!(
+        descs[0].precondition.is_some(),
+        "the TF/IRQ wrapper must still be captured as a precondition",
+    );
+}
+
+#[test]
+fn predicate_means_stay_true_for_then_stay_orientation() {
+    // Kiln's shape: the stay body is the branch `then` (predicate true →
+    // loop continues). The recogniser must record that polarity.
+    let descs = recognise_loops(&cabinet_a());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        assert!(
+            d.predicate_means_stay,
+            "stay body in `then` must capture predicate_means_stay=true",
+        );
+    }
+}
+
+#[test]
+fn predicate_means_stay_false_for_inverted_orientation() {
+    // An emitter that inverts the shape — advance in `then`, stay in the
+    // fallback — must produce predicate_means_stay=false, so the runtime
+    // gate knows predicate-true means "the loop exited".
+    let no_rep = style_eq("--hasREP", 0.0);
+    let pred_done = style_eq("--loopDone", 1.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--__1CX"))],
+        keep_self("--__1CX"),
+    );
+    // Inverted IP body: advance on `then`, stay in the fallback.
+    let ip_body_inverted = iff(
+        pred_done.clone(),
+        add(var("--__1IP"), lit(1.0)),
+        sub(var("--__1IP"), var("--prefixLen")),
+    );
+    let ip_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, ip_body_inverted)],
         keep_self("--__1IP"),
     );
     let di_dispatch = dispatch(
@@ -2487,68 +2726,31 @@ fn ip_extra_advance_slot_none_when_no_outer_wrapper() {
     let descs = recognise_loops(&asns);
     assert_eq!(descs.len(), 1);
     assert!(
-        descs[0].ip_extra_advance_slot.is_none(),
-        "bare IP dispatch (no outer Calc(Add(..., var(...)))) must yield None, \
-         got {:?}",
-        descs[0].ip_extra_advance_slot,
+        !descs[0].predicate_means_stay,
+        "stay body in the fallback must capture predicate_means_stay=false",
+    );
+    assert_eq!(
+        descs[0].ip_extra_advance_slot.as_deref(),
+        Some("--prefixLen"),
+        "subtrahend capture must work in the inverted orientation too",
     );
 }
 
 #[test]
-fn ip_extra_advance_slot_none_when_outer_add_is_literal() {
-    // A cabinet whose IP outer wrapper is `calc(<dispatch> + lit(K))`
-    // rather than `calc(<dispatch> + var(slot))`. The structural rule
-    // requires a bare-Var addend; a literal addend produces None.
-    let pred_continue = style_eq("--_repContinue", 1.0);
-    let no_rep = style_eq("--hasREP", 0.0);
-    let active_guard = StyleTest::And(vec![
-        style_eq("--hasREP", 1.0),
-        style_eq("--_repActive", 0.0),
-    ]);
-
-    let cx_dispatch = dispatch(
-        "--opcode",
-        vec![(0xAA as f64, counter_body(no_rep.clone(), "--__1CX"))],
-        keep_self("--__1CX"),
-    );
-    let ip_dispatch = dispatch(
-        "--opcode",
-        vec![(
-            0xAA as f64,
-            ip_body(pred_continue.clone(), "--__1IP", lit(0.0), 1),
-        )],
-        keep_self("--__1IP"),
-    );
-    let ip_wrapped = add(ip_dispatch, lit(2.0)); // literal addend, NOT a Var.
-    let di_dispatch = dispatch(
-        "--opcode",
-        vec![(
-            0xAA as f64,
-            pointer_body(
-                active_guard.clone(),
-                "--__1DI",
-                1,
-                "--__1flags",
-                10,
-                "--lowerBytes",
-                "--bit",
-            ),
-        )],
-        keep_self("--__1DI"),
-    );
-
-    let asns = vec![
-        assign("--CX", cx_dispatch),
-        assign("--IP", ip_wrapped),
-        assign("--DI", di_dispatch),
-    ];
-    let descs = recognise_loops(&asns);
+fn ip_extra_advance_slot_reads_subtrahend_not_wrapper() {
+    // Wrapper addend and stay subtrahend are DIFFERENT slots. The
+    // fixed-point algebra says the wrapper cancels and the subtrahend
+    // is the true extra advance — the recogniser must capture the
+    // subtrahend, not the wrapper.
+    let descs = recognise_loops(&cabinet_with_ip_subtrahend(
+        var("--trueExtra"),
+        Some(var("--redHerring")),
+    ));
     assert_eq!(descs.len(), 1);
-    assert!(
-        descs[0].ip_extra_advance_slot.is_none(),
-        "literal addend (not a bare-Var) must not be captured as an extra-advance slot, \
-         got {:?}",
-        descs[0].ip_extra_advance_slot,
+    assert_eq!(
+        descs[0].ip_extra_advance_slot.as_deref(),
+        Some("--trueExtra"),
+        "must capture the stay subtrahend, not the wrapper addend",
     );
 }
 
@@ -2724,7 +2926,7 @@ fn comparison_shape_extracted_for_cmps_with_two_pointers() {
     assert_eq!(cmp.dst_ptr_property, "--di0");
     assert_eq!(cmp.dst_seg_property, "--es");
     match &cmp.source {
-        ComparisonSource::Pointer { seg_property, ptr_property } => {
+        ComparisonSource::Pointer { seg_property, ptr_property, .. } => {
             assert_eq!(ptr_property, "--si0");
             assert_eq!(seg_property, "--ds");
         }
@@ -2764,7 +2966,7 @@ fn comparison_shape_renaming_blind() {
     assert_eq!(cmp.dst_ptr_property, "--zorch_dst_ptr");
     assert_eq!(cmp.dst_seg_property, "--zorch_dst_seg");
     match &cmp.source {
-        ComparisonSource::Pointer { seg_property, ptr_property } => {
+        ComparisonSource::Pointer { seg_property, ptr_property, .. } => {
             assert_eq!(ptr_property, "--zorch_src_ptr");
             assert_eq!(seg_property, "--zorch_src_seg");
         }

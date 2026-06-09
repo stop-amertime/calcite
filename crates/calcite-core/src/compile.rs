@@ -6070,6 +6070,22 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
         return;
     };
 
+    // Loop-continuation gate: did the CSS take the stay branch of the
+    // IP body this tick? If not, there is no loop in flight — either
+    // the op ran single-shot (no rep-style prefix active) or this tick
+    // WAS the final iteration and the CSS already advanced IP past the
+    // loop. Both mean the post-tick state is already correct and
+    // collapsing "remaining" iterations would corrupt it (the
+    // single-shot case would bulk-apply a stale counter). This is the
+    // descriptor-driven equivalent of the deleted hardcoded path's
+    // "hasREP != 1" and "REPE/REPNE already exited via post-tick ZF"
+    // entry guards, folded into the cabinet's own predicate.
+    if !crate::pattern::loop_descriptor::evaluate_loop_predicate(descriptor, program, state, slots)
+    {
+        rep_diag_bail("loop-not-continuing");
+        return;
+    }
+
     use crate::pattern::loop_descriptor::BulkClass;
     use crate::pattern::rep_applier::{
         apply_copy_with_commit, apply_fill_with_commit, apply_read_only_with_commit,

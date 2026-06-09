@@ -1503,7 +1503,11 @@ fn collect_style_test_deps(
 /// These assignments exist for x86CSS's animation pipeline but are no-ops
 /// in calcite's mutable-state model — they just copy the canonical value
 /// to a buffer slot that resolves back to the same value via `resolve_property`.
-fn is_buffer_copy(name: &str) -> bool {
+///
+/// `pub(crate)` so `pattern::rep_applier`'s slot resolver can mirror the
+/// compiler's routing (buffer-copy reads skip the slot table and read the
+/// committed state address) instead of inventing its own.
+pub(crate) fn is_buffer_copy(name: &str) -> bool {
     name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2")
 }
 
