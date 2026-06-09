@@ -1526,7 +1526,13 @@ pub(crate) fn is_buffer_copy(name: &str) -> bool {
 /// both resolve to the same canonical name. This keeps the function safe when
 /// called from code paths that build names programmatically (e.g. the packed
 /// cell table builder formats `"mc{}"` without the leading `--`).
-fn to_bare_name(name: &str) -> &str {
+///
+/// `pub(crate)` so `pattern::rep_applier` / `pattern::loop_descriptor` can
+/// resolve descriptor-carried mirror names (`--__1DI` etc.) to their
+/// committed state vars. Unlike `property_to_address` this is a pure
+/// function — no thread-local — so it works on the debugger's tokio
+/// worker threads, where the ADDRESS_MAP thread-local is empty.
+pub(crate) fn to_bare_name(name: &str) -> &str {
     let after_dashes = name.strip_prefix("--").unwrap_or(name);
     if let Some(rest) = after_dashes.strip_prefix("__0") {
         rest

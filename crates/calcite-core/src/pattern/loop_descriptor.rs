@@ -1277,10 +1277,11 @@ fn evaluate_style_test_runtime(
 /// Resolve a property name's current value through the same routing the
 /// compiler gives reads of that name (see `rep_applier::read_prop` for
 /// the full rationale): buffer-copy names skip the slot table and read
-/// the committed state address; everything else tries the compiled slot
-/// view, then state vars, then the engine's address map. Missing slots
-/// resolve to 0 (matches the `Evaluator::resolve_property` default for
-/// unset numeric slots).
+/// the committed state var via the canonical bare name (`to_bare_name`
+/// — pure function, debugger-thread-safe, unlike the thread-local
+/// address map); everything else tries the compiled slot view first.
+/// Missing slots resolve to 0 (matches the `Evaluator::resolve_property`
+/// default for unset numeric slots).
 fn read_prop_runtime(
     program: &crate::compile::CompiledProgram,
     state: &crate::state::State,
@@ -1291,15 +1292,11 @@ fn read_prop_runtime(
         if let Some(&s) = program.property_slots.get(name) {
             return slots[s as usize] as i64;
         }
-        let bare = name.strip_prefix("--").unwrap_or(name);
-        if let Some(v) = state.get_var(bare) {
-            return v as i64;
-        }
     }
-    match crate::eval::property_to_address(name) {
-        Some(addr) if addr < 0 => state.read_mem(addr) as i64,
-        _ => 0,
-    }
+    state
+        .get_var(crate::eval::to_bare_name(name))
+        .map(|v| v as i64)
+        .unwrap_or(0)
 }
 
 /// Evaluate the RHS of a `StyleTest::Single`. The recogniser only

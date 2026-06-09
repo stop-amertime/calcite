@@ -135,15 +135,17 @@ pub(crate) enum CommitMode {
 /// compiler gives reads of that name (`compile.rs::resolve_property`):
 ///
 /// 1. Buffer-copy names (`is_buffer_copy`) skip the slot table — the
-///    engine compiles those reads as loads of the committed state
-///    address, so we resolve them through `property_to_address` +
-///    `state.read_mem` (negative addresses are state vars). This is what
-///    makes the cabinet's prior-tick pointer mirrors (the
-///    `self_property` of a PointerEntry) resolvable here.
+///    engine compiles those reads as loads of the committed state var,
+///    so we resolve them via the canonical bare name (`to_bare_name`
+///    strips the `--` and `__N` buffer prefixes). This is what makes
+///    the cabinet's prior-tick pointer mirrors (the `self_property` of
+///    a PointerEntry) resolvable here.
 /// 2. Every other name tries the compiled `property_slots` (current-tick
-///    slot view), then the state-var table by bare name, then the
-///    engine's address map as a last resort.
+///    slot view) first, then the state-var table by canonical name.
 ///
+/// `to_bare_name` (not `property_to_address`) is deliberate: the address
+/// map is a thread-local populated on the loading thread, and the
+/// debugger runs the engine on worker threads where it's empty.
 /// Matching the compiler's routing is what keeps the applier's view of a
 /// slot equal to what the cabinet's own compiled reads would see —
 /// i.e. what Chrome computes. Returns `None` if no table has the name.
@@ -157,16 +159,8 @@ fn read_prop(
         if let Some(&s) = program.property_slots.get(name) {
             return Some(slots[s as usize]);
         }
-        let bare = name.strip_prefix("--").unwrap_or(name);
-        if let Some(v) = state.get_var(bare) {
-            return Some(v);
-        }
     }
-    let addr = crate::eval::property_to_address(name)?;
-    if addr < 0 {
-        return Some(state.read_mem(addr));
-    }
-    None
+    state.get_var(crate::eval::to_bare_name(name))
 }
 
 /// Resolve a `val_expr` to its current i32 value, structurally.
@@ -1083,24 +1077,19 @@ pub(crate) fn apply_read_only_with_commit(
 /// DI/SI commits in Fill/Copy and for the flags slot in ReadOnly's
 /// CMPS/SCAS sub-shape.
 ///
-/// Resolution mirrors `read_prop`: try the bare state-var name first,
-/// then route through the engine's address map. The second path is what
-/// makes mirror-named slots committable — the descriptor's
-/// `flag_property` is the cabinet's prior-tick mirror (e.g.
-/// `--__1flags`), whose committed storage is the state var the address
-/// map points at. Before this fallback existed, the CMPS/SCAS flags
-/// commit silently no-opped on real cabinets and downstream conditional
-/// jumps ran on stale flags.
+/// Resolution mirrors `read_prop`: the canonical bare name
+/// (`to_bare_name` — strips `--` and `__N` buffer prefixes, pure
+/// function, debugger-thread-safe) addressed into the state-var table.
+/// The prefix strip is what makes mirror-named slots committable — the
+/// descriptor's `flag_property` is the cabinet's prior-tick mirror
+/// (e.g. `--__1flags`), whose committed storage is the `flags` state
+/// var. Before this routing existed, the CMPS/SCAS flags commit
+/// silently no-opped on real cabinets and downstream conditional jumps
+/// ran on stale flags.
 fn commit_pointer(state: &mut State, property: &str, value: i32) {
-    let bare = property.strip_prefix("--").unwrap_or(property);
-    if state.state_var_index.contains_key(bare) {
-        state.set_var(bare, value);
-        return;
-    }
-    if let Some(addr) = crate::eval::property_to_address(property) {
-        if addr < 0 {
-            state.write_mem(addr, value);
-        }
+    let canon = crate::eval::to_bare_name(property);
+    if state.state_var_index.contains_key(canon) {
+        state.set_var(canon, value);
     }
     // Anything else: the cabinet doesn't have this slot reachable
     // through the state-var path. The hardcoded `rep_fast_forward` only
