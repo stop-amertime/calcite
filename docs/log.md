@@ -11,6 +11,61 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-06-10 — copy propagation + DCE landed (`967ddad` + `9ecc6de`): −17.8% dispatched ops, +4.6% web throughput
+
+Executes the copy-elimination proposal from the 2026-06-09 op-profile
+entry. New pass in `compile.rs` between `inline_calls` and the fuse
+peepholes, run per op stream (main, dispatch entries/fallbacks,
+broadcast value/spillover): (1) forward copy propagation — facts merge
+by intersection at labels, one linear pass since streams are
+forward-only CFGs; (2) backward liveness DCE for pure ops, plus
+adjacent store-forwarding (retarget producer → copy dst when the
+copied slot dies; kills dispatch-entry result copies). Soundness rests
+on the same invariants `compact_slots` already assumes (tick-scratch
+slots, declared cross-stream channels); `Dispatch` drops all facts and
+its table's transitive read-set is always-live; streams with backward
+edges are skipped; `CALCITE_NO_COPY_ELIM=1` disables (native only).
+
+**doom8088 numbers.** Static: 122,859 ops removed, 234,022 reads
+redirected. Dispatched ops/tick 846 → 695 (−17.8%; profile CSVs were
+tmp-only, regenerate with `--op-profile`). The reduction is entirely
+LoadSlot (472M → 341M per 2M ticks): propagation+DCE killed call-site
+arg/result copies, forwarding killed entry result copies; survivors
+are dispatch-param (barrier) and cross-label copies. CLI 6M ticks:
+351.8K vs 307.4K t/s (+14.4%, dev-only). Web 3-run `doom-all --headed`
+medians vs the 2026-06-09 baseline (75.0 s / 456.0K t/s / doomLoad
+63.65 s): **70.5 s runMsToInGame (−6.1%) / 477.2K t/s (+4.6%) /
+doomLoad 60.8 s (−4.4%)** — every run beat every clean baseline run.
+JSONs: CSS-DOS `docs/benches/doom-all-2026-06-10-copyelim-run{1,2,3}`.
+
+**Compile-cost note (and a baseline-drift warning).** First cut cost
+14.9 s of native compile — fixed to 0.11 s by keeping external/barrier
+slots out of the tracked live set, reusing scratch buffers across the
+~100K entry streams, and capping the facts map (`9ecc6de`,
+output-identical fingerprint). In wasm the pass costs **~1.7 s** of
+cabinet compile, measured same-day A/B with the pass hard-disabled
+(33.3 vs 31.6 s, `compile-only` profile). Caveat: the 2026-06-09
+baseline recorded compileMs ≈ 24.6 s, but pass-OFF today measures
+31.6 s — web compile wall drifts day-to-day on this host; only
+same-day A/B is trustworthy for compile-cost claims. Runtime metrics
+(t/s, doomLoad) were stable across days.
+
+**Verification.** 300 lib tests (9 new, incl. forwarding negatives);
+doom8088 full state dump (every state var + cell, 4.5 MB) byte-identical
+vs pass-off after 2M ticks; ticks+cycles+IP identical on all 8 cached
+harness cabinets; CSS-DOS smoke 7/7. dos-smoke-p2 note: that cabinet
+is ~7 t/s in the CLI with or without the pass (pre-existing; it has
+tens of millions of ops — 11M reads redirected, 9.5M removed, 4.4 s
+native compile) — worth its own investigation someday.
+
+**Remaining headroom in the profile (ops/tick, post-pass):** BIfNEL
+22.6% + DispatchChain 4.5% (chain probing), LoadSlot 21.9% (params +
+cross-label), LoadState 11.7%, LoadLit 9.0%. Next structural lever is
+per-dispatch-key specialisation (CSS-DOS plans), or cross-label copy
+propagation if profiling shows the surviving LoadSlots are cheap wins.
+
+---
+
 ## 2026-06-10 — rep-generic MERGED to main (`cc729b2`): hardcoded x86 string-op path is gone
 
 Cross-link: CSS-DOS LOGBOOK 2026-06-10. Closes the 2026-06-09 entry's
