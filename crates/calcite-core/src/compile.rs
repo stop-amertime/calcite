@@ -22,6 +22,7 @@ use std::collections::HashMap;
 // caches in CompilerCtx, etc.) are NOT swapped — they're hit once at
 // load and the swap would ripple through every cross-crate API.
 type FxMap<K, V> = rustc_hash::FxHashMap<K, V>;
+type FxSet<T> = rustc_hash::FxHashSet<T>;
 
 use crate::eval::property_to_address;
 use crate::pattern::broadcast_write::BroadcastWrite;
@@ -3341,6 +3342,27 @@ pub fn compile(
     log::info!("[compile detail] inline calls: {} sites inlined, {:.2}s",
         inlined, _ct.elapsed().as_secs_f64());
 
+    // Copy propagation + DCE. Disable with CALCITE_NO_COPY_ELIM=1 (native
+    // only; wasm has no env) for A/B measurement.
+    let copy_elim_enabled = {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::env::var_os("CALCITE_NO_COPY_ELIM").is_none()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            true
+        }
+    };
+    let _ct = web_time::Instant::now();
+    let (copies_propagated, copy_ops_removed) = if copy_elim_enabled {
+        copy_propagate_and_dce(&mut program)
+    } else {
+        (0, 0)
+    };
+    log::info!("[compile detail] copy-elim: {} reads redirected, {} ops removed, {:.2}s",
+        copies_propagated, copy_ops_removed, _ct.elapsed().as_secs_f64());
+
     let _ct = web_time::Instant::now();
     let fused = fuse_cmp_branch(&mut program);
     log::info!("[compile detail] fuse_cmp_branch: {} fused, {:.2}s", fused, _ct.elapsed().as_secs_f64());
@@ -3623,6 +3645,723 @@ fn inline_calls(program: &mut CompiledProgram) -> usize {
     // (harmless, and the executor's Op::Call arm won't be invoked).
     program.functions.clear();
     total
+}
+
+// ---------------------------------------------------------------------------
+// Copy propagation + dead-code elimination
+// ---------------------------------------------------------------------------
+//
+// Call inlining materialises one `LoadSlot { param, arg }` per argument at
+// every call site plus one `LoadSlot { dst, result }` per call, and dispatch
+// entry compilation adds one result copy per entry. At runtime these are pure
+// data movement: measured on a CSS-DOS cabinet, LoadSlot alone is ~28% of all
+// dispatched ops and LoadLit (mostly literal call arguments) another ~8%.
+//
+// Two classic passes, run per op stream:
+//
+//  1. Forward copy propagation — while the fact `slots[dst] == slots[src]`
+//     provably holds, rewrite reads of `dst` to read `src` directly. Facts
+//     merge by intersection at branch targets; a single linear pass suffices
+//     because these streams are forward-only CFGs (every branch target is a
+//     higher index), so index order is topological order.
+//  2. Backward liveness DCE — remove side-effect-free ops whose destination
+//     is never read afterwards. After propagation this kills the bypassed
+//     copies, plus literal/compute chains that only fed them.
+//
+// Soundness leans on the same invariants `compact_slots` already depends on:
+//
+//  - Non-external slots are tick-scratch: no stream reads a slot expecting a
+//    value from a previous tick (slot-compaction's free-list reuse would
+//    already corrupt such a pattern).
+//  - Cross-stream slot communication happens only through declared channels:
+//    dispatch entries read containing-scope slots (modelled by each table's
+//    transitive read-set, applied at `Dispatch` ops) and export exactly one
+//    result slot; broadcast/spillover sub-ops read main-scope slots (their
+//    reads are added to the main stream's external set); writeback,
+//    property_slots and packed ports read main slots at end-of-tick
+//    (`collect_main_pinned`).
+//  - Because pre-compaction slot numbers of inlined bodies are shared across
+//    streams, a `Dispatch` may write slots aliasing the containing stream's
+//    temporaries — so propagation drops ALL facts at a `Dispatch`.
+//
+// Streams containing a backward branch edge, or op variants that only exist
+// after later passes (DispatchChain, BranchIfNotEqLit2, fused branches,
+// ReplicatedBody) or `Op::Call`, are skipped untouched.
+//
+// Must run after `inline_calls` and before `build_dispatch_chains` / the
+// fuse passes: no chain tables exist yet, so removing ops invalidates no
+// chain-table body PCs, and the cleaned streams give the fuse passes more
+// adjacent triplets to work with.
+
+/// Copy-propagation facts: `map[dst] = root` means `slots[dst] == slots[root]`
+/// here. Values are always roots (never themselves keys), maintained by
+/// `add`/`kill`. `dependents` is the reverse index used to invalidate facts
+/// when a root is overwritten.
+#[derive(Default, Clone)]
+struct CopyFacts {
+    map: FxMap<Slot, Slot>,
+    dependents: FxMap<Slot, Vec<Slot>>,
+}
+
+impl CopyFacts {
+    fn root(&self, s: Slot) -> Slot {
+        self.map.get(&s).copied().unwrap_or(s)
+    }
+    /// Slot `w` was overwritten: drop the fact about `w` and every fact
+    /// rooted at `w`.
+    fn kill(&mut self, w: Slot) {
+        self.map.remove(&w);
+        if let Some(deps) = self.dependents.remove(&w) {
+            for d in deps {
+                if self.map.get(&d) == Some(&w) {
+                    self.map.remove(&d);
+                }
+            }
+        }
+    }
+    /// Record `slots[dst] == slots[src]`. Caller must `kill(dst)` first and
+    /// guarantee `src` is already a root (reads are rewritten before adding).
+    fn add(&mut self, dst: Slot, src: Slot) {
+        self.map.insert(dst, src);
+        self.dependents.entry(src).or_default().push(dst);
+    }
+    fn clear(&mut self) {
+        self.map.clear();
+        self.dependents.clear();
+    }
+    /// Restore from a plain dst→root snapshot.
+    fn from_map(map: FxMap<Slot, Slot>) -> Self {
+        let mut dependents: FxMap<Slot, Vec<Slot>> = FxMap::default();
+        for (&d, &r) in &map {
+            dependents.entry(r).or_default().push(d);
+        }
+        CopyFacts { map, dependents }
+    }
+    /// Keep only facts present (with equal root) in `other`.
+    fn intersect_map(a: &mut FxMap<Slot, Slot>, b: &FxMap<Slot, Slot>) {
+        a.retain(|k, v| b.get(k) == Some(v));
+    }
+}
+
+/// The real control-flow target of an op at this pipeline stage, if any.
+/// `Dispatch.fallback_target` is excluded — it is a placeholder (always 0)
+/// that the executor never reads.
+fn op_real_target(op: &Op) -> Option<u32> {
+    match op {
+        Op::Jump { target }
+        | Op::BranchIfZero { target, .. }
+        | Op::BranchIfNotEqLit { target, .. }
+        | Op::LoadStateAndBranchIfNotEqLit { target, .. } => Some(*target),
+        Op::MemoryFill { exit_target, .. } | Op::MemoryCopy { exit_target, .. } => {
+            Some(*exit_target)
+        }
+        _ => None,
+    }
+}
+
+/// Rewrite every pure-read operand of `op` through `facts`. Returns the
+/// number of operands redirected. Operands that are both read AND written
+/// by the op (MemoryFill/MemoryCopy pointer slots) are left alone — the
+/// write-back must keep landing in the original slot.
+fn rewrite_op_reads(op: &mut Op, facts: &CopyFacts) -> usize {
+    let mut n = 0usize;
+    macro_rules! rw {
+        ($s:expr) => {{
+            let r = facts.root(*$s);
+            if r != *$s {
+                *$s = r;
+                n += 1;
+            }
+        }};
+    }
+    match op {
+        Op::LoadSlot { src, .. } => rw!(src),
+        Op::LoadMem { addr_slot, .. } | Op::LoadMem16 { addr_slot, .. } => rw!(addr_slot),
+        Op::LoadPackedByte { key_slot, .. } => rw!(key_slot),
+        Op::Add { a, b, .. }
+        | Op::Sub { a, b, .. }
+        | Op::Mul { a, b, .. }
+        | Op::Div { a, b, .. }
+        | Op::Mod { a, b, .. }
+        | Op::And { a, b, .. }
+        | Op::Shr { a, b, .. }
+        | Op::Shl { a, b, .. }
+        | Op::BitAnd16 { a, b, .. }
+        | Op::BitOr16 { a, b, .. }
+        | Op::BitXor16 { a, b, .. }
+        | Op::CmpEq { a, b, .. } => {
+            rw!(a);
+            rw!(b);
+        }
+        Op::AddLit { a, .. }
+        | Op::SubLit { a, .. }
+        | Op::MulLit { a, .. }
+        | Op::AndLit { a, .. }
+        | Op::ShrLit { a, .. }
+        | Op::ShlLit { a, .. }
+        | Op::ModLit { a, .. }
+        | Op::BitNot16 { a, .. } => rw!(a),
+        Op::Neg { src, .. } | Op::Abs { src, .. } | Op::Sign { src, .. } | Op::Floor { src, .. } => {
+            rw!(src)
+        }
+        Op::Pow { base, exp, .. } => {
+            rw!(base);
+            rw!(exp);
+        }
+        Op::Min { args, .. } | Op::Max { args, .. } => {
+            for a in args.iter_mut() {
+                rw!(a);
+            }
+        }
+        Op::Clamp { min, val, max, .. } => {
+            rw!(min);
+            rw!(val);
+            rw!(max);
+        }
+        Op::Round { val, interval, .. } => {
+            rw!(val);
+            rw!(interval);
+        }
+        Op::Bit { val, idx, .. } => {
+            rw!(val);
+            rw!(idx);
+        }
+        Op::BranchIfZero { cond, .. } => rw!(cond),
+        Op::BranchIfNotEqLit { a, .. } => rw!(a),
+        Op::Dispatch { key, .. } | Op::DispatchFlatArray { key, .. } => rw!(key),
+        Op::StoreState { src, .. } => rw!(src),
+        Op::StoreMem { addr_slot, src } => {
+            rw!(addr_slot);
+            rw!(src);
+        }
+        // val_slot is read-only; dst/src/count are read+written — not rewritable.
+        Op::MemoryFill { val_slot, .. } => rw!(val_slot),
+        Op::MemoryCopy { .. } => {}
+        Op::LoadLit { .. } | Op::LoadState { .. } | Op::Jump { .. }
+        | Op::LoadStateAndBranchIfNotEqLit { .. } => {}
+        // Excluded by the pre-scan bail in copy_opt_stream.
+        Op::BranchIfNotEqLit2 { .. }
+        | Op::DispatchChain { .. }
+        | Op::Call { .. }
+        | Op::ReplicatedBody { .. } => {
+            unreachable!("rewrite_op_reads on op excluded by copy_opt_stream pre-scan")
+        }
+    }
+    n
+}
+
+/// Is this op free of side effects (removable when its dst is dead)?
+/// `Dispatch` is NOT pure: entries may contain StoreState/StoreMem.
+fn op_is_pure(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::LoadLit { .. }
+            | Op::LoadSlot { .. }
+            | Op::LoadState { .. }
+            | Op::LoadMem { .. }
+            | Op::LoadMem16 { .. }
+            | Op::LoadPackedByte { .. }
+            | Op::Add { .. }
+            | Op::AddLit { .. }
+            | Op::Sub { .. }
+            | Op::SubLit { .. }
+            | Op::Mul { .. }
+            | Op::MulLit { .. }
+            | Op::Div { .. }
+            | Op::Mod { .. }
+            | Op::ModLit { .. }
+            | Op::Neg { .. }
+            | Op::Abs { .. }
+            | Op::Sign { .. }
+            | Op::Pow { .. }
+            | Op::Min { .. }
+            | Op::Max { .. }
+            | Op::Clamp { .. }
+            | Op::Round { .. }
+            | Op::Floor { .. }
+            | Op::And { .. }
+            | Op::AndLit { .. }
+            | Op::Shr { .. }
+            | Op::ShrLit { .. }
+            | Op::Shl { .. }
+            | Op::ShlLit { .. }
+            | Op::Bit { .. }
+            | Op::BitAnd16 { .. }
+            | Op::BitOr16 { .. }
+            | Op::BitXor16 { .. }
+            | Op::BitNot16 { .. }
+            | Op::CmpEq { .. }
+            | Op::DispatchFlatArray { .. }
+    )
+}
+
+/// Run copy propagation + DCE on one op stream. `external` is the set of
+/// slots read after the stream finishes (live-out). `table_reads[t]` is the
+/// transitive read-set of dispatch table `t`. Returns (reads redirected,
+/// ops removed).
+fn copy_opt_stream(
+    ops: &mut Vec<Op>,
+    external: &FxSet<Slot>,
+    table_reads: &[FxSet<Slot>],
+) -> (usize, usize) {
+    let len = ops.len();
+    if len == 0 {
+        return (0, 0);
+    }
+
+    // --- Pre-scan: bail on shapes this pass doesn't model, mark labels ---
+    // `barrier_live` collects the transitive read-sets of every dispatch
+    // table referenced from this stream. Those slots are treated as
+    // always-live (checked at the removal decision) instead of being
+    // injected into the tracked live set — the big tables' read-sets have
+    // tens of thousands of slots, and carrying them in `live` makes every
+    // per-label snapshot a huge clone. Conservative (a slot read by some
+    // dispatch is unremovable even below the last Dispatch op), but those
+    // slots are genuine cross-stream parameters anyway.
+    let mut is_label = vec![false; len + 1];
+    let mut barrier_live: FxSet<Slot> = FxSet::default();
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            Op::BranchIfNotEqLit2 { .. }
+            | Op::DispatchChain { .. }
+            | Op::Call { .. }
+            | Op::ReplicatedBody { .. } => return (0, 0),
+            Op::Dispatch { table_id, .. } => {
+                if let Some(reads) = table_reads.get(*table_id as usize) {
+                    barrier_live.extend(reads.iter().copied());
+                }
+            }
+            _ => {}
+        }
+        if let Some(t) = op_real_target(op) {
+            if (t as usize) <= i {
+                // Backward (or self) edge — this pass assumes forward-only CFGs.
+                return (0, 0);
+            }
+            if (t as usize) <= len {
+                is_label[t as usize] = true;
+            }
+        }
+    }
+
+    // --- Forward copy propagation ---
+    let mut facts = CopyFacts::default();
+    // Facts snapshot arriving at each label via jumps (intersected per edge).
+    let mut pending: FxMap<usize, FxMap<Slot, Slot>> = FxMap::default();
+    // Whether the previous op can fall through into the current one.
+    let mut ft_reachable = true;
+    let mut noop = vec![false; len];
+    let mut propagated = 0usize;
+
+    for i in 0..len {
+        if is_label[i] {
+            match (ft_reachable, pending.remove(&i)) {
+                (true, Some(p)) => {
+                    CopyFacts::intersect_map(&mut facts.map, &p);
+                    facts = CopyFacts::from_map(std::mem::take(&mut facts.map));
+                }
+                (true, None) => {
+                    // Label with no recorded jump-in snapshot (shouldn't happen
+                    // on forward-only CFGs) — be conservative.
+                    facts.clear();
+                }
+                (false, Some(p)) => facts = CopyFacts::from_map(p),
+                (false, None) => facts.clear(), // unreachable code
+            }
+            ft_reachable = true;
+        }
+
+        let op = &mut ops[i];
+        propagated += rewrite_op_reads(op, &facts);
+
+        // Helper to merge the current facts into a jump target's pending set.
+        macro_rules! snapshot_to {
+            ($t:expr) => {{
+                let t = $t as usize;
+                if t <= len {
+                    match pending.entry(t) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            CopyFacts::intersect_map(e.get_mut(), &facts.map);
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(facts.map.clone());
+                        }
+                    }
+                }
+            }};
+        }
+
+        match op {
+            Op::LoadSlot { dst, src } => {
+                if *dst == *src {
+                    // No-op after rewriting: value unchanged, facts unchanged.
+                    noop[i] = true;
+                } else {
+                    let (d, s) = (*dst, *src);
+                    facts.kill(d);
+                    // Cap the fact-map size: every branch clones it for the
+                    // target's pending snapshot, so an unbounded map makes
+                    // branchy streams quadratic. Copies are consumed close to
+                    // where they're made; dropping facts past the cap only
+                    // costs optimisation, not correctness.
+                    if facts.map.len() < 512 {
+                        facts.add(d, s);
+                    }
+                }
+            }
+            Op::Jump { target } => {
+                let t = *target;
+                snapshot_to!(t);
+                ft_reachable = false;
+            }
+            Op::BranchIfZero { target, .. } | Op::BranchIfNotEqLit { target, .. } => {
+                let t = *target;
+                snapshot_to!(t);
+            }
+            Op::LoadStateAndBranchIfNotEqLit { dst, target, .. } => {
+                let (d, t) = (*dst, *target);
+                facts.kill(d);
+                snapshot_to!(t);
+            }
+            Op::MemoryFill { dst_slot, count_slot, exit_target, .. } => {
+                let (a, b, t) = (*dst_slot, *count_slot, *exit_target);
+                facts.kill(a);
+                facts.kill(b);
+                snapshot_to!(t);
+                ft_reachable = false;
+            }
+            Op::MemoryCopy { src_slot, dst_slot, count_slot, exit_target } => {
+                let (a, b, c, t) = (*src_slot, *dst_slot, *count_slot, *exit_target);
+                facts.kill(a);
+                facts.kill(b);
+                facts.kill(c);
+                snapshot_to!(t);
+                ft_reachable = false;
+            }
+            Op::Dispatch { .. } => {
+                // Entry ops may write slots aliasing this scope's temporaries
+                // (inlined bodies share slot numbers across streams).
+                facts.clear();
+            }
+            Op::StoreState { .. } | Op::StoreMem { .. } => {}
+            other => {
+                if let Some(d) = op_dst(other) {
+                    facts.kill(d);
+                }
+            }
+        }
+    }
+
+    // --- Backward liveness DCE ---
+    // `live` tracks only ordinary (scratch) slots. External and
+    // dispatch-read slots are handled as always-live via the membership
+    // checks at the removal decision below — keeping them out of `live`
+    // keeps the per-label snapshots small.
+    let mut live: FxSet<Slot> = FxSet::default();
+    // live-in set at each label index (available because targets are forward:
+    // in the reverse walk a target is always visited before its branch).
+    let mut live_at: FxMap<usize, FxSet<Slot>> = FxMap::default();
+    let live_in = |live_at: &FxMap<usize, FxSet<Slot>>, t: u32| {
+        if (t as usize) >= len {
+            FxSet::default()
+        } else {
+            live_at.get(&(t as usize)).cloned().unwrap_or_default()
+        }
+    };
+    let mut dead = vec![false; len];
+    let mut removed = 0usize;
+
+    for i in (0..len).rev() {
+        let op = &ops[i];
+        if noop[i] {
+            dead[i] = true;
+        } else {
+            match op {
+                Op::Jump { target } => {
+                    live = live_in(&live_at, *target);
+                }
+                Op::BranchIfZero { cond, target } => {
+                    live.extend(live_in(&live_at, *target));
+                    live.insert(*cond);
+                }
+                Op::BranchIfNotEqLit { a, target, .. } => {
+                    live.extend(live_in(&live_at, *target));
+                    live.insert(*a);
+                }
+                Op::LoadStateAndBranchIfNotEqLit { dst, target, .. } => {
+                    live.extend(live_in(&live_at, *target));
+                    live.remove(dst);
+                }
+                Op::MemoryFill { dst_slot, val_slot, count_slot, exit_target } => {
+                    live = live_in(&live_at, *exit_target);
+                    live.insert(*dst_slot);
+                    live.insert(*val_slot);
+                    live.insert(*count_slot);
+                }
+                Op::MemoryCopy { src_slot, dst_slot, count_slot, exit_target } => {
+                    live = live_in(&live_at, *exit_target);
+                    live.insert(*src_slot);
+                    live.insert(*dst_slot);
+                    live.insert(*count_slot);
+                }
+                Op::Dispatch { dst, key, .. } => {
+                    // Table read-set handled via barrier_live.
+                    live.remove(dst);
+                    live.insert(*key);
+                }
+                Op::StoreState { src, .. } => {
+                    live.insert(*src);
+                }
+                Op::StoreMem { addr_slot, src } => {
+                    live.insert(*addr_slot);
+                    live.insert(*src);
+                }
+                other => {
+                    debug_assert!(op_is_pure(other));
+                    let d = op_dst(other).expect("pure op without dst");
+                    if !live.contains(&d) && !external.contains(&d) && !barrier_live.contains(&d) {
+                        dead[i] = true;
+                    } else if let Op::LoadSlot { dst: r, src: x } = *other {
+                        // Store-forwarding: if the previous op is the sole
+                        // producer of `x` and `x` is dead after this copy,
+                        // retarget the producer to write `r` directly and
+                        // drop the copy. Adjacency plus !is_label[i] means no
+                        // other path can observe the intermediate state, and
+                        // forwarding can't change `r`'s value at any read.
+                        let fwd = i >= 1
+                            && !is_label[i]
+                            && !noop[i - 1]
+                            && !live.contains(&x)
+                            && !external.contains(&x)
+                            && !barrier_live.contains(&x)
+                            && match &ops[i - 1] {
+                                // Producer must write exactly `x`, never
+                                // branch, and have no other dst.
+                                p if op_is_pure(p) => op_dst(p) == Some(x),
+                                Op::Dispatch { dst, .. } => *dst == x,
+                                _ => false,
+                            };
+                        if fwd {
+                            dead[i] = true;
+                            // Retarget the producer. Reads were already
+                            // final for ops[i-1] (the forward pass is done),
+                            // and the backward walk hasn't visited it yet.
+                            let prev = &mut ops[i - 1];
+                            match prev {
+                                Op::LoadLit { dst, .. }
+                                | Op::LoadSlot { dst, .. }
+                                | Op::LoadState { dst, .. }
+                                | Op::LoadMem { dst, .. }
+                                | Op::LoadMem16 { dst, .. }
+                                | Op::LoadPackedByte { dst, .. }
+                                | Op::Add { dst, .. }
+                                | Op::AddLit { dst, .. }
+                                | Op::Sub { dst, .. }
+                                | Op::SubLit { dst, .. }
+                                | Op::Mul { dst, .. }
+                                | Op::MulLit { dst, .. }
+                                | Op::Div { dst, .. }
+                                | Op::Mod { dst, .. }
+                                | Op::ModLit { dst, .. }
+                                | Op::Neg { dst, .. }
+                                | Op::Abs { dst, .. }
+                                | Op::Sign { dst, .. }
+                                | Op::Pow { dst, .. }
+                                | Op::Min { dst, .. }
+                                | Op::Max { dst, .. }
+                                | Op::Clamp { dst, .. }
+                                | Op::Round { dst, .. }
+                                | Op::Floor { dst, .. }
+                                | Op::And { dst, .. }
+                                | Op::AndLit { dst, .. }
+                                | Op::Shr { dst, .. }
+                                | Op::ShrLit { dst, .. }
+                                | Op::Shl { dst, .. }
+                                | Op::ShlLit { dst, .. }
+                                | Op::Bit { dst, .. }
+                                | Op::BitAnd16 { dst, .. }
+                                | Op::BitOr16 { dst, .. }
+                                | Op::BitXor16 { dst, .. }
+                                | Op::BitNot16 { dst, .. }
+                                | Op::CmpEq { dst, .. }
+                                | Op::DispatchFlatArray { dst, .. }
+                                | Op::Dispatch { dst, .. } => *dst = r,
+                                _ => unreachable!("forwarding producer checked above"),
+                            }
+                        } else {
+                            live.remove(&r);
+                            live.insert(x);
+                        }
+                    } else {
+                        live.remove(&d);
+                        for r in op_slots_read(other) {
+                            live.insert(r);
+                        }
+                    }
+                }
+            }
+        }
+        if is_label[i] {
+            live_at.insert(i, live.clone());
+        }
+    }
+
+    // --- Remove dead ops, remapping branch targets ---
+    if dead.iter().any(|&d| d) {
+        let mut new_indices = vec![0u32; len];
+        let mut offset = 0u32;
+        for i in 0..len {
+            new_indices[i] = i as u32 - offset;
+            if dead[i] {
+                offset += 1;
+            }
+        }
+        let new_end = len as u32 - offset;
+
+        for op in ops.iter_mut() {
+            let t = match op {
+                Op::Jump { target }
+                | Op::BranchIfZero { target, .. }
+                | Op::BranchIfNotEqLit { target, .. }
+                | Op::LoadStateAndBranchIfNotEqLit { target, .. } => target,
+                Op::MemoryFill { exit_target, .. } | Op::MemoryCopy { exit_target, .. } => {
+                    exit_target
+                }
+                _ => continue,
+            };
+            let old = *t as usize;
+            *t = if old < len { new_indices[old] } else { new_end };
+        }
+
+        let mut write = 0usize;
+        for read in 0..len {
+            if dead[read] {
+                continue;
+            }
+            if write != read {
+                ops.swap(write, read);
+            }
+            write += 1;
+        }
+        removed = len - write;
+        ops.truncate(write);
+    }
+
+    (propagated, removed)
+}
+
+/// Drive `copy_opt_stream` over every op stream in the program.
+/// Returns (reads redirected, ops removed).
+fn copy_propagate_and_dce(program: &mut CompiledProgram) -> (usize, usize) {
+    // Transitive read-set per dispatch table: every slot any entry/fallback op
+    // reads (plus result/fallback slots, which the Dispatch op itself reads),
+    // closed over nested Dispatch references. Over-approximates "slots a
+    // Dispatch on this table may consume from the containing scope".
+    let n_tables = program.dispatch_tables.len();
+    let mut table_reads: Vec<FxSet<Slot>> = Vec::with_capacity(n_tables);
+    let mut table_refs: Vec<Vec<usize>> = Vec::with_capacity(n_tables);
+    for table in &program.dispatch_tables {
+        let mut reads: FxSet<Slot> = FxSet::default();
+        let mut refs: Vec<usize> = Vec::new();
+        let mut collect = |ops: &[Op]| {
+            let mut local_reads = Vec::new();
+            let mut local_refs = Vec::new();
+            for op in ops {
+                local_reads.extend(op_slots_read(op));
+                if let Op::Dispatch { table_id, .. } = op {
+                    local_refs.push(*table_id as usize);
+                }
+            }
+            (local_reads, local_refs)
+        };
+        let (r, f) = collect(&table.fallback_ops);
+        reads.extend(r);
+        refs.extend(f);
+        reads.insert(table.fallback_slot);
+        for (entry_ops, result_slot) in table.entries.values() {
+            let (r, f) = collect(entry_ops);
+            reads.extend(r);
+            refs.extend(f);
+            reads.insert(*result_slot);
+        }
+        table_reads.push(reads);
+        table_refs.push(refs);
+    }
+    loop {
+        let mut changed = false;
+        for i in 0..n_tables {
+            let mut add: Vec<Slot> = Vec::new();
+            for &c in &table_refs[i] {
+                if c < n_tables && c != i {
+                    add.extend(table_reads[c].iter().filter(|s| !table_reads[i].contains(s)));
+                }
+            }
+            if !add.is_empty() {
+                changed = true;
+                table_reads[i].extend(add);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Main-stream live-out: end-of-tick readers (writeback, property_slots,
+    // broadcast/packed-port control slots) plus everything the broadcast
+    // value/spillover sub-op streams read (they execute after the main
+    // stream within the same tick).
+    let mut main_external: FxSet<Slot> = collect_main_pinned(program).into_iter().collect();
+    for bw in &program.broadcast_writes {
+        for op in &bw.value_ops {
+            main_external.extend(op_slots_read(op));
+        }
+        main_external.insert(bw.value_slot);
+        if let Some(ref sp) = bw.spillover {
+            for (spill_ops, spill_slot) in sp.entries.values() {
+                for op in spill_ops {
+                    main_external.extend(op_slots_read(op));
+                }
+                main_external.insert(*spill_slot);
+            }
+        }
+    }
+
+    let mut propagated = 0usize;
+    let mut removed = 0usize;
+
+    let (p, r) = copy_opt_stream(&mut program.ops, &main_external, &table_reads);
+    propagated += p;
+    removed += r;
+
+    for table in &mut program.dispatch_tables {
+        for (entry_ops, result_slot) in table.entries.values_mut() {
+            let ext: FxSet<Slot> = std::iter::once(*result_slot).collect();
+            let (p, r) = copy_opt_stream(entry_ops, &ext, &table_reads);
+            propagated += p;
+            removed += r;
+        }
+        let ext: FxSet<Slot> = std::iter::once(table.fallback_slot).collect();
+        let (p, r) = copy_opt_stream(&mut table.fallback_ops, &ext, &table_reads);
+        propagated += p;
+        removed += r;
+    }
+
+    for bw in &mut program.broadcast_writes {
+        let ext: FxSet<Slot> = std::iter::once(bw.value_slot).collect();
+        let (p, r) = copy_opt_stream(&mut bw.value_ops, &ext, &table_reads);
+        propagated += p;
+        removed += r;
+        if let Some(ref mut sp) = bw.spillover {
+            for (spill_ops, spill_slot) in sp.entries.values_mut() {
+                let ext: FxSet<Slot> = std::iter::once(*spill_slot).collect();
+                let (p, r) = copy_opt_stream(spill_ops, &ext, &table_reads);
+                propagated += p;
+                removed += r;
+            }
+        }
+    }
+
+    (propagated, removed)
 }
 
 // ---------------------------------------------------------------------------
@@ -8470,6 +9209,241 @@ mod tests {
         }
         crate::eval::set_address_map(map);
         state
+    }
+
+    // --- copy_propagate_and_dce / copy_opt_stream ---
+
+    fn run(ops: &[Op], n_slots: usize) -> Vec<i32> {
+        let mut state = State::default();
+        let mut slots = vec![0i32; n_slots];
+        exec_ops(ops, &[], &[], &[], &[], &[], &[], &mut state, &mut slots);
+        slots
+    }
+
+    fn ext(slots: &[Slot]) -> FxSet<Slot> {
+        slots.iter().copied().collect()
+    }
+
+    #[test]
+    fn copy_elim_collapses_chain() {
+        let mut ops = vec![
+            Op::LoadLit { dst: 0, val: 7 },
+            Op::LoadSlot { dst: 1, src: 0 },
+            Op::LoadSlot { dst: 2, src: 1 },
+            Op::Add { dst: 3, a: 2, b: 2 },
+        ];
+        let before = run(&ops, 8);
+        let (prop, removed) = copy_opt_stream(&mut ops, &ext(&[3]), &[]);
+        assert!(prop >= 2, "expected chain reads redirected, got {prop}");
+        assert_eq!(removed, 2, "both copies should die");
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[1], Op::Add { dst: 3, a: 0, b: 0 }));
+        let after = run(&ops, 8);
+        assert_eq!(before[3], after[3]);
+        assert_eq!(after[3], 14);
+    }
+
+    #[test]
+    fn copy_elim_diamond_facts_survive_labels() {
+        // 0: LoadLit cond
+        // 1: LoadSlot 1 <- 0 (the copy under test)
+        // 2: BranchIfZero(cond=1) -> 5
+        // 3: AddLit 2 = slot1 + 100
+        // 4: Jump -> 6
+        // 5: AddLit 2 = slot1 + 200    (label, single pred)
+        // 6: Add 3 = slot2 + slot1     (join label, two preds)
+        let build = |k: i32| {
+            vec![
+                Op::LoadLit { dst: 0, val: k },
+                Op::LoadSlot { dst: 1, src: 0 },
+                Op::BranchIfZero { cond: 1, target: 5 },
+                Op::AddLit { dst: 2, a: 1, val: 100 },
+                Op::Jump { target: 6 },
+                Op::AddLit { dst: 2, a: 1, val: 200 },
+                Op::Add { dst: 3, a: 2, b: 1 },
+            ]
+        };
+        for k in [0, 5] {
+            let mut ops = build(k);
+            let before = run(&ops, 8);
+            let (_, removed) = copy_opt_stream(&mut ops, &ext(&[3]), &[]);
+            assert_eq!(removed, 1, "copy should die after facts cross the labels (k={k})");
+            assert_eq!(ops.len(), 6);
+            let after = run(&ops, 8);
+            assert_eq!(before[3], after[3], "semantics changed for k={k}");
+        }
+    }
+
+    #[test]
+    fn copy_elim_copy_back_is_noop() {
+        let mut ops = vec![
+            Op::LoadLit { dst: 0, val: 9 },
+            Op::LoadSlot { dst: 1, src: 0 },
+            Op::LoadSlot { dst: 0, src: 1 }, // copy-back: a no-op once src is rewritten
+            Op::Add { dst: 2, a: 0, b: 1 },
+        ];
+        let before = run(&ops, 8);
+        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[2]), &[]);
+        assert_eq!(removed, 2);
+        assert_eq!(ops.len(), 2);
+        let after = run(&ops, 8);
+        assert_eq!(before[2], after[2]);
+        assert_eq!(after[2], 18);
+    }
+
+    #[test]
+    fn copy_elim_dead_chain_cascade() {
+        let mut ops = vec![
+            Op::LoadLit { dst: 0, val: 1 },
+            Op::LoadLit { dst: 1, val: 2 },
+            Op::Add { dst: 2, a: 0, b: 1 },
+            Op::LoadLit { dst: 3, val: 5 },
+        ];
+        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[3]), &[]);
+        assert_eq!(removed, 3, "whole dead compute chain should cascade away");
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], Op::LoadLit { dst: 3, val: 5 }));
+    }
+
+    #[test]
+    fn copy_elim_dispatch_kills_facts_and_keeps_table_reads() {
+        let mut table_reads: Vec<FxSet<Slot>> = vec![FxSet::default()];
+        table_reads[0].insert(7);
+        let mut ops = vec![
+            Op::LoadLit { dst: 5, val: 1 },
+            Op::LoadSlot { dst: 7, src: 5 }, // read inside the dispatch entry
+            Op::Dispatch { dst: 8, key: 5, table_id: 0, fallback_target: 0 },
+            Op::Add { dst: 9, a: 8, b: 7 },
+        ];
+        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[9]), &table_reads);
+        assert_eq!(removed, 0, "copy feeding a dispatch entry must survive");
+        assert_eq!(ops.len(), 4);
+        // The read of slot 7 after the Dispatch must NOT have been rewritten
+        // to 5 — the dispatch entry may alias-write either slot.
+        assert!(matches!(ops[3], Op::Add { dst: 9, a: 8, b: 7 }));
+    }
+
+    #[test]
+    fn copy_elim_external_dst_kept() {
+        let mut ops = vec![
+            Op::LoadLit { dst: 0, val: 3 },
+            Op::LoadSlot { dst: 10, src: 0 }, // external (e.g. writeback)
+            Op::LoadSlot { dst: 11, src: 0 }, // dead
+        ];
+        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[10]), &[]);
+        // The dead copy dies, and store-forwarding folds the external copy
+        // into its producer: LoadLit writes slot 10 directly.
+        assert_eq!(removed, 2);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], Op::LoadLit { dst: 10, val: 3 }));
+    }
+
+    #[test]
+    fn copy_elim_store_forwarding_result_copy() {
+        // The dispatch-entry shape: compute, then copy into the result slot.
+        let mut ops = vec![
+            Op::LoadLit { dst: 0, val: 6 },
+            Op::AddLit { dst: 1, a: 0, val: 1 },
+            Op::LoadSlot { dst: 2, src: 1 }, // result copy
+        ];
+        let before = run(&ops, 8);
+        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[2]), &[]);
+        assert_eq!(removed, 1);
+        assert!(matches!(ops[1], Op::AddLit { dst: 2, a: 0, val: 1 }));
+        let after = run(&ops, 8);
+        assert_eq!(before[2], after[2]);
+        assert_eq!(after[2], 7);
+    }
+
+    #[test]
+    fn copy_elim_no_forwarding_across_label() {
+        // A branch target sits on the copy: another path reaches the copy
+        // without the producer, so the producer must not be retargeted.
+        let build = |k: i32| {
+            vec![
+                Op::LoadLit { dst: 0, val: k },
+                Op::LoadLit { dst: 1, val: 10 },
+                Op::BranchIfZero { cond: 0, target: 4 },
+                Op::AddLit { dst: 1, a: 1, val: 90 },
+                Op::LoadSlot { dst: 2, src: 1 }, // label: reached two ways
+            ]
+        };
+        for k in [0, 1] {
+            let mut ops = build(k);
+            let before = run(&ops, 8);
+            copy_opt_stream(&mut ops, &ext(&[2]), &[]);
+            let after = run(&ops, 8);
+            assert_eq!(before[2], after[2], "label forwarding broke semantics for k={k}");
+        }
+    }
+
+    #[test]
+    fn copy_elim_no_forwarding_when_src_still_live() {
+        let mut ops = vec![
+            Op::LoadLit { dst: 0, val: 6 },
+            Op::AddLit { dst: 1, a: 0, val: 1 },
+            Op::LoadSlot { dst: 2, src: 1 }, // copy
+            Op::Add { dst: 3, a: 1, b: 2 },  // still reads slot 1
+        ];
+        let before = run(&ops, 8);
+        copy_opt_stream(&mut ops, &ext(&[3]), &[]);
+        let after = run(&ops, 8);
+        assert_eq!(before[3], after[3]);
+        assert_eq!(after[3], 14);
+    }
+
+    #[test]
+    fn copy_elim_backward_edge_bails() {
+        let mut ops = vec![
+            Op::LoadLit { dst: 0, val: 3 },
+            Op::LoadSlot { dst: 1, src: 0 },
+            Op::BranchIfZero { cond: 1, target: 0 },
+        ];
+        let orig = format!("{ops:?}");
+        let (prop, removed) = copy_opt_stream(&mut ops, &ext(&[1]), &[]);
+        assert_eq!((prop, removed), (0, 0));
+        assert_eq!(format!("{ops:?}"), orig, "stream with backward edge must be untouched");
+    }
+
+    #[test]
+    fn copy_elim_memoryfill_pointer_slots_not_rewritten() {
+        let mut ops = vec![
+            Op::LoadLit { dst: 0, val: 5 },
+            Op::LoadSlot { dst: 1, src: 0 },
+            Op::MemoryFill { dst_slot: 1, val_slot: 0, count_slot: 3, exit_target: 3 },
+        ];
+        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[1]), &[]);
+        assert_eq!(removed, 0);
+        // dst_slot is read+written: must keep pointing at slot 1, and the
+        // copy producing slot 1 must stay.
+        assert!(matches!(
+            ops[2],
+            Op::MemoryFill { dst_slot: 1, val_slot: 0, count_slot: 3, .. }
+        ));
+        assert!(matches!(ops[1], Op::LoadSlot { dst: 1, src: 0 }));
+    }
+
+    #[test]
+    fn copy_elim_jump_target_remap_preserves_semantics() {
+        // Dead copy sits between a branch and its target; removal shifts
+        // indices, so targets must be remapped.
+        let build = |k: i32| {
+            vec![
+                Op::LoadLit { dst: 0, val: k },
+                Op::BranchIfZero { cond: 0, target: 4 },
+                Op::LoadSlot { dst: 1, src: 0 }, // dead (slot 1 never read)
+                Op::LoadLit { dst: 2, val: 111 },
+                Op::AddLit { dst: 3, a: 2, val: 1 },
+            ]
+        };
+        for k in [0, 1] {
+            let mut ops = build(k);
+            let before = run(&ops, 8);
+            let (_, removed) = copy_opt_stream(&mut ops, &ext(&[3]), &[]);
+            assert_eq!(removed, 1);
+            let after = run(&ops, 8);
+            assert_eq!(before[3], after[3], "branch remap broke semantics for k={k}");
+        }
     }
 
     #[test]
