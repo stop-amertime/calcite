@@ -2208,6 +2208,11 @@ fn indirect_read_captures_base_scaling_from_shape() {
 /// K_opcode)`. This is structurally what kiln emits for the `cycleCount`
 /// dispatch in the doom8088 cabinet (one of the 94 opcode entries in
 /// `kiln/cycle-counts.mjs`).
+/// Expected `per_iter_cycles` value: the cycle slot's own name + K.
+fn charge(property: &str, per_iter: i32) -> Option<CycleCharge> {
+    Some(CycleCharge { property: property.to_string(), per_iter })
+}
+
 fn cabinet_a_with_cycle_dispatch(
     cycle_slot: &str,
     cycle_mirror: &str,
@@ -2243,21 +2248,22 @@ fn per_iter_cycles_extracted_from_self_add_literal_dispatch() {
         .iter()
         .find(|d| d.key_value == 0xA4)
         .expect("MOVSB descriptor");
-    assert_eq!(stos.per_iter_cycles, Some(10));
-    assert_eq!(movs.per_iter_cycles, Some(17));
+    assert_eq!(stos.per_iter_cycles, charge("--cycleCount", 10));
+    assert_eq!(movs.per_iter_cycles, charge("--cycleCount", 17));
 }
 
 #[test]
 fn per_iter_cycles_renaming_is_blind() {
     // Same cabinet shape, completely different cycle slot name. The
     // recogniser does not inspect characters of the slot name; renaming
-    // does not affect extraction.
+    // does not affect extraction — and the captured property follows
+    // the rename, so the applier commits to the cabinet's own slot.
     let asns = cabinet_a_with_cycle_dispatch("--zorch", "--__zorchPrev", 10, 17);
     let descs = recognise_loops(&asns);
     let stos = descs.iter().find(|d| d.key_value == 0xAA).unwrap();
     let movs = descs.iter().find(|d| d.key_value == 0xA4).unwrap();
-    assert_eq!(stos.per_iter_cycles, Some(10));
-    assert_eq!(movs.per_iter_cycles, Some(17));
+    assert_eq!(stos.per_iter_cycles, charge("--zorch", 10));
+    assert_eq!(movs.per_iter_cycles, charge("--zorch", 17));
 }
 
 #[test]
@@ -2288,10 +2294,10 @@ fn per_iter_cycles_brainfuck_shape_extracts_same_way() {
         .expect("brainfuck copy-shape descriptor");
     assert_eq!(
         fill.per_iter_cycles,
-        Some(3),
+        charge("--whiskCount", 3),
         "brainfuck cabinet's K is extracted just like x86's K",
     );
-    assert_eq!(copy.per_iter_cycles, Some(7));
+    assert_eq!(copy.per_iter_cycles, charge("--whiskCount", 7));
 }
 
 #[test]
@@ -2346,7 +2352,7 @@ fn per_iter_cycles_picks_most_populated_self_add_literal_family_member() {
     let stos = descs.iter().find(|d| d.key_value == 0xAA).unwrap();
     assert_eq!(
         stos.per_iter_cycles,
-        Some(10),
+        charge("--bigSlot", 10),
         "the most-populated self+lit member wins; we should pick K=10 \
          from --bigSlot, not K=99 from --smallSlot",
     );

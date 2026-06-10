@@ -137,8 +137,8 @@ pub struct LoopDescriptor {
     /// not look at any name, only at whether write-value expressions
     /// transitively reference any pointer-slot mirror.
     pub bulk_class: BulkClass,
-    /// Per-iteration cycle cost charged when the applier fast-forwards
-    /// one iteration of this loop.
+    /// The cycle-counter slot and the per-iteration cost charged to it
+    /// when the applier fast-forwards this loop.
     ///
     /// **Structurally derived, not opcode-keyed.** At recogniser time we
     /// scan the dispatch family for the single family member whose
@@ -147,23 +147,25 @@ pub struct LoopDescriptor {
     /// of keys, with `X` the same opaque slot reference across all
     /// matching keys. That member is "the cycle counter": the slot
     /// dispatched per opcode as a fixed-slot-plus-per-opcode-literal
-    /// shape. For this descriptor's `key_value`, the literal `K` from
-    /// that member's body is captured here.
+    /// shape. For this descriptor's `key_value`, both that member's
+    /// *property name* and the literal `K` from its body are captured
+    /// here — the applier commits through the captured name, never a
+    /// hardcoded one.
     ///
-    /// `Some(K)` when the dispatch family contains such a member AND
+    /// `Some` when the dispatch family contains such a member AND
     /// it has a body for this opcode of the matching shape.
     /// `None` otherwise — the applier returns `Unsupported` and the
     /// dispatcher panics, because charging the wrong cycle count would
-    /// break cabinets whose progression is gated on cycleCount-derived
+    /// break cabinets whose progression is gated on cycle-derived
     /// timers.
     ///
     /// **Cardinal-rule probe.** A 6502 / brainfuck / non-emulator
     /// cabinet whose CSS emits the same `var(X) + Literal(K)`-per-key
-    /// dispatch family produces the same `Some(K)`; one without that
+    /// dispatch family produces the same charge; one without that
     /// shape produces `None`. Slot names are opaque tokens; renaming
-    /// the cycle counter slot (e.g. `--cycleCount` → `--zorch`) does
-    /// not affect the extraction.
-    pub per_iter_cycles: Option<i32>,
+    /// the cycle counter slot (e.g. `--cycleCount` → `--zorch`) moves
+    /// the captured `property` along with it and the commit follows.
+    pub per_iter_cycles: Option<CycleCharge>,
     /// Name of an extra slot whose value contributes to the IP slot's
     /// post-loop advance, captured from the stay branch's subtrahend:
     /// the per-key IP body `if(<pred>: calc(self − var(extra)); else:
@@ -231,6 +233,21 @@ pub struct LoopDescriptor {
     /// `Precondition` (or `None`) without any character-level
     /// inspection of slot names by the recogniser.
     pub precondition: Option<Precondition>,
+}
+
+/// The structurally identified cycle-counter slot and the per-iteration
+/// literal this opcode's body adds to it. Captured together so the
+/// applier can never charge a cost without also knowing *which* slot
+/// the cabinet accumulates it in — both come from the same family
+/// member (see [`LoopDescriptor::per_iter_cycles`] for the extraction
+/// rule).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CycleCharge {
+    /// The cycle-counter family member's property name, verbatim from
+    /// the cabinet (opaque token — e.g. `--cycleCount`, `--zorch`).
+    pub property: String,
+    /// The literal `K` from this opcode's `var(X) + K` body.
+    pub per_iter: i32,
 }
 
 /// The cabinet's own outer-guard predicate for whether a recognised
@@ -1937,16 +1954,17 @@ fn collect_var_names_in_test(test: &StyleTest, out: &mut HashSet<String>) {
     }
 }
 
-/// Find the per-iteration cycle cost literal for one opcode, structurally.
+/// Find the per-iteration cycle cost for one opcode, structurally.
 ///
 /// **Rule.** Among the dispatch family's members, pick the one with the
 /// highest count of bodies matching the shape
 /// `Calc(Add(Var(X), Literal(K)))` (with X the same opaque slot reference
 /// across all matching keys for that member). Call that member "the
 /// cycle-counter family member". For the requested `key_value`, return
-/// `Some(K)` if its body in that member matches the shape; `None`
-/// otherwise (no such family member exists, or this opcode is not one
-/// of the per-key bodies the chosen member covers).
+/// `Some(CycleCharge)` — that member's property name plus its `K` — if
+/// its body in that member matches the shape; `None` otherwise (no such
+/// family member exists, or this opcode is not one of the per-key
+/// bodies the chosen member covers).
 ///
 /// **Why this rule.** A CPU cabinet that wants per-instruction cycle
 /// accounting emits exactly this shape: one slot dispatched on the
@@ -1962,7 +1980,7 @@ fn collect_var_names_in_test(test: &StyleTest, out: &mut HashSet<String>) {
 /// equality (to detect "same X across keys"). A cabinet without a
 /// per-iter cycle-style dispatch returns `None`, and the applier bails
 /// loudly rather than charging a fabricated cost.
-fn extract_per_iter_cycles(family: &DispatchFamily<'_>, key_value: i64) -> Option<i32> {
+fn extract_per_iter_cycles(family: &DispatchFamily<'_>, key_value: i64) -> Option<CycleCharge> {
     // For each member, compute the (best_X, count) over its bodies: the
     // single Var slot reference shared by the most "Var(X) + Literal(K)"
     // bodies, and how many such bodies use it.
@@ -1991,13 +2009,13 @@ fn extract_per_iter_cycles(family: &DispatchFamily<'_>, key_value: i64) -> Optio
         }
     }
 
-    let (_, _, bodies, shared_x) = best_member?;
+    let (prop, _, bodies, shared_x) = best_member?;
     let body = bodies.get(&key_value)?;
     let (x, k) = decompose_var_plus_literal(body)?;
     if x != shared_x {
         return None;
     }
-    Some(k)
+    Some(CycleCharge { property: prop.to_string(), per_iter: k })
 }
 
 /// Decompose an expression matching shape `Calc(Add(Var(X), Literal(K)))`

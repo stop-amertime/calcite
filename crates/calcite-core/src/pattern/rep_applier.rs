@@ -116,10 +116,12 @@ pub(crate) enum CommitMode {
 //
 // The per-iteration cycle cost is **structurally derived** by the
 // recogniser and stored on the descriptor as `per_iter_cycles:
-// Option<i32>`. See `pattern/loop_descriptor.rs::extract_per_iter_cycles`
-// for the structural rule (the most-populated dispatch family member
-// whose per-key bodies have shape `Calc(Add(Var(X), Literal(K)))` with X
-// the same opaque slot reference across keys).
+// Option<CycleCharge>` — the cycle-counter slot's own name plus the
+// per-opcode literal. See
+// `pattern/loop_descriptor.rs::extract_per_iter_cycles` for the
+// structural rule (the most-populated dispatch family member whose
+// per-key bodies have shape `Calc(Add(Var(X), Literal(K)))` with X the
+// same opaque slot reference across keys).
 //
 // When the recogniser couldn't extract a value, the applier returns
 // `Unsupported("per_iter_cycles not extracted")` and the dispatcher
@@ -243,9 +245,9 @@ pub(crate) fn apply_fill_with_commit(
             return ApplyOutcome::PreconditionNotMet;
         }
     }
-    let Some(per_iter) = descriptor.per_iter_cycles else {
+    if descriptor.per_iter_cycles.is_none() {
         return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
-    };
+    }
     if commit == CommitMode::Full && descriptor.ip_extra_advance_slot.is_none() {
         return ApplyOutcome::Unsupported("ip_extra_advance_slot not captured");
     }
@@ -378,7 +380,7 @@ pub(crate) fn apply_fill_with_commit(
         // Counter commit: drains to zero.
         commit_counter(state, &counter.property, 0);
         // IP advance and cycle charge.
-        commit_ip_and_cycles(program, state, slots, descriptor, n, per_iter);
+        commit_ip_and_cycles(program, state, slots, descriptor, n);
     }
 
     ApplyOutcome::Applied { iterations }
@@ -448,9 +450,9 @@ pub(crate) fn apply_copy_with_commit(
             return ApplyOutcome::PreconditionNotMet;
         }
     }
-    let Some(per_iter) = descriptor.per_iter_cycles else {
+    if descriptor.per_iter_cycles.is_none() {
         return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
-    };
+    }
     if commit == CommitMode::Full && descriptor.ip_extra_advance_slot.is_none() {
         return ApplyOutcome::Unsupported("ip_extra_advance_slot not captured");
     }
@@ -681,7 +683,7 @@ pub(crate) fn apply_copy_with_commit(
         commit_pointer(state, &dst_entry.property, new_dst);
         commit_pointer(state, &src_entry.property, new_src);
         commit_counter(state, &counter.property, 0);
-        commit_ip_and_cycles(program, state, slots, descriptor, n, per_iter);
+        commit_ip_and_cycles(program, state, slots, descriptor, n);
     }
 
     ApplyOutcome::Applied { iterations: n }
@@ -781,9 +783,9 @@ pub(crate) fn apply_read_only_with_commit(
             return ApplyOutcome::PreconditionNotMet;
         }
     }
-    let Some(per_iter) = descriptor.per_iter_cycles else {
+    if descriptor.per_iter_cycles.is_none() {
         return ApplyOutcome::Unsupported("per_iter_cycles not extracted");
-    };
+    }
     if commit == CommitMode::Full && descriptor.ip_extra_advance_slot.is_none() {
         return ApplyOutcome::Unsupported("ip_extra_advance_slot not captured");
     }
@@ -1041,7 +1043,7 @@ pub(crate) fn apply_read_only_with_commit(
         // IP advance and per-iter cycle charge. The `iters` value (not
         // n) is what the hardcoded path uses for the cycle multiplier on
         // CMPS/SCAS — early-exit reduces actual work done.
-        commit_ip_and_cycles(program, state, slots, descriptor, iters, per_iter);
+        commit_ip_and_cycles(program, state, slots, descriptor, iters);
     }
 
     ApplyOutcome::Applied { iterations: iters }
@@ -1094,44 +1096,47 @@ fn commit_counter(state: &mut State, property: &str, value: i32) {
     commit_pointer(state, property, value);
 }
 
-/// Advance IP and charge cycles for `iters` iterations. Mirrors the
-/// hardcoded path's
-///     state.set_var("IP", (ip + 1 + extra) & 0xFFFF);
-///     state.set_var("cycleCount", cc + iters * per_iter);
+/// Advance the loop's IP slot and charge the cycle counter for `iters`
+/// iterations — both through the descriptor-carried names (the
+/// cabinet's own `ip_property` and `per_iter_cycles.property`), never
+/// hardcoded ones. A cabinet that calls its instruction-pointer slot
+/// `--pc` and its cycle counter `--zorch` commits to those.
 ///
-/// The `+ 1` is `descriptor.ip_advance_literal` (the exit branch's
-/// literal — extracted structurally by the recogniser). The `+ extra`
-/// is read from `descriptor.ip_extra_advance_slot`, the cabinet's own
-/// name for the stay branch's subtrahend (`calc(self − var(extra))`).
-/// See `LoopDescriptor::ip_extra_advance_slot` for the fixed-point
-/// argument that makes `IP + literal + extra` the exit branch's value.
+/// The IP advance is `ip + ip_advance_literal + extra`: the literal is
+/// the exit branch's structural constant, `extra` is read from
+/// `descriptor.ip_extra_advance_slot`, the cabinet's own name for the
+/// stay branch's subtrahend (`calc(self − var(extra))`). See
+/// `LoopDescriptor::ip_extra_advance_slot` for the fixed-point argument
+/// that makes `IP + literal + extra` the exit branch's value.
 ///
-/// Caller contract: the descriptor's `ip_extra_advance_slot` MUST be
-/// `Some` and the named slot MUST resolve. Both invariants are checked
-/// at the start of each `apply_*_with_commit` and the applier returns
-/// `Unsupported` before reaching this commit step when they don't hold;
-/// here we resolve unconditionally (with `unwrap_or(0)` as belt-and-
-/// braces, since the slot was already proven resolvable upstream).
+/// Caller contract: the descriptor's `ip_extra_advance_slot` and
+/// `per_iter_cycles` MUST be `Some` and the extra slot MUST resolve.
+/// Those invariants are checked at the start of each
+/// `apply_*_with_commit` and the applier returns `Unsupported` before
+/// reaching this commit step when they don't hold; here we resolve
+/// unconditionally (with `unwrap_or(0)` as belt-and-braces, since the
+/// slot was already proven resolvable upstream).
 fn commit_ip_and_cycles(
     program: &CompiledProgram,
     state: &mut State,
     slots: &[i32],
     descriptor: &LoopDescriptor,
     iters: i32,
-    per_iter: i32,
 ) {
-    let ip = state.get_var("IP").unwrap_or(0);
+    let ip_var = crate::eval::to_bare_name(&descriptor.ip_property);
+    let ip = state.get_var(ip_var).unwrap_or(0);
     let extra = descriptor
         .ip_extra_advance_slot
         .as_deref()
         .and_then(|slot| read_prop(program, state, slots, slot))
         .unwrap_or(0);
     let new_ip = (ip + descriptor.ip_advance_literal + extra) & 0xFFFF;
-    if state.state_var_index.contains_key("IP") {
-        state.set_var("IP", new_ip);
-    }
-    if let Some(cc) = state.get_var("cycleCount") {
-        state.set_var("cycleCount", cc.wrapping_add(iters.wrapping_mul(per_iter)));
+    commit_pointer(state, &descriptor.ip_property, new_ip);
+    if let Some(charge) = descriptor.per_iter_cycles.as_ref() {
+        let cc_var = crate::eval::to_bare_name(&charge.property);
+        if let Some(cc) = state.get_var(cc_var) {
+            state.set_var(cc_var, cc.wrapping_add(iters.wrapping_mul(charge.per_iter)));
+        }
     }
 }
 
@@ -1143,7 +1148,8 @@ fn commit_ip_and_cycles(
 mod tests {
     use super::*;
     use crate::pattern::loop_descriptor::{
-        BulkClass, CounterEntry, IndirectRead, LoopDescriptor, PointerEntry, WriteEntry,
+        BulkClass, CounterEntry, CycleCharge, IndirectRead, LoopDescriptor, PointerEntry,
+        WriteEntry,
     };
     use crate::types::{CssValue, Expr, PropertyDef, PropertySyntax, StyleTest};
 
@@ -1229,7 +1235,7 @@ mod tests {
             }],
             flag_conditioned: false,
             bulk_class: BulkClass::Fill,
-            per_iter_cycles: Some(10),
+            per_iter_cycles: Some(CycleCharge { property: "--cycleCount".to_string(), per_iter: 10 }),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
             precondition: None,
@@ -1324,7 +1330,7 @@ mod tests {
             ],
             flag_conditioned: false,
             bulk_class: BulkClass::Fill,
-            per_iter_cycles: Some(10),
+            per_iter_cycles: Some(CycleCharge { property: "--cycleCount".to_string(), per_iter: 10 }),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
             precondition: None,
@@ -1638,7 +1644,7 @@ mod tests {
             }],
             flag_conditioned: false,
             bulk_class: BulkClass::Fill,
-            per_iter_cycles: Some(10),
+            per_iter_cycles: Some(CycleCharge { property: "--cycle_x".to_string(), per_iter: 10 }),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
             precondition: None,
@@ -1815,7 +1821,7 @@ mod tests {
             }],
             flag_conditioned: false,
             bulk_class: BulkClass::Copy,
-            per_iter_cycles: Some(17),
+            per_iter_cycles: Some(CycleCharge { property: "--cycleCount".to_string(), per_iter: 17 }),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
             precondition: None,
@@ -1939,7 +1945,7 @@ mod tests {
             ],
             flag_conditioned: false,
             bulk_class: BulkClass::Copy,
-            per_iter_cycles: Some(17),
+            per_iter_cycles: Some(CycleCharge { property: "--cycleCount".to_string(), per_iter: 17 }),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
             precondition: None,
@@ -2258,7 +2264,7 @@ mod tests {
             }],
             flag_conditioned: false,
             bulk_class: BulkClass::Copy,
-            per_iter_cycles: Some(17),
+            per_iter_cycles: Some(CycleCharge { property: "--cycle_x".to_string(), per_iter: 17 }),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
             precondition: None,
@@ -2418,7 +2424,7 @@ mod tests {
             writes: vec![],
             flag_conditioned: false,
             bulk_class: BulkClass::ReadOnly,
-            per_iter_cycles: Some(15),
+            per_iter_cycles: Some(CycleCharge { property: "--cycleCount".to_string(), per_iter: 15 }),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
             precondition: None,
@@ -2464,7 +2470,7 @@ mod tests {
             writes: vec![],
             flag_conditioned: true,
             bulk_class: BulkClass::ReadOnly,
-            per_iter_cycles: Some(22),
+            per_iter_cycles: Some(CycleCharge { property: "--cycleCount".to_string(), per_iter: 22 }),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: Some(crate::pattern::loop_descriptor::ComparisonShape {
                 width: 1,
@@ -2524,7 +2530,7 @@ mod tests {
             writes: vec![],
             flag_conditioned: true,
             bulk_class: BulkClass::ReadOnly,
-            per_iter_cycles: Some(15),
+            per_iter_cycles: Some(CycleCharge { property: "--cycleCount".to_string(), per_iter: 15 }),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: Some(crate::pattern::loop_descriptor::ComparisonShape {
                 width: 1,
@@ -2919,7 +2925,7 @@ mod tests {
             writes: vec![],
             flag_conditioned: false,
             bulk_class: BulkClass::ReadOnly,
-            per_iter_cycles: Some(15),
+            per_iter_cycles: Some(CycleCharge { property: "--cycle_x".to_string(), per_iter: 15 }),
             ip_extra_advance_slot: Some("--prefixLen".to_string()),
             comparison_shape: None,
             precondition: None,
@@ -3087,6 +3093,42 @@ mod tests {
         assert_eq!(state.get_var("IP"), Some(0x1236));
         // cycleCount: 1000 + 32 * 10 (STOS per_iter) = 1320
         assert_eq!(state.get_var("cycleCount"), Some(1320));
+    }
+
+    /// Genericity probe for the commit step: a cabinet that names its
+    /// instruction-pointer slot `--pc_y` and its cycle counter
+    /// `--zorch` gets its OWN slots advanced — the applier carries no
+    /// hardcoded `IP` / `cycleCount` names. Before the descriptor
+    /// carried these names, this exact test could not pass: the commit
+    /// wrote literal `"IP"` / `"cycleCount"` and would silently no-op
+    /// here.
+    #[test]
+    fn commit_full_renamed_ip_and_cycle_slots_commit_to_cabinet_names() {
+        let mut desc = stosb_descriptor();
+        desc.ip_property = "--pc_y".to_string();
+        desc.per_iter_cycles =
+            Some(CycleCharge { property: "--zorch".to_string(), per_iter: 10 });
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&[
+            "CX", "DI", "ES", "AL", "flags", "pc_y", "zorch", "prefixLen",
+        ]);
+        state.set_var("CX", 32);
+        state.set_var("DI", 0x100);
+        state.set_var("ES", 0x2000);
+        state.set_var("AL", 0x55);
+        state.set_var("flags", 0); // DF=0
+        state.set_var("pc_y", 0x1234);
+        state.set_var("zorch", 1000);
+        state.set_var("prefixLen", 1);
+
+        let outcome = apply_fill_with_commit(&desc, &prog, &mut state, &[], CommitMode::Full);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 32 });
+        // The cabinet's own slots advance exactly as IP/cycleCount would.
+        assert_eq!(state.get_var("pc_y"), Some(0x1236));
+        assert_eq!(state.get_var("zorch"), Some(1320));
+        // And nothing materialised under the x86 names.
+        assert_eq!(state.get_var("IP"), None);
+        assert_eq!(state.get_var("cycleCount"), None);
     }
 
     /// `CommitMode::Full` on STOSW with DF=1 (reverse): pointer arithmetic

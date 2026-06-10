@@ -6021,11 +6021,11 @@ fn rep_fastfwd_enabled() -> bool { true }
 fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32]) {
     // Resolve a CSS property name to its current i32 value. Tries the
     // compiled program's `property_slots` first; falls back to state
-    // vars by bare name. Used here exclusively to (a) read --opcode as
-    // the dispatch key against `program.loop_descriptors`, and (b)
+    // vars by bare name. Used here exclusively to (a) read each
+    // descriptor's own dispatch-key slot during routing, and (b)
     // populate the panic diagnostic when an applier surfaces an
-    // unrecognised shape. The applier itself never reads slots by
-    // literal name — every name it touches comes off the descriptor.
+    // unrecognised shape. Every name passed in comes off a descriptor —
+    // no literal property name appears anywhere in this dispatcher.
     fn read_prop(
         program: &CompiledProgram,
         state: &State,
@@ -6041,31 +6041,37 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
 
     rep_diag_bail("00-entered");
 
-    // What opcode just dispatched? This is the ONLY thing the
-    // dispatcher reads by literal name; the descriptor list is keyed
-    // by opcode value (identity-compared, not table-looked-up).
-    let opcode = match read_prop(program, state, slots, "--opcode") {
-        Some(v) => v,
-        None => {
-            // Cabinet has no --opcode slot. There's nothing to look
-            // up — silent return. This is the path the 4 pre-existing
-            // unit-test cabinets (no-opcode synthetic CSS) take.
-            rep_diag_bail("no-opcode-slot");
-            return;
-        }
-    };
-
-    // Descriptor lookup is the ONLY routing decision. No
-    // `matches!(opcode, 0xAA | 0xAB | ...)` here. No `is_stos_movs` /
-    // `is_cmps_scas` derived tables. The cabinet's recogniser already
-    // enumerated every self-loop opcode it produced at load time; if
-    // an opcode isn't on that list, calcite has no fast-forward to do
+    // Which descriptor's dispatch family fired this tick? Each
+    // descriptor carries its own key property name (`key_property`,
+    // captured structurally by the recogniser) and the key value its
+    // shapes belong to. Read the cabinet's own key slot and compare.
+    // Descriptors from the same dispatch family share a key property,
+    // so cache the last read — in practice this is one slot read per
+    // tick, same as the old literal-name read, without the literal.
+    //
+    // No `matches!(opcode, 0xAA | 0xAB | ...)` here. No `is_stos_movs`
+    // / `is_cmps_scas` derived tables. The cabinet's recogniser already
+    // enumerated every self-loop key it produced at load time; if the
+    // current key value isn't on that list (or the cabinet has no
+    // recognised dispatch at all), calcite has no fast-forward to do
     // and the CSS single-iter result stands.
-    let Some(descriptor) = program
-        .loop_descriptors
-        .iter()
-        .find(|d| d.key_value == opcode as i64)
-    else {
+    let mut last_key_read: Option<(&str, Option<i64>)> = None;
+    let mut found: Option<&crate::pattern::loop_descriptor::LoopDescriptor> = None;
+    for d in &program.loop_descriptors {
+        let v = match last_key_read {
+            Some((p, v)) if p == d.key_property.as_str() => v,
+            _ => {
+                let v = read_prop(program, state, slots, &d.key_property).map(i64::from);
+                last_key_read = Some((d.key_property.as_str(), v));
+                v
+            }
+        };
+        if v == Some(d.key_value) {
+            found = Some(d);
+            break;
+        }
+    }
+    let Some(descriptor) = found else {
         rep_diag_bail("no-descriptor");
         return;
     };
@@ -6110,14 +6116,10 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
             // a frozen screen with no error. The fix is to extend the
             // recogniser/applier to handle this shape, never to make
             // the bail silent.
-            let cs = read_prop(program, state, slots, "--CS").unwrap_or(0);
-            let ip = state.get_var("IP").unwrap_or(0);
-            let rep_type = read_prop(program, state, slots, "--repType").unwrap_or(0);
-            let cx = read_prop(program, state, slots, "--CX").unwrap_or(0);
-            let flags = read_prop(program, state, slots, "--flags").unwrap_or(0);
             rep_fast_forward_panic(
                 "bulk-class-per-iter",
-                opcode, rep_type, cx, flags, cs, ip,
+                descriptor,
+                &describe_loop_state(program, state, slots, descriptor),
                 "descriptor.bulk_class is PerIter — recogniser produced a descriptor but no bulk applier handles this shape. Extend the recogniser/applier; do not silently fall back to per-iter CSS.",
             );
         }
@@ -6127,7 +6129,7 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
         ApplyOutcome::Applied { iterations } => {
             // Applier committed memory + state vars. Tally diagnostic
             // counters and return.
-            rep_diag_fire(opcode, iterations);
+            rep_diag_fire(descriptor.key_value, iterations);
         }
         ApplyOutcome::PreconditionNotMet => {
             // The cabinet's own outer guard predicate evaluated false
@@ -6143,21 +6145,61 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
             // refused. Distinct from PreconditionNotMet: this is a
             // genuine recogniser/applier gap that would otherwise
             // silently route the user into a slow per-iter CSS path.
-            // Panic with full cabinet state so the developer can
-            // diagnose. See the BulkClass::PerIter arm above for the
-            // rationale on why we don't fall back silently.
-            let cs = read_prop(program, state, slots, "--CS").unwrap_or(0);
-            let ip = state.get_var("IP").unwrap_or(0);
-            let rep_type = read_prop(program, state, slots, "--repType").unwrap_or(0);
-            let cx = read_prop(program, state, slots, "--CX").unwrap_or(0);
-            let flags = read_prop(program, state, slots, "--flags").unwrap_or(0);
+            // Panic with the loop's own slot state so the developer
+            // can diagnose. See the BulkClass::PerIter arm above for
+            // the rationale on why we don't fall back silently.
             rep_fast_forward_panic(
                 "applier-unsupported",
-                opcode, rep_type, cx, flags, cs, ip,
+                descriptor,
+                &describe_loop_state(program, state, slots, descriptor),
                 reason,
             );
         }
     }
+}
+
+/// Render the current values of every slot a loop descriptor names —
+/// key, IP, counter, pointers, predicate participants — for panic
+/// diagnostics. Every property printed comes off the descriptor (the
+/// cabinet's own names); nothing is read by literal name, so the dump
+/// is equally meaningful for an x86 cabinet (`--CX=412 --DI=80`) and
+/// any other (`--whisksLeft=3 --bowlPos=9`).
+fn describe_loop_state(
+    program: &CompiledProgram,
+    state: &State,
+    slots: &[i32],
+    descriptor: &crate::pattern::loop_descriptor::LoopDescriptor,
+) -> String {
+    fn read_prop(
+        program: &CompiledProgram,
+        state: &State,
+        slots: &[i32],
+        name: &str,
+    ) -> Option<i32> {
+        if let Some(&s) = program.property_slots.get(name) {
+            return Some(slots[s as usize]);
+        }
+        let bare = name.strip_prefix("--").unwrap_or(name);
+        state.get_var(bare)
+    }
+    let mut names: Vec<&str> = vec![descriptor.ip_property.as_str()];
+    if let Some(c) = descriptor.counter.as_ref() {
+        names.push(c.property.as_str());
+    }
+    for p in &descriptor.pointers {
+        names.push(p.property.as_str());
+    }
+    for p in &descriptor.predicate_properties {
+        names.push(p.as_str());
+    }
+    names
+        .into_iter()
+        .map(|n| match read_prop(program, state, slots, n) {
+            Some(v) => format!("{n}={v:#x}"),
+            None => format!("{n}=<unresolved>"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Compute the 8086 flag word produced by SUB(dst, src), preserving the
@@ -6202,10 +6244,14 @@ mod rep_diag {
     use std::sync::Mutex;
     use std::sync::OnceLock;
     use std::collections::HashMap;
-    #[derive(Default, Clone, Copy)]
+    /// Fire counters keyed by dispatch-key value — the cabinet's own
+    /// key space (opcode bytes for a CPU cabinet, whatever else for
+    /// any other). No per-mnemonic fields: the diagnostics carry no
+    /// ISA vocabulary.
+    #[derive(Default, Clone)]
     pub(super) struct Fires {
-        pub stosb: u64, pub stosw: u64, pub movsb: u64, pub movsw: u64,
-        pub cmpsb: u64, pub cmpsw: u64, pub scasb: u64, pub scasw: u64,
+        /// (fire count, iterations elided) per dispatch-key value.
+        pub per_key: HashMap<i64, (u64, i64)>,
         pub total_iters: i64,
     }
     pub(super) static COUNTS: OnceLock<Mutex<HashMap<&'static str, u64>>> = OnceLock::new();
@@ -6225,59 +6271,42 @@ fn rep_diag_bail(reason: &'static str) {
 #[cfg(target_arch = "wasm32")]
 fn rep_diag_bail(_reason: &'static str) {}
 
-/// Panic with the offending REP state. Called when a fast-forward bail
-/// would otherwise drop into per-byte CSS execution. There is no slow
-/// path: per-byte CSS for a long REP is so slow that conformance can't
-/// progress and DOOM never reaches its menu within a sensible budget.
-/// When this fires, the fix is to extend rep_fast_forward to handle the
+/// Panic with the offending loop's state. Called when a fast-forward
+/// bail would otherwise drop into per-iter CSS execution. There is no
+/// slow path: per-iter CSS for a long recognised loop is so slow that
+/// conformance can't progress within a sensible budget. When this
+/// fires, the fix is to extend the recogniser/applier to handle the
 /// new variant — never to make the bail silent.
+///
+/// The diagnostic prints only descriptor-carried names and values (see
+/// `describe_loop_state`) — the cabinet's own vocabulary, whatever its
+/// ISA or lack of one.
 fn rep_fast_forward_panic(
     reason: &'static str,
-    opcode: i32,
-    rep_type: i32,
-    cx: i32,
-    flags: i32,
-    cs: i32,
-    ip: i32,
+    descriptor: &crate::pattern::loop_descriptor::LoopDescriptor,
+    loop_state: &str,
     advice: &str,
 ) -> ! {
-    let opname = match opcode {
-        0xA4 => "MOVSB", 0xA5 => "MOVSW",
-        0xA6 => "CMPSB", 0xA7 => "CMPSW",
-        0xAA => "STOSB", 0xAB => "STOSW",
-        0xAE => "SCASB", 0xAF => "SCASW",
-        _ => "?",
-    };
-    let prefix = match rep_type {
-        1 => "REPE/REP",
-        2 => "REPNE",
-        _ => "no-prefix",
-    };
     panic!(
-        "rep_fast_forward: {reason} — {prefix} {opname} (op={opcode:#04x}) at CS:IP={cs:#06x}:{ip:#06x} CX={cx} flags={flags:#x}\n  {advice}\n  No slow path: extend rep_fast_forward to handle this variant.",
+        "rep_fast_forward: {reason} — dispatch {key}={val:#x} ({class:?})\n  loop state: {loop_state}\n  {advice}\n  No slow path: extend the recogniser/applier to handle this variant.",
+        key = descriptor.key_property,
+        val = descriptor.key_value,
+        class = descriptor.bulk_class,
     );
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn rep_diag_fire(opcode: i32, n: i32) {
+fn rep_diag_fire(key_value: i64, n: i32) {
     if !rep_diag::enabled() { return; }
     let m = rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new(rep_diag::Fires::default()));
     let mut m = m.lock().unwrap();
-    match opcode {
-        0xAA => m.stosb += 1,
-        0xAB => m.stosw += 1,
-        0xA4 => m.movsb += 1,
-        0xA5 => m.movsw += 1,
-        0xA6 => m.cmpsb += 1,
-        0xA7 => m.cmpsw += 1,
-        0xAE => m.scasb += 1,
-        0xAF => m.scasw += 1,
-        _ => {}
-    }
+    let e = m.per_key.entry(key_value).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += n as i64;
     m.total_iters += n as i64;
 }
 #[cfg(target_arch = "wasm32")]
-fn rep_diag_fire(_opcode: i32, _n: i32) {}
+fn rep_diag_fire(_key_value: i64, _n: i32) {}
 
 pub fn rep_diag_reset() {
     #[cfg(not(target_arch = "wasm32"))]
@@ -6294,13 +6323,16 @@ pub fn rep_diag_report() -> String {
     {
         let bails = rep_diag::COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
             .lock().unwrap().clone();
-        let fires = *rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new(rep_diag::Fires::default()))
-            .lock().unwrap();
+        let fires = rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new(rep_diag::Fires::default()))
+            .lock().unwrap().clone();
         let mut s = String::new();
-        s.push_str(&format!(
-            "rep_fast_forward fires: STOSB={} STOSW={} MOVSB={} MOVSW={} CMPSB={} CMPSW={} SCASB={} SCASW={} total_iters={}\n",
-            fires.stosb, fires.stosw, fires.movsb, fires.movsw,
-            fires.cmpsb, fires.cmpsw, fires.scasb, fires.scasw, fires.total_iters));
+        s.push_str("rep_fast_forward fires (per dispatch-key value):\n");
+        let mut keys: Vec<_> = fires.per_key.iter().collect();
+        keys.sort_by_key(|(k, _)| **k);
+        for (k, (count, iters)) in keys {
+            s.push_str(&format!("  key={k:#x}: fires={count} iters={iters}\n"));
+        }
+        s.push_str(&format!("rep_fast_forward total_iters={}\n", fires.total_iters));
         s.push_str("rep_fast_forward bails:\n");
         let mut items: Vec<_> = bails.iter().collect();
         items.sort_by(|a, b| b.1.cmp(a.1));
