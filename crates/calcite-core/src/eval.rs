@@ -114,6 +114,12 @@ pub struct Evaluator {
     /// expression evaluator isn't worth the complexity for the current
     /// shapes kiln emits).
     pub(crate) input_edge_bindings: Vec<InputEdgeBinding>,
+    /// Self-loop descriptors recognised at compile time from the
+    /// cabinet's opcode-keyed dispatch family. Phase 1 of the
+    /// rep_fast_forward genericity mission emits these but does not
+    /// yet consume them at runtime — the hardcoded fast-forward path
+    /// remains the active applier.
+    pub loop_descriptors: Vec<crate::pattern::loop_descriptor::LoopDescriptor>,
 }
 
 /// Compiled form of a `ParsedProgram::input_edges` entry. The
@@ -286,6 +292,11 @@ impl Evaluator {
             stride: cw.stride,
             byte_array_base_key: cw.byte_array_base_key,
             byte_array: cw.byte_array.clone(),
+        });
+        state.virtual_regions.push(crate::state::VirtualRegion {
+            start: cw.window_base,
+            end: cw.window_end,
+            source: "windowed_byte_array",
         });
         log::info!(
             "[windowed-byte-array] installed: window=[0x{:X},0x{:X}) stride={} key_cell={} byte_array_len={}",
@@ -545,6 +556,18 @@ impl Evaluator {
             );
         }
 
+        // Recognise opcode-keyed self-loops in the cabinet's dispatch
+        // family. Phase 1 of the rep_fast_forward genericity mission:
+        // descriptors are produced but not yet consumed at runtime.
+        let loop_descriptors =
+            crate::pattern::loop_descriptor::recognise_loops(&program.assignments);
+        log::info!(
+            "[loop-descriptor] recognised {} self-loop opcodes",
+            loop_descriptors.len(),
+        );
+        let mut compiled = compiled;
+        compiled.loop_descriptors = loop_descriptors.clone();
+
         Evaluator {
             functions,
             assignments,
@@ -560,6 +583,7 @@ impl Evaluator {
             compiled,
             slots: Vec::with_capacity(slot_count),
             input_edge_bindings,
+            loop_descriptors,
         }
     }
 
@@ -1479,7 +1503,11 @@ fn collect_style_test_deps(
 /// These assignments exist for x86CSS's animation pipeline but are no-ops
 /// in calcite's mutable-state model — they just copy the canonical value
 /// to a buffer slot that resolves back to the same value via `resolve_property`.
-fn is_buffer_copy(name: &str) -> bool {
+///
+/// `pub(crate)` so `pattern::rep_applier`'s slot resolver can mirror the
+/// compiler's routing (buffer-copy reads skip the slot table and read the
+/// committed state address) instead of inventing its own.
+pub(crate) fn is_buffer_copy(name: &str) -> bool {
     name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2")
 }
 
@@ -1498,7 +1526,13 @@ fn is_buffer_copy(name: &str) -> bool {
 /// both resolve to the same canonical name. This keeps the function safe when
 /// called from code paths that build names programmatically (e.g. the packed
 /// cell table builder formats `"mc{}"` without the leading `--`).
-fn to_bare_name(name: &str) -> &str {
+///
+/// `pub(crate)` so `pattern::rep_applier` / `pattern::loop_descriptor` can
+/// resolve descriptor-carried mirror names (`--__1DI` etc.) to their
+/// committed state vars. Unlike `property_to_address` this is a pure
+/// function — no thread-local — so it works on the debugger's tokio
+/// worker threads, where the ADDRESS_MAP thread-local is empty.
+pub(crate) fn to_bare_name(name: &str) -> &str {
     let after_dashes = name.strip_prefix("--").unwrap_or(name);
     if let Some(rest) = after_dashes.strip_prefix("__0") {
         rest
@@ -2232,6 +2266,7 @@ mod tests {
             compiled,
             slots: Vec::new(),
             input_edge_bindings: Vec::new(),
+            loop_descriptors: Vec::new(),
         };
         (evaluator, state)
     }

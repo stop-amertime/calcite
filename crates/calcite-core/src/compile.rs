@@ -538,6 +538,12 @@ pub struct CompiledProgram {
     /// inside the window collapse to one state-var read + one array index,
     /// instead of walking the inline-exception CmpEq chain on every byte.
     pub windowed_byte_array: Option<CompiledWindowedByteArray>,
+    /// Mirror of `Evaluator::loop_descriptors`. Populated at compile time
+    /// by the same recogniser; carried on the program so the per-tick
+    /// path can consult it without re-recognising. Phase 1 of the
+    /// rep_fast_forward genericity mission: populated but not yet
+    /// consumed at runtime.
+    pub loop_descriptors: Vec<crate::pattern::loop_descriptor::LoopDescriptor>,
 }
 
 /// Compile-time half of the windowed-byte-array fast path. The compiler can't
@@ -3322,6 +3328,7 @@ pub fn compile(
         packed_exception_tables: compiler.packed_exception_tables,
         packed_broadcast_writes: compiled_packed_bw,
         windowed_byte_array: compiler.recognised_windowed_byte_array.take(),
+        loop_descriptors: Vec::new(),
     };
 
     // Expand all Op::Call sites inline. Op::Call was a compile-time device to
@@ -5985,36 +5992,46 @@ fn rep_fastfwd_enabled() -> bool {
 #[cfg(target_arch = "wasm32")]
 fn rep_fastfwd_enabled() -> bool { true }
 
-/// Post-tick recognizer for REP string ops. Runs after the CSS has applied
-/// exactly one iteration. If the opcode is a simple REP string op (0xAA STOSB,
-/// 0xAB STOSW, 0xA4 MOVSB, 0xA5 MOVSW), the direction flag is forward, there
-/// is no segment override, and CX is still > 0, apply the remaining iterations
-/// in bulk and zero CX. This is functionally equivalent to running the CSS for
-/// CX more ticks.
+/// Post-tick descriptor-driven applier for self-loop opcodes ("REP"
+/// in x86 terms; structurally: any opcode whose CSS dispatch loops on
+/// its own slot with the cabinet's outer guard predicate still true).
+/// Runs after the CSS has applied exactly one iteration.
 ///
-/// Reads from `slots` because most of the CSS signals we inspect
-/// (--opcode, --hasREP, --repType, --hasSegOverride) are derived intermediate
-/// properties, not `@property` state vars. Only CX/DI/SI/IP/ES/DS/AL/AX/flags
-/// are @property-backed state vars; we read those from State.
+/// Routing is purely descriptor-driven. There is **no** opcode-byte
+/// table, no `matches!(opcode, 0xAA | ...)` test — the cabinet's
+/// recogniser produced a `Vec<LoopDescriptor>` at load time, keyed by
+/// dispatch-key value, and this function looks up the descriptor for
+/// the current opcode and dispatches on its `BulkClass`.
 ///
-/// Guards (any of these failing → fall through, let the CSS handle it):
-/// - Opcode not in {0xAA, 0xAB, 0xA4, 0xA5}.
-/// - `--hasREP` != 1 (no REP prefix → just a single iteration).
-/// - `--repType` != 1 (REPNE on STOS/MOVS is a misuse; be conservative).
-/// - CX already 0 (nothing to fast-forward).
-/// - DF=1 (flags bit 10 set → reverse direction; skip for simplicity).
-/// - `--hasSegOverride` == 1 (rare; skip).
-/// - DI or SI would wrap past 65535 over the range (rare; skip).
+/// Three outcomes:
+/// - `Applied { iterations }` — applier mutated state, done.
+/// - `PreconditionNotMet` — the cabinet's own outer guard predicate
+///   evaluated false; CSS already produced the correct post-state and
+///   calcite has nothing to do. Silent bail.
+/// - `Unsupported(reason)` — recogniser produced a descriptor but the
+///   applier refused. **Panic loudly**, because the per-iter CSS
+///   fallback is 10-1000x slower per iteration and a long loop would
+///   strand the user on a frozen screen with no error.
 ///
-/// When fast-forwarding we update: memory, DI (and SI for MOVS), CX, IP, and
-/// cycleCount. Other state vars (AL/AX/flags/ES/DS) don't change during these
-/// opcodes so they stay as-is.
+/// `BulkClass::PerIter` (the recogniser's "I can't bulk this") also
+/// panics — same reason. The fix is to extend the recogniser or
+/// applier, never to make the bail silent.
+///
+/// No env-var toggle. This is the only path.
 fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32]) {
-    // Resolve a CSS property to its current value. Tries the compiled
-    // program's property_slots first, falls back to state vars by bare name.
-    // Implemented as a function rather than a closure so the `state` borrow
-    // is released after each call.
-    fn read_prop(program: &CompiledProgram, state: &State, slots: &[i32], name: &str) -> Option<i32> {
+    // Resolve a CSS property name to its current i32 value. Tries the
+    // compiled program's `property_slots` first; falls back to state
+    // vars by bare name. Used here exclusively to (a) read each
+    // descriptor's own dispatch-key slot during routing, and (b)
+    // populate the panic diagnostic when an applier surfaces an
+    // unrecognised shape. Every name passed in comes off a descriptor —
+    // no literal property name appears anywhere in this dispatcher.
+    fn read_prop(
+        program: &CompiledProgram,
+        state: &State,
+        slots: &[i32],
+        name: &str,
+    ) -> Option<i32> {
         if let Some(&s) = program.property_slots.get(name) {
             return Some(slots[s as usize]);
         }
@@ -6022,489 +6039,173 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
         state.get_var(bare)
     }
 
-    // Snapshot every field the hook needs up-front so we can release the
-    // state borrow before any mutations.
-    //
-    // CONTRACT: there is no slow path. Every REP variant the cabinet emits
-    // must fast-forward here. Conditions that mean "no work to do" return
-    // silently. Conditions that would have to fall back to per-byte CSS
-    // evaluation panic loudly with the offending state — the per-byte path
-    // is so slow (10-1000x slower per iteration than the bulk path) that
-    // long REPs make conformance testing untenable and DOOM never reaches
-    // its menu within a reasonable tick budget. When a panic fires, the
-    // fix is to extend rep_fast_forward to handle that variant, not to
-    // make the bail silent.
     rep_diag_bail("00-entered");
-    let opcode = match read_prop(program, state, slots, "--opcode") {
-        Some(v) => v,
-        None => panic!(
-            "rep_fast_forward: no-opcode — cabinet has no --opcode slot. \
-             rep_fast_forward should not be invoked for cabinets that don't \
-             expose --opcode; either add the slot or guard the caller. No \
-             slow path."
-        ),
-    };
-    // Two opcode groups handled below:
-    //   STOS/MOVS (0xAA/AB/A4/A5): write-side, repType must be 1.
-    //   CMPS/SCAS (0xA6/A7/AE/AF): read-only with early exit on flag
-    //     condition; repType 1 (REPE) or 2 (REPNE) are both meaningful.
-    let is_stos_movs = matches!(opcode, 0xAA | 0xAB | 0xA4 | 0xA5);
-    let is_cmps_scas = matches!(opcode, 0xA6 | 0xA7 | 0xAE | 0xAF);
-    if !is_stos_movs && !is_cmps_scas {
-        // Current instruction is not a string op at all. Most ticks land here.
-        rep_diag_bail("opcode-not-string");
-        return;
-    }
-    rep_diag_bail("01-opcode-is-string");
-    let has_rep = read_prop(program, state, slots, "--hasREP").unwrap_or(0);
-    let rep_type = read_prop(program, state, slots, "--repType").unwrap_or(0);
-    let cx_raw = read_prop(program, state, slots, "--CX");
-    let flags_raw = read_prop(program, state, slots, "--flags").unwrap_or(0);
-    let seg_override = read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0);
-    #[cfg(not(target_arch = "wasm32"))]
-    if is_cmps_scas && rep_diag::trace_cmps_scas() {
-        eprintln!(
-            "[rep_entry] op={:#04x} hasREP={} repType={} CX={:?} flags={:#x} segOv={}",
-            opcode, has_rep, rep_type, cx_raw, flags_raw, seg_override,
-        );
-    }
-    if has_rep != 1 {
-        // String op without REP prefix: MOVSB/STOSB run as a single 1-iter
-        // op in the CSS, which is already 1 CSS tick. No fast-forward needed.
-        rep_diag_bail("no-hasREP");
-        return;
-    }
-    let cs_for_diag = read_prop(program, state, slots, "--CS").unwrap_or(0);
-    let ip_for_diag = state.get_var("IP").unwrap_or(0);
-    if is_stos_movs && rep_type != 1 {
-        // REPNE prefix on a STOS/MOVS. 8086 honors it (CX decrement loop with
-        // no early exit). Falling through to CSS would per-iter; that's slow.
-        rep_fast_forward_panic(
-            "repType-ne-1",
-            opcode, rep_type, cx_raw.unwrap_or(0), flags_raw, cs_for_diag, ip_for_diag,
-            "STOS/MOVS with REPNE prefix — extend rep_fast_forward to handle repType=2 for write-side string ops",
-        );
-    }
-    if is_cmps_scas && rep_type != 1 && rep_type != 2 {
-        // CMPS/SCAS with no REP prefix at all. CSS runs one iter and
-        // single-instruction execution is already 1 tick — no fast-forward
-        // needed. (This shouldn't happen because hasREP would be 0, caught
-        // above.) Silent.
-        rep_diag_bail("repType-bad");
-        return;
-    }
-    let cx = match cx_raw {
-        Some(v) => v,
-        None => {
-            rep_fast_forward_panic(
-                "no-CX",
-                opcode, rep_type, 0, flags_raw, cs_for_diag, ip_for_diag,
-                "--CX slot missing — every cabinet should expose CX",
-            );
-        }
-    };
-    if cx <= 0 {
-        // CX=0 entering REP: the body doesn't execute. CSS handles this in
-        // 1 tick. No work for the fast-forward.
-        rep_diag_bail("cx-le-0");
-        return;
-    }
-    let flags = flags_raw;
-    let df = ((flags >> 10) & 1) != 0;
-    if seg_override != 0 {
-        // Segment override prefix (e.g. ES: or CS:) on a REP changes the
-        // segment used for the source/dest. fast-forward currently assumes
-        // default segments (DS for source of MOVS/CMPS, ES for dest).
-        rep_fast_forward_panic(
-            "seg-override",
-            opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
-            "REP with segment override — extend rep_fast_forward to honor --segOverrideValue",
-        );
-    }
 
-    // rep_fast_forward runs at end-of-tick, AFTER the CSS writeback that
-    // applies --IP/--CS/--SP/etc. to state-vars. If a hardware IRQ (or TF
-    // trap) was delivered THIS tick, those registers already hold the IVT
-    // vector (CS:IP = handler) and the saved IRET frame is on the stack.
-    // The string-op opcode (--opcode = 0xA4..0xA7) is still in slots[]
-    // because decode ran against the OLD CS:IP — but proceeding would smash
-    // the post-IRQ IP with `0 + 1 + prefix_len = 2`, skipping the first two
-    // bytes of the handler.
+    // Which descriptor's dispatch family fired this tick? Each
+    // descriptor carries its own key property name (`key_property`,
+    // captured structurally by the recogniser) and the key value its
+    // shapes belong to. Read the cabinet's own key slot and compare.
+    // Descriptors from the same dispatch family share a key property,
+    // so cache the last read — in practice this is one slot read per
+    // tick, same as the old literal-name read, without the literal.
     //
-    // Symptom (Doom8088, 2026-04-26): PIT fires during a libc memcpy REP
-    // MOVSW. CSS computes IRQ override (--IP = IVT[8].IP = 0, --CS = 0x2BC2),
-    // writeback updates state-vars. rep_fast_forward then reads IP=0 and
-    // writes IP=2, skipping `PUSH CX; PUSH AX`. Handler still pops them on
-    // exit → IRET reads a bogus frame from above its own stack window → CPU
-    // lands in a PSP/data area → halts on OUTSB (0x6E).
-    let irq_active = read_prop(program, state, slots, "--_irqActive").unwrap_or(0);
-    let tf_active  = read_prop(program, state, slots, "--_tf").unwrap_or(0);
-    if irq_active != 0 || tf_active != 0 {
-        // CSS already vectored this tick (registers point at IRQ/TF
-        // handler). Touching them would smash the post-IRQ state. Correct
-        // behavior is to leave the post-vector regs alone — CSS finished
-        // the iteration before vectoring. No fast-forward needed.
-        rep_diag_bail("irq-or-tf-this-tick");
-        return;
-    }
-
-    // Handle CMPS / SCAS (read-only string ops with early exit on flag
-    // condition) in a separate path. These don't write memory; they walk
-    // through ES:DI (and DS:SI for CMPS) byte/word at a time, comparing
-    // and updating flags, stopping when CX hits 0 or when the REPE/REPNE
-    // condition flips.
-    //
-    // The CSS already executed one iteration BEFORE this hook fires.
-    // Crucially, that iteration may have already terminated the REP via
-    // its ZF condition — in which case post-tick IP has advanced past
-    // the prefix and we must NOT do another iteration. Detect this from
-    // post-tick flags: REPE exits when ZF=0 (after a non-equal compare),
-    // REPNE exits when ZF=1 (after an equal compare). `cx` here is
-    // post-tick (CSS decremented CX by 1 unconditionally); a fresh check
-    // against 0 happens after we factor in that early-exit.
-    if is_cmps_scas {
-        let zf_post = (flags >> 6) & 1;
-        let rep_already_exited =
-            (rep_type == 1 && zf_post == 0) ||  // REPE: stop on inequality
-            (rep_type == 2 && zf_post == 1);    // REPNE: stop on equality
-        if rep_already_exited {
-            // CSS finished the REP this tick (the single iter that ran in
-            // CSS satisfied the exit condition). Post-tick IP, CX, SI, DI,
-            // flags are already correct. No fast-forward needed.
-            rep_diag_bail("cmps-scas-already-exited");
-            return;
-        }
-        rep_fast_forward_cmps_scas(program, state, slots, opcode, rep_type, cx, flags);
-        return;
-    }
-
-    // Per-iteration step in bytes. Negated when DF=1.
-    let step_bytes: i32 = if opcode == 0xAB || opcode == 0xA5 { 2 } else { 1 };
-    let signed_step: i32 = if df { -step_bytes } else { step_bytes };
-    let n = cx;
-    let di = read_prop(program, state, slots, "--DI").unwrap_or(0);
-    // 16-bit segment-bound check. Writes/reads at offset DI per iter +
-    // {0..step_bytes-1} for word ops. DF=0: lowest=DI, highest=DI+n*step-1.
-    // DF=1: lowest=DI-(n-1)*step, highest=DI+step-1. Either way the range
-    // must be entirely in [0, 0x10000).
-    let (di_lo, di_hi) = if df {
-        (di as i64 - (n as i64 - 1) * step_bytes as i64, di as i64 + step_bytes as i64)
-    } else {
-        (di as i64, di as i64 + n as i64 * step_bytes as i64)
-    };
-    if di_lo < 0 || di_hi > 0x10000 {
-        rep_fast_forward_panic(
-            "DI-wrap",
-            opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
-            "REP MOVS/STOS would wrap DI past 0xFFFF — split into pre-wrap and post-wrap bulk ops",
-        );
-    }
-    let si_opt = if opcode == 0xA4 || opcode == 0xA5 {
-        let si = read_prop(program, state, slots, "--SI").unwrap_or(0);
-        let (si_lo, si_hi) = if df {
-            (si as i64 - (n as i64 - 1) * step_bytes as i64, si as i64 + step_bytes as i64)
-        } else {
-            (si as i64, si as i64 + n as i64 * step_bytes as i64)
+    // No `matches!(opcode, 0xAA | 0xAB | ...)` here. No `is_stos_movs`
+    // / `is_cmps_scas` derived tables. The cabinet's recogniser already
+    // enumerated every self-loop key it produced at load time; if the
+    // current key value isn't on that list (or the cabinet has no
+    // recognised dispatch at all), calcite has no fast-forward to do
+    // and the CSS single-iter result stands.
+    let mut last_key_read: Option<(&str, Option<i64>)> = None;
+    let mut found: Option<&crate::pattern::loop_descriptor::LoopDescriptor> = None;
+    for d in &program.loop_descriptors {
+        let v = match last_key_read {
+            Some((p, v)) if p == d.key_property.as_str() => v,
+            _ => {
+                let v = read_prop(program, state, slots, &d.key_property).map(i64::from);
+                last_key_read = Some((d.key_property.as_str(), v));
+                v
+            }
         };
-        if si_lo < 0 || si_hi > 0x10000 {
+        if v == Some(d.key_value) {
+            found = Some(d);
+            break;
+        }
+    }
+    let Some(descriptor) = found else {
+        rep_diag_bail("no-descriptor");
+        return;
+    };
+
+    // Loop-continuation gate: did the CSS take the stay branch of the
+    // IP body this tick? If not, there is no loop in flight — either
+    // the op ran single-shot (no rep-style prefix active) or this tick
+    // WAS the final iteration and the CSS already advanced IP past the
+    // loop. Both mean the post-tick state is already correct and
+    // collapsing "remaining" iterations would corrupt it (the
+    // single-shot case would bulk-apply a stale counter). This is the
+    // descriptor-driven equivalent of the deleted hardcoded path's
+    // "hasREP != 1" and "REPE/REPNE already exited via post-tick ZF"
+    // entry guards, folded into the cabinet's own predicate.
+    if !crate::pattern::loop_descriptor::evaluate_loop_predicate(descriptor, program, state, slots)
+    {
+        rep_diag_bail("loop-not-continuing");
+        return;
+    }
+
+    use crate::pattern::loop_descriptor::BulkClass;
+    use crate::pattern::rep_applier::{
+        apply_copy_with_commit, apply_fill_with_commit, apply_read_only_with_commit,
+        ApplyOutcome, CommitMode,
+    };
+
+    let outcome = match descriptor.bulk_class {
+        BulkClass::Fill => apply_fill_with_commit(
+            descriptor, program, state, slots, CommitMode::Full,
+        ),
+        BulkClass::Copy => apply_copy_with_commit(
+            descriptor, program, state, slots, CommitMode::Full,
+        ),
+        BulkClass::ReadOnly => apply_read_only_with_commit(
+            descriptor, program, state, slots, CommitMode::Full,
+        ),
+        BulkClass::PerIter => {
+            // Recogniser produced a descriptor but classified it as
+            // PerIter — no bulk applier handles this shape. Panic
+            // loudly. Per-iter CSS fallback runs at 10-1000x slowdown
+            // per iteration, which on a long REP strands the user on
+            // a frozen screen with no error. The fix is to extend the
+            // recogniser/applier to handle this shape, never to make
+            // the bail silent.
             rep_fast_forward_panic(
-                "SI-wrap",
-                opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
-                "REP MOVS would wrap SI past 0xFFFF — split into pre-wrap and post-wrap bulk ops",
+                "bulk-class-per-iter",
+                descriptor,
+                &describe_loop_state(program, state, slots, descriptor),
+                "descriptor.bulk_class is PerIter — recogniser produced a descriptor but no bulk applier handles this shape. Extend the recogniser/applier; do not silently fall back to per-iter CSS.",
             );
         }
-        Some(si)
-    } else {
-        None
     };
 
-    let es = read_prop(program, state, slots, "--ES").unwrap_or(0);
-    let es_base = (es as i64) * 16;
-    // Linear range covered by all destination writes.
-    let dst_lo_linear = es_base + di_lo;
-    let dst_hi_linear = es_base + di_hi;
-    let n_bytes = (n as i64) * (step_bytes as i64);
-
-    // Panic out if the destination range touches a region that isn't plain
-    // state.memory. Writes to those regions in the CSS go through dispatch
-    // functions (not `--mN` state vars), so a bulk `state.memory` write
-    // wouldn't match what the CSS would compute.
-    //
-    //   [0xD0000, 0xD0200)  — ROM-disk window (read-only via --readDiskByte)
-    //   [0xF0000, 0x100000) — BIOS ROM (extended map, not state.memory)
-    if ranges_overlap_virtual(dst_lo_linear, dst_hi_linear - dst_lo_linear) {
-        rep_fast_forward_panic(
-            "dst-virtual-range",
-            opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
-            "REP dest overlaps a virtual region (BIOS ROM or disk window) — extend bulk path to route through write_mem for those ranges",
-        );
-    }
-
-    let al_or_ax = match opcode {
-        0xAA => read_prop(program, state, slots, "--AL").unwrap_or(0),
-        0xAB => read_prop(program, state, slots, "--AX").unwrap_or(0),
-        _ => 0,
-    };
-    let ds = if opcode == 0xA4 || opcode == 0xA5 {
-        read_prop(program, state, slots, "--DS").unwrap_or(0)
-    } else {
-        0
-    };
-
-    // For MOVS, source bytes flow through `state.read_mem` per byte. If
-    // a cabinet has a rom-disk dispatch in CSS but the recogniser failed
-    // to extract a descriptor, `read_mem` for the disk window would
-    // silently return 0 — panic so the caller knows to fix the recogniser.
-    if (opcode == 0xA4 || opcode == 0xA5) && state.windowed_byte_array.is_none() {
-        let src_lo_linear = (ds as i64) * 16 + si_opt.unwrap() as i64
-            - if df { (n as i64 - 1) * step_bytes as i64 } else { 0 };
-        if src_lo_linear < 0xD_0200 && (src_lo_linear + n_bytes) > 0xD_0000 {
+    match outcome {
+        ApplyOutcome::Applied { iterations } => {
+            // Applier committed memory + state vars. Tally diagnostic
+            // counters and return.
+            rep_diag_fire(descriptor.key_value, iterations);
+        }
+        ApplyOutcome::PreconditionNotMet => {
+            // The cabinet's own outer guard predicate evaluated false
+            // (e.g., IRQ vectored this tick, segment override prefix
+            // in effect, CMPS/SCAS already exited via ZF). The CSS
+            // already produced the correct single-iter post-state and
+            // calcite has nothing to do. Silent bail — this is NOT a
+            // recogniser gap, it's the cabinet telling us so.
+            rep_diag_bail("precondition-not-met");
+        }
+        ApplyOutcome::Unsupported(reason) => {
+            // Recogniser produced a descriptor but the applier
+            // refused. Distinct from PreconditionNotMet: this is a
+            // genuine recogniser/applier gap that would otherwise
+            // silently route the user into a slow per-iter CSS path.
+            // Panic with the loop's own slot state so the developer
+            // can diagnose. See the BulkClass::PerIter arm above for
+            // the rationale on why we don't fall back silently.
             rep_fast_forward_panic(
-                "src-rom-disk-no-descriptor",
-                opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
-                "REP MOVS source overlaps windowed-byte-array window but cabinet has no windowed_byte_array descriptor — recogniser failed",
+                "applier-unsupported",
+                descriptor,
+                &describe_loop_state(program, state, slots, descriptor),
+                reason,
             );
         }
     }
-    let _ = (ds, n_bytes); // suppress unused-warning
-    let ip = state.get_var("IP").unwrap_or(0);
-    let prefix_len = read_prop(program, state, slots, "--prefixLen").unwrap_or(1);
-
-    // Now mutate memory and state vars. State reads are done.
-    //
-    // For STOS{B,W} the same byte(s) are written to every iteration's
-    // address slot, so direction is irrelevant — fill the whole address
-    // range. For MOVS, walk per-byte in the hardware iteration order to
-    // preserve overlap semantics (LZ77 forward, backward stream copies).
-    match opcode {
-        0xAA => {
-            // STOSB: fill n bytes with AL across [di_lo, di_hi).
-            let al = (al_or_ax & 0xFF) as u8;
-            bulk_fill(state, dst_lo_linear, (di_hi - di_lo) as usize, al);
-        }
-        0xAB => {
-            // STOSW: write (lo,hi) at each of the n word slots. Direction
-            // doesn't change which addresses get which byte — slot k writes
-            // lo at DI±k*2 and hi at DI±k*2+1. Just enumerate the slots.
-            let lo = (al_or_ax & 0xFF) as u8;
-            let hi = ((al_or_ax >> 8) & 0xFF) as u8;
-            for k in 0..(n as i64) {
-                let off = if df { -k * 2 } else { k * 2 };
-                let base = es_base + di as i64 + off;
-                bulk_store_byte(state, base, lo);
-                bulk_store_byte(state, base + 1, hi);
-            }
-        }
-        0xA4 => {
-            // MOVSB: per-byte read+write in iteration order. read_mem
-            // handles BIOS-ROM via state.extended and packed cells.
-            let si = si_opt.unwrap();
-            let src_seg = (ds as i64) * 16;
-            for k in 0..(n as i64) {
-                let off = if df { -k } else { k };
-                let s = src_seg + si as i64 + off;
-                let d = es_base + di as i64 + off;
-                let b = (state.read_mem(s as i32) & 0xFF) as u8;
-                bulk_store_byte(state, d, b);
-            }
-        }
-        0xA5 => {
-            // MOVSW: per-iter, copy (lo, hi) from [src..src+1] to [dst..dst+1].
-            // Order within the word is fixed (low byte first); only the
-            // iteration step direction varies.
-            let si = si_opt.unwrap();
-            let src_seg = (ds as i64) * 16;
-            for k in 0..(n as i64) {
-                let off = if df { -k * 2 } else { k * 2 };
-                let s = src_seg + si as i64 + off;
-                let d = es_base + di as i64 + off;
-                let lo = (state.read_mem(s as i32) & 0xFF) as u8;
-                let hi = (state.read_mem((s + 1) as i32) & 0xFF) as u8;
-                bulk_store_byte(state, d, lo);
-                bulk_store_byte(state, d + 1, hi);
-            }
-        }
-        _ => unreachable!(),
-    }
-
-    // 16-bit wrap on DI/SI commit.
-    state.set_var("DI", (di + n * signed_step) & 0xFFFF);
-    if let Some(si) = si_opt {
-        state.set_var("SI", (si + n * signed_step) & 0xFFFF);
-    }
-    state.set_var("CX", 0);
-    // IP bookkeeping. The kiln emits repIP() as
-    //     calc(if(_repContinue=1: IP - prefixLen; else: IP + instrLen) + prefixLen)
-    // so on a continuing iteration the post-tick IP stays at the REP prefix
-    // byte. Our fast-forward replaces the remaining iterations with the
-    // final one, which would have taken the `else` branch: post-tick IP =
-    // IP_at_prefix + instrLen + prefixLen. instrLen is 1 for all four
-    // opcodes we handle.
-    state.set_var("IP", (ip + 1 + prefix_len) & 0xFFFF);
-    // Charge cycles. CSS adds 10 per STOS and 17 per MOVS iteration.
-    let per_iter = if opcode == 0xAA || opcode == 0xAB { 10 } else { 17 };
-    if let Some(cc) = state.get_var("cycleCount") {
-        state.set_var("cycleCount", cc.wrapping_add(n.wrapping_mul(per_iter)));
-    }
-    rep_diag_fire(opcode, n);
 }
 
-/// Fast-forward REPE/REPNE CMPS{B,W} and SCAS{B,W}.
-///
-/// Each iteration:
-///   - if CX == 0: exit (already filtered upstream by cx<=0 bail)
-///   - read source (AL/AX for SCAS, [DS:SI] for CMPS) and dest [ES:DI]
-///   - update flags as if a SUB (dst - src) had been executed
-///   - decrement CX, advance DI (and SI for CMPS) by step (DF=0 forward)
-///   - if REPE (rep_type=1) and ZF=0: exit
-///   - if REPNE (rep_type=2) and ZF=1: exit
-///
-/// Walks linearly via state.read_mem (handles BIOS ROM, packed cells,
-/// disk window, etc. transparently). Word ops read low byte then high
-/// byte and combine, matching the kiln-emitted `--read2` semantics.
-fn rep_fast_forward_cmps_scas(
+/// Render the current values of every slot a loop descriptor names —
+/// key, IP, counter, pointers, predicate participants — for panic
+/// diagnostics. Every property printed comes off the descriptor (the
+/// cabinet's own names); nothing is read by literal name, so the dump
+/// is equally meaningful for an x86 cabinet (`--CX=412 --DI=80`) and
+/// any other (`--whisksLeft=3 --bowlPos=9`).
+fn describe_loop_state(
     program: &CompiledProgram,
-    state: &mut State,
+    state: &State,
     slots: &[i32],
-    opcode: i32,
-    rep_type: i32,
-    cx_in: i32,
-    flags_in: i32,
-) {
-    fn read_prop(program: &CompiledProgram, state: &State, slots: &[i32], name: &str) -> Option<i32> {
+    descriptor: &crate::pattern::loop_descriptor::LoopDescriptor,
+) -> String {
+    fn read_prop(
+        program: &CompiledProgram,
+        state: &State,
+        slots: &[i32],
+        name: &str,
+    ) -> Option<i32> {
         if let Some(&s) = program.property_slots.get(name) {
             return Some(slots[s as usize]);
         }
         let bare = name.strip_prefix("--").unwrap_or(name);
         state.get_var(bare)
     }
-
-    let is_word = matches!(opcode, 0xA7 | 0xAF);
-    let is_cmps = matches!(opcode, 0xA6 | 0xA7);
-    let step: i32 = if is_word { 2 } else { 1 };
-
-    let di_start = read_prop(program, state, slots, "--DI").unwrap_or(0) & 0xFFFF;
-    let es = read_prop(program, state, slots, "--ES").unwrap_or(0) & 0xFFFF;
-    let es_base = (es as i64) * 16;
-
-    // SCAS pulls its source from AL/AX; CMPS pulls from [DS:SI].
-    let (si_start, ds_base) = if is_cmps {
-        let si = read_prop(program, state, slots, "--SI").unwrap_or(0) & 0xFFFF;
-        let ds = read_prop(program, state, slots, "--DS").unwrap_or(0) & 0xFFFF;
-        (si, (ds as i64) * 16)
-    } else {
-        (0, 0)
-    };
-    let scas_acc = if !is_cmps {
-        if is_word {
-            read_prop(program, state, slots, "--AX").unwrap_or(0) & 0xFFFF
-        } else {
-            read_prop(program, state, slots, "--AL").unwrap_or(0) & 0xFF
-        }
-    } else {
-        0
-    };
-
-    let ip = state.get_var("IP").unwrap_or(0);
-    let prefix_len = read_prop(program, state, slots, "--prefixLen").unwrap_or(1);
-
-    // Walk forward. Track post-iteration state at the moment we exit.
-    let mut cx = cx_in;
-    let mut di = di_start;
-    let mut si = si_start;
-    let mut last_dst: i32 = 0;
-    let mut last_src: i32 = 0;
-    let mut iters = 0i32;
-    let mut exit_reason: &'static str = "cx-exhausted";
-    // 16-bit wrap on DI/SI is the actual hardware behavior. Iterate at
-    // most cx_in times.
-    while cx > 0 {
-        // Read dst at ES:DI.
-        let dst_lin = (es_base + di as i64) & 0xFFFFF;
-        let dst_v = if is_word {
-            let lo = state.read_mem(dst_lin as i32) & 0xFF;
-            let hi = state.read_mem(((dst_lin + 1) & 0xFFFFF) as i32) & 0xFF;
-            lo | (hi << 8)
-        } else {
-            state.read_mem(dst_lin as i32) & 0xFF
-        };
-        // Read src.
-        let src_v = if is_cmps {
-            let src_lin = (ds_base + si as i64) & 0xFFFFF;
-            if is_word {
-                let lo = state.read_mem(src_lin as i32) & 0xFF;
-                let hi = state.read_mem(((src_lin + 1) & 0xFFFFF) as i32) & 0xFF;
-                lo | (hi << 8)
-            } else {
-                state.read_mem(src_lin as i32) & 0xFF
-            }
-        } else {
-            scas_acc
-        };
-
-        // For CMPS the SUB is (mem[DS:SI] - mem[ES:DI]) per Intel manual
-        // (subFlags8(_strSrcByte, _strDstByte) in kiln); for SCAS it's
-        // (AL - mem[ES:DI]).
-        let (cmp_dst, cmp_src) = if is_cmps {
-            (src_v, dst_v) // CMPS: subFlags(src, dst) -> ZF if src==dst
-        } else {
-            (scas_acc, dst_v) // SCAS: subFlags(AL, dst) -> ZF if AL==dst
-        };
-
-        last_dst = dst_v;
-        last_src = src_v;
-        let _ = (cmp_dst, cmp_src);
-
-        // Advance pointers and CX.
-        di = (di + step) & 0xFFFF;
-        if is_cmps {
-            si = (si + step) & 0xFFFF;
-        }
-        cx -= 1;
-        iters += 1;
-
-        // Check REP termination based on the comparison just made.
-        // ZF set iff equal.
-        let zf = if is_cmps { src_v == dst_v } else { scas_acc == dst_v };
-        if rep_type == 1 && !zf { exit_reason = "repe-not-equal"; break; }   // REPE: stop on inequality
-        if rep_type == 2 && zf { exit_reason = "repne-equal"; break; }       // REPNE: stop on equality
+    let mut names: Vec<&str> = vec![descriptor.ip_property.as_str()];
+    if let Some(c) = descriptor.counter.as_ref() {
+        names.push(c.property.as_str());
     }
-
-    // Compute flags from the LAST comparison: subFlags(last_cmp_dst, last_cmp_src)
-    // For CMPS: dst_arg = last_src (mem[DS:SI]),  src_arg = last_dst (mem[ES:DI]).
-    // For SCAS: dst_arg = scas_acc (AL/AX),       src_arg = last_dst (mem[ES:DI]).
-    let (fl_dst, fl_src) = if is_cmps {
-        (last_src, last_dst)
-    } else {
-        (scas_acc, last_dst)
-    };
-    let new_flags = compute_sub_flags(fl_dst, fl_src, is_word, flags_in);
-
-    // Commit: CX, DI, (SI), flags, IP, cycleCount.
-    state.set_var("CX", cx & 0xFFFF);
-    state.set_var("DI", di);
-    if is_cmps {
-        state.set_var("SI", si);
+    for p in &descriptor.pointers {
+        names.push(p.property.as_str());
     }
-    state.set_var("flags", new_flags);
-
-    // IP: when CX reached 0 OR rep condition broke, the REP completes.
-    // post-tick IP = IP_at_prefix + instrLen(=1) + prefixLen(=1).
-    state.set_var("IP", (ip + 1 + prefix_len) & 0xFFFF);
-
-    // Cycle count: kiln charges 22/iter for CMPS, 15/iter for SCAS.
-    let per_iter = if is_cmps { 22 } else { 15 };
-    if let Some(cc) = state.get_var("cycleCount") {
-        state.set_var("cycleCount", cc.wrapping_add(iters.wrapping_mul(per_iter)));
+    for p in &descriptor.predicate_properties {
+        names.push(p.as_str());
     }
-    rep_diag_fire(opcode, iters);
-    rep_trace_cmps_scas(opcode, rep_type, cx_in, iters, di_start, di, exit_reason);
+    names
+        .into_iter()
+        .map(|n| match read_prop(program, state, slots, n) {
+            Some(v) => format!("{n}={v:#x}"),
+            None => format!("{n}=<unresolved>"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Compute the 8086 flag word produced by SUB(dst, src), preserving the
 /// upper control bits (TF=0x100, IF=0x200, DF=0x400) from `prev_flags`.
 /// Mirrors kiln's `--subFlags8` / `--subFlags16` + `+ and(prev, 1792)`.
-fn compute_sub_flags(dst: i32, src: i32, is_word: bool, prev_flags: i32) -> i32 {
+pub(crate) fn compute_sub_flags(dst: i32, src: i32, is_word: bool, prev_flags: i32) -> i32 {
     let mask: i32 = if is_word { 0xFFFF } else { 0xFF };
     let sign_bit: i32 = if is_word { 0x8000 } else { 0x80 };
     let dst_u = dst & mask;
@@ -6543,21 +6244,21 @@ mod rep_diag {
     use std::sync::Mutex;
     use std::sync::OnceLock;
     use std::collections::HashMap;
-    #[derive(Default, Clone, Copy)]
+    /// Fire counters keyed by dispatch-key value — the cabinet's own
+    /// key space (opcode bytes for a CPU cabinet, whatever else for
+    /// any other). No per-mnemonic fields: the diagnostics carry no
+    /// ISA vocabulary.
+    #[derive(Default, Clone)]
     pub(super) struct Fires {
-        pub stosb: u64, pub stosw: u64, pub movsb: u64, pub movsw: u64,
-        pub cmpsb: u64, pub cmpsw: u64, pub scasb: u64, pub scasw: u64,
+        /// (fire count, iterations elided) per dispatch-key value.
+        pub per_key: HashMap<i64, (u64, i64)>,
         pub total_iters: i64,
     }
     pub(super) static COUNTS: OnceLock<Mutex<HashMap<&'static str, u64>>> = OnceLock::new();
     pub(super) static FIRES: OnceLock<Mutex<Fires>> = OnceLock::new();
     pub(super) static ENABLED: OnceLock<bool> = OnceLock::new();
-    pub(super) static TRACE: OnceLock<bool> = OnceLock::new();
     pub(super) fn enabled() -> bool {
         *ENABLED.get_or_init(|| std::env::var("CALCITE_REP_DIAG").is_ok())
-    }
-    pub(super) fn trace_cmps_scas() -> bool {
-        *TRACE.get_or_init(|| std::env::var("CALCITE_REP_TRACE_CMPS_SCAS").is_ok())
     }
 }
 
@@ -6570,73 +6271,42 @@ fn rep_diag_bail(reason: &'static str) {
 #[cfg(target_arch = "wasm32")]
 fn rep_diag_bail(_reason: &'static str) {}
 
-/// Panic with the offending REP state. Called when a fast-forward bail
-/// would otherwise drop into per-byte CSS execution. There is no slow
-/// path: per-byte CSS for a long REP is so slow that conformance can't
-/// progress and DOOM never reaches its menu within a sensible budget.
-/// When this fires, the fix is to extend rep_fast_forward to handle the
+/// Panic with the offending loop's state. Called when a fast-forward
+/// bail would otherwise drop into per-iter CSS execution. There is no
+/// slow path: per-iter CSS for a long recognised loop is so slow that
+/// conformance can't progress within a sensible budget. When this
+/// fires, the fix is to extend the recogniser/applier to handle the
 /// new variant — never to make the bail silent.
+///
+/// The diagnostic prints only descriptor-carried names and values (see
+/// `describe_loop_state`) — the cabinet's own vocabulary, whatever its
+/// ISA or lack of one.
 fn rep_fast_forward_panic(
     reason: &'static str,
-    opcode: i32,
-    rep_type: i32,
-    cx: i32,
-    flags: i32,
-    cs: i32,
-    ip: i32,
+    descriptor: &crate::pattern::loop_descriptor::LoopDescriptor,
+    loop_state: &str,
     advice: &str,
 ) -> ! {
-    let opname = match opcode {
-        0xA4 => "MOVSB", 0xA5 => "MOVSW",
-        0xA6 => "CMPSB", 0xA7 => "CMPSW",
-        0xAA => "STOSB", 0xAB => "STOSW",
-        0xAE => "SCASB", 0xAF => "SCASW",
-        _ => "?",
-    };
-    let prefix = match rep_type {
-        1 => "REPE/REP",
-        2 => "REPNE",
-        _ => "no-prefix",
-    };
     panic!(
-        "rep_fast_forward: {reason} — {prefix} {opname} (op={opcode:#04x}) at CS:IP={cs:#06x}:{ip:#06x} CX={cx} flags={flags:#x}\n  {advice}\n  No slow path: extend rep_fast_forward to handle this variant.",
+        "rep_fast_forward: {reason} — dispatch {key}={val:#x} ({class:?})\n  loop state: {loop_state}\n  {advice}\n  No slow path: extend the recogniser/applier to handle this variant.",
+        key = descriptor.key_property,
+        val = descriptor.key_value,
+        class = descriptor.bulk_class,
     );
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn rep_diag_fire(opcode: i32, n: i32) {
+fn rep_diag_fire(key_value: i64, n: i32) {
     if !rep_diag::enabled() { return; }
     let m = rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new(rep_diag::Fires::default()));
     let mut m = m.lock().unwrap();
-    match opcode {
-        0xAA => m.stosb += 1,
-        0xAB => m.stosw += 1,
-        0xA4 => m.movsb += 1,
-        0xA5 => m.movsw += 1,
-        0xA6 => m.cmpsb += 1,
-        0xA7 => m.cmpsw += 1,
-        0xAE => m.scasb += 1,
-        0xAF => m.scasw += 1,
-        _ => {}
-    }
+    let e = m.per_key.entry(key_value).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += n as i64;
     m.total_iters += n as i64;
 }
 #[cfg(target_arch = "wasm32")]
-fn rep_diag_fire(_opcode: i32, _n: i32) {}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn rep_trace_cmps_scas(opcode: i32, rep_type: i32, cx_in: i32, iters: i32, di_start: i32, di_end: i32, exit_reason: &'static str) {
-    if !rep_diag::trace_cmps_scas() { return; }
-    let name = match opcode {
-        0xA6 => "CMPSB", 0xA7 => "CMPSW", 0xAE => "SCASB", 0xAF => "SCASW",
-        _ => "?",
-    };
-    let prefix = if rep_type == 1 { "REPE" } else if rep_type == 2 { "REPNE" } else { "REP?" };
-    eprintln!("[rep_cmps_scas] {} {} cx_in={} iters={} di {:#06x}->{:#06x} exit={}",
-        prefix, name, cx_in, iters, di_start & 0xFFFF, di_end & 0xFFFF, exit_reason);
-}
-#[cfg(target_arch = "wasm32")]
-fn rep_trace_cmps_scas(_opcode: i32, _rep_type: i32, _cx_in: i32, _iters: i32, _di_start: i32, _di_end: i32, _exit_reason: &'static str) {}
+fn rep_diag_fire(_key_value: i64, _n: i32) {}
 
 pub fn rep_diag_reset() {
     #[cfg(not(target_arch = "wasm32"))]
@@ -6653,13 +6323,16 @@ pub fn rep_diag_report() -> String {
     {
         let bails = rep_diag::COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
             .lock().unwrap().clone();
-        let fires = *rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new(rep_diag::Fires::default()))
-            .lock().unwrap();
+        let fires = rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new(rep_diag::Fires::default()))
+            .lock().unwrap().clone();
         let mut s = String::new();
-        s.push_str(&format!(
-            "rep_fast_forward fires: STOSB={} STOSW={} MOVSB={} MOVSW={} CMPSB={} CMPSW={} SCASB={} SCASW={} total_iters={}\n",
-            fires.stosb, fires.stosw, fires.movsb, fires.movsw,
-            fires.cmpsb, fires.cmpsw, fires.scasb, fires.scasw, fires.total_iters));
+        s.push_str("rep_fast_forward fires (per dispatch-key value):\n");
+        let mut keys: Vec<_> = fires.per_key.iter().collect();
+        keys.sort_by_key(|(k, _)| **k);
+        for (k, (count, iters)) in keys {
+            s.push_str(&format!("  key={k:#x}: fires={count} iters={iters}\n"));
+        }
+        s.push_str(&format!("rep_fast_forward total_iters={}\n", fires.total_iters));
         s.push_str("rep_fast_forward bails:\n");
         let mut items: Vec<_> = bails.iter().collect();
         items.sort_by(|a, b| b.1.cmp(a.1));
@@ -6682,16 +6355,24 @@ pub fn rep_diag_report() -> String {
 /// fast-forward collapses iterations into a single `state.memory`
 /// operation, which would be wrong for any of these ranges.
 #[inline]
-fn ranges_overlap_virtual(start: i64, len: i64) -> bool {
+pub(crate) fn ranges_overlap_virtual(state: &State, start: i64, len: i64) -> bool {
     if len <= 0 { return false; }
     let end = start + len;
     let overlaps = |a: i64, b: i64, c: i64, d: i64| a < d && c < b;
-    overlaps(start, end, 0x0500, 0x0502)
-        || overlaps(start, end, 0xD_0000, 0xD_0200)
-        || overlaps(start, end, 0xF_0000, 0x10_0000)
+    // Extended-map range: a State invariant, not a cabinet feature.
+    if overlaps(start, end, 0xF_0000, 0x10_0000) {
+        return true;
+    }
+    // Cabinet-registered virtual regions (windowed byte arrays, etc).
+    for region in &state.virtual_regions {
+        if overlaps(start, end, region.start as i64, region.end as i64) {
+            return true;
+        }
+    }
+    false
 }
 
-fn bulk_store_byte(state: &mut State, addr: i64, val: u8) {
+pub(crate) fn bulk_store_byte(state: &mut State, addr: i64, val: u8) {
     // Mirrors MemoryFill/MemoryCopy discipline (bulk path is
     // diagnostic-silent: no write_log entries). Routes through
     // `bulk_fill_byte(count=1)` so packed cabinets land the byte in the
@@ -6723,7 +6404,7 @@ fn effective_guest_mem_end(state: &State) -> usize {
 }
 
 #[inline]
-fn bulk_fill(state: &mut State, dst: i64, count: usize, val: u8) {
+pub(crate) fn bulk_fill(state: &mut State, dst: i64, count: usize, val: u8) {
     if count == 0 || dst < 0 { return; }
     let mem_len = effective_guest_mem_end(state);
     if (dst as usize) >= mem_len { return; }
@@ -6734,26 +6415,6 @@ fn bulk_fill(state: &mut State, dst: i64, count: usize, val: u8) {
     }
 }
 
-#[inline]
-fn bulk_copy(state: &mut State, src: i64, dst: i64, count: usize) {
-    if count == 0 || src < 0 || dst < 0 { return; }
-    let mem_len = effective_guest_mem_end(state);
-    // Destination must be inside writable guest memory. (BIOS-as-dst is
-    // bailed by the rep_fast_forward overlap check.)
-    if (dst as usize) >= mem_len { return; }
-    let max_by_dst = (mem_len as i64) - dst;
-    let mut n = count.min(max_by_dst as usize);
-    // Source may extend into the BIOS ROM region (0xF0000..0x100000) which
-    // lives in `state.extended`, not `state.memory`. `bulk_copy_bytes` uses
-    // `state.read_mem` per byte, which transparently handles extended, so we
-    // only need to ensure the dst window is valid; src bytes are always
-    // resolvable via read_mem (returns 0 for unmapped addresses).
-    if n > 0 {
-        state.bulk_copy_bytes(src as usize, dst as usize, n);
-    }
-    // Suppress unused warning about `n` reassignment.
-    let _ = &mut n;
-}
 
 /// Execute a sequence of ops against the slot array.
 ///

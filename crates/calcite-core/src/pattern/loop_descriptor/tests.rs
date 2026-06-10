@@ -1,0 +1,3576 @@
+//! Unit tests for the self-loop recogniser.
+//!
+//! Two synthetic cabinets, A and B, produce equivalent descriptors
+//! despite having completely different slot/property names. This is the
+//! cardinal-rule genericity probe: A is x86-shaped (slot names match the
+//! current kiln-emitted cabinets); B is brainfuck-shaped (arbitrary
+//! opaque names, no x86 ABI, no shared naming convention with A). The
+//! recogniser must not see the difference.
+
+use super::*;
+use crate::types::*;
+
+// ---------------------------------------------------------------------------
+// Helpers for building Expr trees (lots of `Box::new` otherwise).
+// ---------------------------------------------------------------------------
+
+fn lit(v: f64) -> Expr {
+    Expr::Literal(v)
+}
+
+fn var(name: &str) -> Expr {
+    Expr::Var {
+        name: name.to_string(),
+        fallback: None,
+    }
+}
+
+fn add(a: Expr, b: Expr) -> Expr {
+    Expr::Calc(CalcOp::Add(Box::new(a), Box::new(b)))
+}
+
+fn sub(a: Expr, b: Expr) -> Expr {
+    Expr::Calc(CalcOp::Sub(Box::new(a), Box::new(b)))
+}
+
+fn mul(a: Expr, b: Expr) -> Expr {
+    Expr::Calc(CalcOp::Mul(Box::new(a), Box::new(b)))
+}
+
+fn maxof(a: Expr, b: Expr) -> Expr {
+    Expr::Calc(CalcOp::Max(vec![a, b]))
+}
+
+fn call(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::FunctionCall {
+        name: name.to_string(),
+        args,
+    }
+}
+
+fn style_eq(prop: &str, value: f64) -> StyleTest {
+    StyleTest::Single {
+        property: prop.to_string(),
+        value: Expr::Literal(value),
+    }
+}
+
+/// Build `if(<test>: then; else: fallback)`.
+fn iff(test: StyleTest, then: Expr, fallback: Expr) -> Expr {
+    Expr::StyleCondition {
+        branches: vec![StyleBranch {
+            condition: test,
+            then,
+        }],
+        fallback: Box::new(fallback),
+    }
+}
+
+/// Build a multi-branch StyleCondition, all branches keyed on `prop`.
+fn dispatch(prop: &str, branches: Vec<(f64, Expr)>, fallback: Expr) -> Expr {
+    Expr::StyleCondition {
+        branches: branches
+            .into_iter()
+            .map(|(v, then)| StyleBranch {
+                condition: style_eq(prop, v),
+                then,
+            })
+            .collect(),
+        fallback: Box::new(fallback),
+    }
+}
+
+fn assign(prop: &str, value: Expr) -> Assignment {
+    Assignment {
+        property: prop.to_string(),
+        value,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builders for the per-V kiln shapes.
+// ---------------------------------------------------------------------------
+
+/// Build the IP-stay-or-advance body for one opcode.
+///
+/// Shape: `if(<predicate>: calc(self - prefix_sub); else: calc(self + advance_lit))`.
+///
+/// `predicate` is the loop-continue gate; `self_var` is the prior IP
+/// mirror; `prefix_sub` is what gets subtracted on the stay branch.
+fn ip_body(predicate: StyleTest, self_var: &str, prefix_sub: Expr, advance_lit: i32) -> Expr {
+    iff(
+        predicate,
+        sub(var(self_var), prefix_sub),
+        add(var(self_var), lit(advance_lit as f64)),
+    )
+}
+
+/// Build the multi-branch IP-stay-or-advance body for an opcode whose
+/// loop-continue predicate is a disjunction of multiple branch
+/// conditions. Used for CMPS/SCAS in real cabinets:
+///
+///   `if(<P1>: stay; <P2>: stay; ...; else: advance)`
+///
+/// All branches share the same stay body. `predicates` provides the
+/// per-branch conditions; each must independently signal "stay".
+fn ip_body_multi(
+    predicates: Vec<StyleTest>,
+    self_var: &str,
+    prefix_sub: Expr,
+    advance_lit: i32,
+) -> Expr {
+    let stay = sub(var(self_var), prefix_sub);
+    let advance = add(var(self_var), lit(advance_lit as f64));
+    Expr::StyleCondition {
+        branches: predicates
+            .into_iter()
+            .map(|p| StyleBranch {
+                condition: p,
+                then: stay.clone(),
+            })
+            .collect(),
+        fallback: Box::new(advance),
+    }
+}
+
+/// Build the counter-decrement body for one opcode.
+///
+/// Shape: `if(<no-rep-guard>: self; else: max(0, calc(self - 1)))`.
+fn counter_body(no_rep_guard: StyleTest, self_var: &str) -> Expr {
+    iff(
+        no_rep_guard,
+        var(self_var),
+        maxof(lit(0.0), sub(var(self_var), lit(1.0))),
+    )
+}
+
+/// Build the pointer-step body for one opcode in kiln's actual shape:
+///
+///   `if(<rep-guard>: var(self); else: <update-expr>)`
+///
+/// where update-expr =
+///   `OUTER_CALL(calc(calc(var(self) + k) - INNER_CALL(var(flag), bit) * (2k)), 16)`
+/// — the kiln `--lowerBytes` / direction-flag idiom for a 16-bit
+/// modular pointer step.
+fn pointer_body(
+    rep_guard: StyleTest,
+    self_var: &str,
+    base_step: i32,
+    flag_var: &str,
+    flag_bit: u32,
+    outer_call: &str,
+    inner_call: &str,
+) -> Expr {
+    let inner = sub(
+        add(var(self_var), lit(base_step as f64)),
+        mul(
+            call(inner_call, vec![var(flag_var), lit(flag_bit as f64)]),
+            lit(2.0 * base_step as f64),
+        ),
+    );
+    let update = call(outer_call, vec![inner, lit(16.0)]);
+    iff(rep_guard, var(self_var), update)
+}
+
+/// Build a "no entry" fallback expression (slot keeps its prior value).
+fn keep_self(self_var: &str) -> Expr {
+    var(self_var)
+}
+
+// ---------------------------------------------------------------------------
+// Cabinet A — x86-shaped names.
+//
+// Two opcodes:
+//   0xAA: STOSB-shape — counter, one pointer (DI).
+//   0xA4: MOVSB-shape — counter, two pointers (DI, SI).
+// ---------------------------------------------------------------------------
+
+fn cabinet_a() -> Vec<Assignment> {
+    let pred_continue = style_eq("--_repContinue", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+
+    let cx_dispatch = dispatch(
+        "--opcode",
+        vec![
+            (0xAA as f64, counter_body(no_rep.clone(), "--__1CX")),
+            (0xA4 as f64, counter_body(no_rep.clone(), "--__1CX")),
+        ],
+        keep_self("--__1CX"),
+    );
+
+    let ip_dispatch = dispatch(
+        "--opcode",
+        vec![
+            (
+                0xAA as f64,
+                ip_body(
+                    pred_continue.clone(),
+                    "--__1IP",
+                    var("--prefixLen"),
+                    1,
+                ),
+            ),
+            (
+                0xA4 as f64,
+                ip_body(
+                    pred_continue.clone(),
+                    "--__1IP",
+                    var("--prefixLen"),
+                    1,
+                ),
+            ),
+        ],
+        keep_self("--__1IP"),
+    );
+
+    // Outer wrapper kiln adds: calc(<dispatch> + var(--prefixLen)).
+    let ip_wrapped = add(ip_dispatch, var("--prefixLen"));
+
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+    let di_dispatch = dispatch(
+        "--opcode",
+        vec![
+            (
+                0xAA as f64,
+                pointer_body(
+                    active_guard.clone(),
+                    "--__1DI",
+                    1,
+                    "--__1flags",
+                    10,
+                    "--lowerBytes",
+                    "--bit",
+                ),
+            ),
+            (
+                0xA4 as f64,
+                pointer_body(
+                    active_guard.clone(),
+                    "--__1DI",
+                    1,
+                    "--__1flags",
+                    10,
+                    "--lowerBytes",
+                    "--bit",
+                ),
+            ),
+        ],
+        keep_self("--__1DI"),
+    );
+    let si_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xA4 as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--__1SI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1SI"),
+    );
+
+    // Memwrite address slot: -1 when inactive, real address when active.
+    let memaddr0_dispatch = dispatch(
+        "--opcode",
+        vec![
+            (
+                0xAA as f64,
+                iff(
+                    active_guard.clone(),
+                    lit(-1.0),
+                    add(mul(var("--__1ES"), lit(16.0)), var("--__1DI")),
+                ),
+            ),
+            (
+                0xA4 as f64,
+                iff(
+                    active_guard.clone(),
+                    lit(-1.0),
+                    add(mul(var("--__1ES"), lit(16.0)), var("--__1DI")),
+                ),
+            ),
+        ],
+        lit(-1.0),
+    );
+
+    let memval0_dispatch = dispatch(
+        "--opcode",
+        vec![
+            (0xAA as f64, var("--AL")),
+            (0xA4 as f64, var("--_strSrcByte")),
+        ],
+        lit(0.0),
+    );
+
+    vec![
+        assign("--CX", cx_dispatch),
+        assign("--IP", ip_wrapped),
+        assign("--DI", di_dispatch),
+        assign("--SI", si_dispatch),
+        assign("--memAddr0", memaddr0_dispatch),
+        assign("--memVal0", memval0_dispatch),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Cabinet B — brainfuck-shaped names.
+//
+// Same structural shape as cabinet A, but the slot names share NOTHING
+// with x86 land. The recogniser must produce the same descriptor count
+// and the same structural fields (counter, pointer count, advance lit).
+// Names will obviously differ — we compare structure, not strings.
+// ---------------------------------------------------------------------------
+
+fn cabinet_b() -> Vec<Assignment> {
+    let pred_continue = style_eq("--moodMeter", 1.0);
+    let no_rep = style_eq("--cookbookOpen", 0.0);
+
+    // Two opcodes: 70 (a "fill" shape, like A's 0xAA) and 80 (a "copy"
+    // shape, like A's 0xA4).
+    let counter_dispatch = dispatch(
+        "--recipeStep",
+        vec![
+            (70.0, counter_body(no_rep.clone(), "--priorTapeUses")),
+            (80.0, counter_body(no_rep.clone(), "--priorTapeUses")),
+        ],
+        keep_self("--priorTapeUses"),
+    );
+
+    let cursor_advance_dispatch = dispatch(
+        "--recipeStep",
+        vec![
+            (
+                70.0,
+                ip_body(
+                    pred_continue.clone(),
+                    "--priorCursor",
+                    var("--introBytes"),
+                    1,
+                ),
+            ),
+            (
+                80.0,
+                ip_body(
+                    pred_continue.clone(),
+                    "--priorCursor",
+                    var("--introBytes"),
+                    1,
+                ),
+            ),
+        ],
+        keep_self("--priorCursor"),
+    );
+    let cursor_wrapped = add(cursor_advance_dispatch, var("--introBytes"));
+
+    let active_guard = StyleTest::And(vec![
+        style_eq("--cookbookOpen", 1.0),
+        style_eq("--ladlePoised", 0.0),
+    ]);
+
+    // Pointer 1 — analog of DI, but called tapeWriteHead.
+    let twh_dispatch = dispatch(
+        "--recipeStep",
+        vec![
+            (
+                70.0,
+                pointer_body(
+                    active_guard.clone(),
+                    "--priorTapeWriteHead",
+                    1,
+                    "--priorMoodFlags",
+                    7, // any small bit, doesn't have to be 10
+                    "--clampLowBits",
+                    "--readBitN",
+                ),
+            ),
+            (
+                80.0,
+                pointer_body(
+                    active_guard.clone(),
+                    "--priorTapeWriteHead",
+                    1,
+                    "--priorMoodFlags",
+                    7,
+                    "--clampLowBits",
+                    "--readBitN",
+                ),
+            ),
+        ],
+        keep_self("--priorTapeWriteHead"),
+    );
+    // Pointer 2 — analog of SI but only for opcode 80.
+    let trh_dispatch = dispatch(
+        "--recipeStep",
+        vec![(
+            80.0,
+            pointer_body(
+                active_guard.clone(),
+                "--priorTapeReadHead",
+                1,
+                "--priorMoodFlags",
+                7,
+                "--clampLowBits",
+                "--readBitN",
+            ),
+        )],
+        keep_self("--priorTapeReadHead"),
+    );
+
+    let bag_addr = dispatch(
+        "--recipeStep",
+        vec![
+            (
+                70.0,
+                iff(
+                    active_guard.clone(),
+                    lit(-1.0),
+                    add(
+                        mul(var("--priorBagPage"), lit(16.0)),
+                        var("--priorTapeWriteHead"),
+                    ),
+                ),
+            ),
+            (
+                80.0,
+                iff(
+                    active_guard.clone(),
+                    lit(-1.0),
+                    add(
+                        mul(var("--priorBagPage"), lit(16.0)),
+                        var("--priorTapeWriteHead"),
+                    ),
+                ),
+            ),
+        ],
+        lit(-1.0),
+    );
+    let bag_val = dispatch(
+        "--recipeStep",
+        vec![
+            (70.0, var("--ladleByte")),
+            (80.0, var("--mirrorSourceByte")),
+        ],
+        lit(0.0),
+    );
+
+    vec![
+        assign("--tapeUses", counter_dispatch),
+        assign("--cursor", cursor_wrapped),
+        assign("--tapeWriteHead", twh_dispatch),
+        assign("--tapeReadHead", trh_dispatch),
+        assign("--bagAddr0", bag_addr),
+        assign("--bagVal0", bag_val),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cabinet_a_recognises_two_loops() {
+    let descs = recognise_loops(&cabinet_a());
+    assert_eq!(descs.len(), 2, "expected 2 loop descriptors, got {}: {:?}", descs.len(), descs);
+
+    let stosb = descs.iter().find(|d| d.key_value == 0xAA).expect("stosb desc");
+    assert!(stosb.counter.is_some(), "stosb should have a counter");
+    assert_eq!(stosb.pointers.len(), 1, "stosb should have 1 pointer (DI)");
+    assert_eq!(stosb.ip_advance_literal, 1);
+    assert_eq!(stosb.writes.len(), 1, "stosb should have 1 write descriptor");
+
+    let movsb = descs.iter().find(|d| d.key_value == 0xA4).expect("movsb desc");
+    assert!(movsb.counter.is_some(), "movsb should have a counter");
+    assert_eq!(movsb.pointers.len(), 2, "movsb should have 2 pointers (DI, SI)");
+    assert_eq!(movsb.ip_advance_literal, 1);
+}
+
+#[test]
+fn cabinet_b_recognises_two_loops_equivalently() {
+    let descs = recognise_loops(&cabinet_b());
+    assert_eq!(
+        descs.len(),
+        2,
+        "brainfuck-shaped cabinet should produce same descriptor count as x86-shaped: {:?}",
+        descs
+    );
+
+    // Sort by key_value for determinism.
+    let mut by_k = descs.clone();
+    by_k.sort_by_key(|d| d.key_value);
+    let fill = &by_k[0]; // key 70 — analog of stosb
+    let copy = &by_k[1]; // key 80 — analog of movsb
+
+    assert_eq!(fill.key_value, 70);
+    assert!(fill.counter.is_some());
+    assert_eq!(fill.pointers.len(), 1);
+    assert_eq!(fill.writes.len(), 1);
+    assert_eq!(fill.ip_advance_literal, 1);
+
+    assert_eq!(copy.key_value, 80);
+    assert!(copy.counter.is_some());
+    assert_eq!(copy.pointers.len(), 2);
+    assert_eq!(copy.ip_advance_literal, 1);
+}
+
+/// The genericity probe in concentrated form: structural fields (counts
+/// and step magnitudes) must match exactly between A and B, even though
+/// no slot or property name overlaps.
+#[test]
+fn a_and_b_descriptors_are_structurally_equivalent() {
+    let a = recognise_loops(&cabinet_a());
+    let b = recognise_loops(&cabinet_b());
+    assert_eq!(a.len(), b.len());
+
+    // Cabinets A and B use unrelated key-value sets (e.g. 0xAA/0xA4 vs
+    // 70/80). Comparing by key-value would be meaningless. Instead we
+    // compare the *multiset* of structural signatures across all
+    // descriptors — both cabinets must yield the same multiset.
+    let signatures = |x: &[LoopDescriptor]| {
+        let mut sigs: Vec<_> = x
+            .iter()
+            .map(|d| {
+                let mut psteps: Vec<i32> = d.pointers.iter().map(|p| p.base_step).collect();
+                psteps.sort();
+                (
+                    d.counter.as_ref().map(|c| c.step),
+                    d.pointers.len(),
+                    psteps,
+                    d.ip_advance_literal,
+                    d.writes.len(),
+                    d.flag_conditioned,
+                )
+            })
+            .collect();
+        sigs.sort();
+        sigs
+    };
+
+    let a_sig = signatures(&a);
+    let b_sig = signatures(&b);
+    assert_eq!(
+        a_sig, b_sig,
+        "cabinet A and cabinet B must produce structurally identical descriptors"
+    );
+}
+
+#[test]
+fn no_loop_when_no_ip_stay_shape() {
+    // A dispatch family with only a counter and a pointer, but no
+    // IP-stay shape. Should produce zero descriptors — there's no
+    // termination signal we can fast-forward against.
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+    let cx = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, counter_body(no_rep, "--__1CX"))],
+        keep_self("--__1CX"),
+    );
+    let di = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard,
+                "--__1DI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1DI"),
+    );
+    let asns = vec![assign("--CX", cx), assign("--DI", di)];
+    let descs = recognise_loops(&asns);
+    assert!(
+        descs.is_empty(),
+        "no IP-stay-shape means no descriptors, got {:?}",
+        descs
+    );
+}
+
+#[test]
+fn no_loop_when_only_ip_stay_no_counter_or_pointer_or_write() {
+    // IP-stay alone, nothing else. We refuse: an unbounded loop is not
+    // safe to fast-forward.
+    let pred = style_eq("--cont", 1.0);
+    let ip = dispatch(
+        "--opcode",
+        vec![(7.0, ip_body(pred, "--prevPC", var("--prefixLen"), 1))],
+        keep_self("--prevPC"),
+    );
+    // Add a second member that's not counter/pointer/write — just a
+    // passthrough. This avoids the "single-member family" filter.
+    let other = dispatch("--opcode", vec![(7.0, lit(0.0))], lit(0.0));
+    let asns = vec![assign("--PC", ip), assign("--noise", other)];
+    let descs = recognise_loops(&asns);
+    assert!(
+        descs.is_empty(),
+        "IP-stay without counter/pointer/write must be refused: {:?}",
+        descs
+    );
+}
+
+#[test]
+fn dispatch_family_picks_largest_member_set() {
+    // Two different dispatch keys present. Recogniser picks the one
+    // with more members.
+    let pred = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+
+    // Family on --opcode (3 members).
+    let cx = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, counter_body(no_rep, "--__1CX"))],
+        keep_self("--__1CX"),
+    );
+    let ip = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            ip_body(pred.clone(), "--__1IP", var("--prefixLen"), 1),
+        )],
+        keep_self("--__1IP"),
+    );
+    let di = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--__1DI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1DI"),
+    );
+
+    // Decoy family on --otherKey (2 members, no shape).
+    let dec1 = dispatch("--otherKey", vec![(1.0, lit(1.0))], lit(0.0));
+    let dec2 = dispatch("--otherKey", vec![(2.0, lit(2.0))], lit(0.0));
+
+    let asns = vec![
+        assign("--CX", cx),
+        assign("--IP", ip),
+        assign("--DI", di),
+        assign("--noise1", dec1),
+        assign("--noise2", dec2),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1);
+    assert_eq!(descs[0].key_property, "--opcode");
+    assert_eq!(descs[0].key_value, 0xAA);
+}
+
+/// Renaming a slot must not change the descriptor structure (only the
+/// stored names). Concretely: change every `--__1CX` to `--zzzCX`, every
+/// `--__1IP` to `--prevIP`, etc., and the recogniser must still produce
+/// equivalent structural facts.
+#[test]
+fn renaming_slots_preserves_structure() {
+    fn rename_one(asns: Vec<Assignment>, table: &[(&str, &str)]) -> Vec<Assignment> {
+        fn ren(s: &str, t: &[(&str, &str)]) -> String {
+            for (from, to) in t {
+                if s == *from {
+                    return (*to).to_string();
+                }
+            }
+            s.to_string()
+        }
+        fn ren_expr(e: &Expr, t: &[(&str, &str)]) -> Expr {
+            match e {
+                Expr::Literal(v) => Expr::Literal(*v),
+                Expr::StringLiteral(s) => Expr::StringLiteral(s.clone()),
+                Expr::Var { name, fallback } => Expr::Var {
+                    name: ren(name, t),
+                    fallback: fallback.as_ref().map(|f| Box::new(ren_expr(f, t))),
+                },
+                Expr::Calc(op) => Expr::Calc(ren_calc(op, t)),
+                Expr::StyleCondition { branches, fallback } => Expr::StyleCondition {
+                    branches: branches
+                        .iter()
+                        .map(|b| StyleBranch {
+                            condition: ren_test(&b.condition, t),
+                            then: ren_expr(&b.then, t),
+                        })
+                        .collect(),
+                    fallback: Box::new(ren_expr(fallback, t)),
+                },
+                Expr::FunctionCall { name, args } => Expr::FunctionCall {
+                    name: ren(name, t),
+                    args: args.iter().map(|a| ren_expr(a, t)).collect(),
+                },
+                Expr::Concat(parts) => Expr::Concat(parts.iter().map(|p| ren_expr(p, t)).collect()),
+            }
+        }
+        fn ren_calc(op: &CalcOp, t: &[(&str, &str)]) -> CalcOp {
+            match op {
+                CalcOp::Add(a, b) => CalcOp::Add(Box::new(ren_expr(a, t)), Box::new(ren_expr(b, t))),
+                CalcOp::Sub(a, b) => CalcOp::Sub(Box::new(ren_expr(a, t)), Box::new(ren_expr(b, t))),
+                CalcOp::Mul(a, b) => CalcOp::Mul(Box::new(ren_expr(a, t)), Box::new(ren_expr(b, t))),
+                CalcOp::Div(a, b) => CalcOp::Div(Box::new(ren_expr(a, t)), Box::new(ren_expr(b, t))),
+                CalcOp::Mod(a, b) => CalcOp::Mod(Box::new(ren_expr(a, t)), Box::new(ren_expr(b, t))),
+                CalcOp::Pow(a, b) => CalcOp::Pow(Box::new(ren_expr(a, t)), Box::new(ren_expr(b, t))),
+                CalcOp::Min(args) => CalcOp::Min(args.iter().map(|a| ren_expr(a, t)).collect()),
+                CalcOp::Max(args) => CalcOp::Max(args.iter().map(|a| ren_expr(a, t)).collect()),
+                CalcOp::Clamp(a, b, c) => CalcOp::Clamp(
+                    Box::new(ren_expr(a, t)),
+                    Box::new(ren_expr(b, t)),
+                    Box::new(ren_expr(c, t)),
+                ),
+                CalcOp::Round(s, a, b) => CalcOp::Round(
+                    *s,
+                    Box::new(ren_expr(a, t)),
+                    Box::new(ren_expr(b, t)),
+                ),
+                CalcOp::Sign(a) => CalcOp::Sign(Box::new(ren_expr(a, t))),
+                CalcOp::Abs(a) => CalcOp::Abs(Box::new(ren_expr(a, t))),
+                CalcOp::Negate(a) => CalcOp::Negate(Box::new(ren_expr(a, t))),
+            }
+        }
+        fn ren_test(test: &StyleTest, t: &[(&str, &str)]) -> StyleTest {
+            match test {
+                StyleTest::Single { property, value } => StyleTest::Single {
+                    property: ren(property, t),
+                    value: ren_expr(value, t),
+                },
+                StyleTest::And(parts) => {
+                    StyleTest::And(parts.iter().map(|p| ren_test(p, t)).collect())
+                }
+                StyleTest::Or(parts) => {
+                    StyleTest::Or(parts.iter().map(|p| ren_test(p, t)).collect())
+                }
+            }
+        }
+        asns.into_iter()
+            .map(|a| Assignment {
+                property: ren(&a.property, table),
+                value: ren_expr(&a.value, table),
+            })
+            .collect()
+    }
+
+    let table: &[(&str, &str)] = &[
+        ("--opcode", "--decided-step"),
+        ("--__1CX", "--rememberedRunLength"),
+        ("--__1IP", "--rememberedSong"),
+        ("--__1DI", "--rememberedHand"),
+        ("--__1SI", "--rememberedFoot"),
+        ("--__1ES", "--rememberedDimension"),
+        ("--__1flags", "--rememberedMood"),
+        ("--CX", "--runLength"),
+        ("--IP", "--song"),
+        ("--DI", "--hand"),
+        ("--SI", "--foot"),
+        ("--memAddr0", "--paint0"),
+        ("--memVal0", "--colour0"),
+        ("--prefixLen", "--introBytes"),
+        ("--hasREP", "--cookbookOpen"),
+        ("--_repActive", "--ladlePoised"),
+        ("--_repContinue", "--moodMeter"),
+        ("--_strSrcByte", "--mirrorSourceByte"),
+        ("--AL", "--ladleByte"),
+        ("--lowerBytes", "--clampLowBits"),
+        ("--bit", "--readBitN"),
+    ];
+
+    let original = recognise_loops(&cabinet_a());
+    let renamed = recognise_loops(&rename_one(cabinet_a(), table));
+    assert_eq!(original.len(), renamed.len());
+
+    let summary = |descs: &[LoopDescriptor]| {
+        let mut keys: Vec<i64> = descs.iter().map(|d| d.key_value).collect();
+        keys.sort_unstable();
+        keys.into_iter()
+            .map(|k| {
+                let d = descs.iter().find(|x| x.key_value == k).unwrap();
+                (
+                    d.counter.as_ref().map(|c| c.step),
+                    d.pointers.len(),
+                    {
+                        let mut s: Vec<i32> = d.pointers.iter().map(|p| p.base_step).collect();
+                        s.sort();
+                        s
+                    },
+                    d.ip_advance_literal,
+                    d.writes.len(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(summary(&original), summary(&renamed));
+}
+
+/// Real cabinets wrap each register dispatch in an outer
+/// `if(<gate-A>: var(self); <gate-B>: var(self); ...; else: <real-dispatch>)`
+/// — the TF / IRQ override layer that takes precedence over normal
+/// instruction execution. The recogniser must peel this wrapper and
+/// still find the loop. The cabinet may also wrap IP in
+/// `calc(<dispatch> + var(--prefixLen))`. Both wrappers must be
+/// stripped before recognition.
+#[test]
+fn outer_wrappers_are_stripped() {
+    let pred = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--inhibit", 0.0),
+    ]);
+
+    // Inner per-V bodies — same shape as cabinet_a.
+    let cx_inner = dispatch(
+        "--op",
+        vec![(0xAA as f64, counter_body(no_rep, "--prevCount"))],
+        keep_self("--prevCount"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            ip_body(pred.clone(), "--prevPC", var("--introBytes"), 1),
+        )],
+        keep_self("--prevPC"),
+    );
+    let di_inner = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--prevHand",
+                1,
+                "--prevMood",
+                10,
+                "--clampLow",
+                "--bitN",
+            ),
+        )],
+        keep_self("--prevHand"),
+    );
+
+    // Wrap CX in TF/IRQ-style passthrough wrapper.
+    let cx_wrapped = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--trapMode", 1.0),
+                then: var("--prevCount"),
+            },
+            StyleBranch {
+                condition: style_eq("--alarmActive", 1.0),
+                then: var("--prevCount"),
+            },
+        ],
+        fallback: Box::new(cx_inner),
+    };
+
+    // Wrap IP in TF/IRQ wrapper, then in calc(... + var(introBytes)).
+    let ip_passthrough = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--trapMode", 1.0),
+                then: var("--prevPC"),
+            },
+            StyleBranch {
+                condition: style_eq("--alarmActive", 1.0),
+                then: var("--prevPC"),
+            },
+        ],
+        fallback: Box::new(ip_inner),
+    };
+    let ip_wrapped = add(ip_passthrough, var("--introBytes"));
+
+    // DI gets the same wrapper.
+    let di_wrapped = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--trapMode", 1.0),
+                then: var("--prevHand"),
+            },
+            StyleBranch {
+                condition: style_eq("--alarmActive", 1.0),
+                then: var("--prevHand"),
+            },
+        ],
+        fallback: Box::new(di_inner),
+    };
+
+    let asns = vec![
+        assign("--count", cx_wrapped),
+        assign("--pc", ip_wrapped),
+        assign("--hand", di_wrapped),
+    ];
+
+    let descs = recognise_loops(&asns);
+    assert_eq!(
+        descs.len(),
+        1,
+        "outer-wrapped dispatches should still recognise the loop, got {:?}",
+        descs
+    );
+    let d = &descs[0];
+    assert!(d.counter.is_some());
+    assert_eq!(d.pointers.len(), 1);
+    assert_eq!(d.ip_advance_literal, 1);
+}
+
+/// Outer wrappers around the IP register can return non-self values in
+/// their override branches (kiln's TF/IRQ wrapper emits things like
+/// `--_tfIP` or `picVector*4`, not `var(self)`). We must still find the
+/// real dispatch in the fallback regardless. The recogniser does NOT
+/// require that override branches read self — only that the fallback
+/// contains a single-key dispatch.
+#[test]
+fn ip_wrapper_with_non_self_overrides_still_recognises() {
+    let pred = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--inhibit", 0.0),
+    ]);
+
+    let cx_inner = dispatch(
+        "--op",
+        vec![(0xAA as f64, counter_body(no_rep, "--prevCount"))],
+        keep_self("--prevCount"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            ip_body(pred.clone(), "--prevPC", var("--introBytes"), 1),
+        )],
+        keep_self("--prevPC"),
+    );
+    let di_inner = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--prevHand",
+                1,
+                "--prevMood",
+                10,
+                "--clampLow",
+                "--bitN",
+            ),
+        )],
+        keep_self("--prevHand"),
+    );
+
+    // IP wrapper: TF returns trap-IP target, IRQ returns IVT slot
+    // address. Neither is `var(self)`. Recogniser must still descend.
+    let ip_wrapped = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--trapMode", 1.0),
+                then: var("--trapTargetIP"),
+            },
+            StyleBranch {
+                condition: style_eq("--alarmActive", 1.0),
+                then: mul(var("--ivtSlot"), lit(4.0)),
+            },
+        ],
+        fallback: Box::new(ip_inner),
+    };
+    let ip_outer = add(ip_wrapped, var("--introBytes"));
+
+    let asns = vec![
+        assign("--count", cx_inner),
+        assign("--pc", ip_outer),
+        assign("--hand", di_inner),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(
+        descs.len(),
+        1,
+        "must descend into IP wrapper fallback even when branches don't read self: {:?}",
+        descs
+    );
+    let d = &descs[0];
+    assert!(d.counter.is_some());
+    assert_eq!(d.pointers.len(), 1);
+}
+
+#[test]
+fn memwrite_pairing_uses_assignment_order_proximity() {
+    // Build a cabinet with TWO write pairs interleaved in source order:
+    //   --addrA (idx 2)
+    //   --valA  (idx 3)
+    //   --addrB (idx 4)
+    //   --valB  (idx 5)
+    // The recogniser should pair (addrA, valA) and (addrB, valB), NOT
+    // pair them by alphabetical sort which would give (addrA, valA) but
+    // also pair (addrB, valA) if we didn't track positions.
+    let pred_continue = style_eq("--repCont", 1.0);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = style_eq("--repActive", 0.0);
+
+    let cx = dispatch(
+        "--op",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            ip_body(pred_continue.clone(), "--ip0", var("--pl"), 1),
+        )],
+        keep_self("--ip0"),
+    );
+
+    // Address bodies: -1 when active, real address otherwise.
+    fn addr(active_guard: StyleTest, slot_self: &str) -> Expr {
+        iff(active_guard, lit(-1.0), add(mul(var("--es"), lit(16.0)), var(slot_self)))
+    }
+
+    let addr_a = dispatch(
+        "--op",
+        vec![(0xAA as f64, addr(active_guard.clone(), "--di0"))],
+        lit(-1.0),
+    );
+    // Two distinct value bodies so we can distinguish which got paired.
+    let val_a = dispatch(
+        "--op",
+        vec![(0xAA as f64, var("--regA"))],
+        lit(0.0),
+    );
+    let addr_b = dispatch(
+        "--op",
+        vec![(0xAA as f64, addr(active_guard.clone(), "--di1"))],
+        lit(-1.0),
+    );
+    let val_b = dispatch(
+        "--op",
+        vec![(0xAA as f64, var("--regB"))],
+        lit(0.0),
+    );
+
+    // Order matters: this is the test.
+    let asns = vec![
+        assign("--cx0", cx),       // idx 0
+        assign("--ip0", ip),       // idx 1
+        assign("--addrA", addr_a), // idx 2
+        assign("--valA", val_a),   // idx 3
+        assign("--addrB", addr_b), // idx 4
+        assign("--valB", val_b),   // idx 5
+    ];
+
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "one descriptor expected: {:?}", descs);
+    let d = &descs[0];
+    assert_eq!(d.writes.len(), 2, "two write pairs expected");
+    // Sort by addr_property for deterministic comparison.
+    let mut writes = d.writes.clone();
+    writes.sort_by(|a, b| a.addr_property.cmp(&b.addr_property));
+    assert_eq!(writes[0].addr_property, "--addrA");
+    assert_eq!(writes[0].val_property, "--valA",
+        "addrA must pair with valA (immediately after in source order), got {:?}", writes[0]);
+    assert_eq!(writes[1].addr_property, "--addrB");
+    assert_eq!(writes[1].val_property, "--valB",
+        "addrB must pair with valB (immediately after in source order), got {:?}", writes[1]);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3a tests: CMPS/SCAS-shape recognition + BulkClass classification.
+// ---------------------------------------------------------------------------
+
+/// Build a CMPS/SCAS-shape cabinet using a multi-branch IP body where
+/// each branch is an AND of three property tests, all yielding "stay",
+/// with the fallback advancing. No memory writes — read-only loop. The
+/// recogniser must produce one descriptor with `flag_conditioned=true`
+/// and `bulk_class=ReadOnly`.
+fn cabinet_cmps_shape() -> Vec<Assignment> {
+    // The disjunction expands to: (P1 AND P2 AND P3) OR (P4 AND P5 AND P6).
+    let branch_a = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq("--repType", 1.0),
+        style_eq("--zfBit", 1.0),
+    ]);
+    let branch_b = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq("--repType", 2.0),
+        style_eq("--zfBit", 0.0),
+    ]);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasRep", 1.0),
+        style_eq("--repInactive", 0.0),
+    ]);
+
+    let cx = dispatch(
+        "--op",
+        vec![(0xA6 as f64, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+
+    // Multi-branch IP body — same shape kiln emits via repCondIP.
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            0xA6 as f64,
+            ip_body_multi(
+                vec![branch_a.clone(), branch_b.clone()],
+                "--ip0",
+                var("--pl"),
+                1,
+            ),
+        )],
+        keep_self("--ip0"),
+    );
+    let ip_wrapped = add(ip_inner, var("--pl"));
+
+    let di = dispatch(
+        "--op",
+        vec![(
+            0xA6 as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--di0",
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--di0"),
+    );
+    let si = dispatch(
+        "--op",
+        vec![(
+            0xA6 as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--si0",
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--si0"),
+    );
+
+    vec![
+        assign("--cx", cx),
+        assign("--ip", ip_wrapped),
+        assign("--di", di),
+        assign("--si", si),
+    ]
+}
+
+#[test]
+fn cmps_shape_recognised_with_flag_conditioning() {
+    let descs = recognise_loops(&cabinet_cmps_shape());
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    assert!(d.counter.is_some(), "counter must be recognised");
+    assert_eq!(d.pointers.len(), 2, "CMPS-shape has two pointers (DI, SI)");
+    assert_eq!(d.writes.len(), 0, "CMPS has no memory writes");
+    assert_eq!(d.ip_advance_literal, 1);
+    assert!(
+        d.flag_conditioned,
+        "predicate spans multiple distinct properties → flag_conditioned",
+    );
+    assert_eq!(
+        d.bulk_class,
+        BulkClass::ReadOnly,
+        "no writes → ReadOnly bulk class",
+    );
+    // The synthesised predicate must be an Or of two And-conditions.
+    match &d.predicate {
+        StyleTest::Or(parts) => {
+            assert_eq!(parts.len(), 2, "two stay-branches → Or with 2 parts");
+        }
+        other => panic!("expected Or predicate from multi-branch IP body, got {:?}", other),
+    }
+}
+
+/// SCAS-shape: like CMPS but only one pointer (DI). Same multi-branch
+/// IP body. No writes.
+fn cabinet_scas_shape() -> Vec<Assignment> {
+    let branch_a = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq("--repType", 1.0),
+        style_eq("--zfBit", 1.0),
+    ]);
+    let branch_b = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq("--repType", 2.0),
+        style_eq("--zfBit", 0.0),
+    ]);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasRep", 1.0),
+        style_eq("--repInactive", 0.0),
+    ]);
+
+    let cx = dispatch(
+        "--op",
+        vec![(0xAE as f64, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            0xAE as f64,
+            ip_body_multi(
+                vec![branch_a, branch_b],
+                "--ip0",
+                var("--pl"),
+                1,
+            ),
+        )],
+        keep_self("--ip0"),
+    );
+    let ip_wrapped = add(ip_inner, var("--pl"));
+    let di = dispatch(
+        "--op",
+        vec![(
+            0xAE as f64,
+            pointer_body(
+                active_guard,
+                "--di0",
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--di0"),
+    );
+
+    vec![
+        assign("--cx", cx),
+        assign("--ip", ip_wrapped),
+        assign("--di", di),
+    ]
+}
+
+#[test]
+fn scas_shape_recognised_with_one_pointer_and_readonly_class() {
+    let descs = recognise_loops(&cabinet_scas_shape());
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    assert_eq!(d.pointers.len(), 1, "SCAS has just DI");
+    assert_eq!(d.writes.len(), 0);
+    assert!(d.flag_conditioned);
+    assert_eq!(d.bulk_class, BulkClass::ReadOnly);
+}
+
+#[test]
+fn cabinet_a_classifies_stos_as_fill_and_movs_as_copy() {
+    // Cabinet A's STOSB-shape (0xAA) writes a constant from --AL — no
+    // pointer-mirror reads. Should classify as Fill.
+    // Cabinet A's MOVSB-shape (0xA4) writes mem[DS:SI] which the cabinet
+    // exposes as --_strSrcByte. That's NOT a pointer mirror in the
+    // recogniser's view though — the pointer mirrors are --__1DI and
+    // --__1SI (the prior-tick mirrors of DI and SI, used by the pointer
+    // step body). For the classifier to call this Copy, the val_expr
+    // must reference one of those mirror names.
+    //
+    // Real kiln-emitted MOVSB uses --_strSrcByte (a pre-computed
+    // intermediate) rather than reading via SI directly. So the
+    // classifier sees no pointer reference and classifies as Fill. That's
+    // a real result of the pure-shape recogniser — it can't tell that
+    // --_strSrcByte happens to be derived from SI without inspecting how
+    // --_strSrcByte itself is computed elsewhere.
+    //
+    // For cabinets that DO read via the pointer slot directly (e.g. an
+    // emitter without an intermediate), the classification would be
+    // Copy. Phase 3b's runtime applier will use Fill/Copy/PerIter to
+    // pick its memory-routing strategy; for cabinets where the
+    // intermediate hides the dependency, PerIter (per-byte read_mem) is
+    // the correct fallback and a separate optimisation pass over the
+    // intermediate's definition can promote Fill→Copy where applicable.
+    let descs = recognise_loops(&cabinet_a());
+    assert_eq!(descs.len(), 2);
+
+    let stosb = descs.iter().find(|d| d.key_value == 0xAA).unwrap();
+    assert_eq!(
+        stosb.bulk_class,
+        BulkClass::Fill,
+        "STOSB writes constant from --AL, no pointer-mirror reads",
+    );
+
+    let movsb = descs.iter().find(|d| d.key_value == 0xA4).unwrap();
+    // Cabinet A's val_expr is `var("--_strSrcByte")` — not a pointer
+    // mirror. So pure-shape classifier sees Fill here. Document the
+    // result rather than asserting Copy.
+    assert!(
+        matches!(movsb.bulk_class, BulkClass::Fill | BulkClass::Copy),
+        "MOVSB classified as {:?} (Fill is correct for intermediate-via shape)",
+        movsb.bulk_class,
+    );
+}
+
+#[test]
+fn pointer_mirror_in_value_expr_classifies_as_copy() {
+    // Build a STOS-shape cabinet whose write value reads through the
+    // pointer mirror directly (no intermediate). The classifier must
+    // see the dependency and call it Copy.
+    let pred_continue = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = style_eq("--repActive", 0.0);
+
+    let cx = dispatch(
+        "--op",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            ip_body(pred_continue.clone(), "--ip0", var("--pl"), 1),
+        )],
+        keep_self("--ip0"),
+    );
+    let ip_wrapped = add(ip_inner, var("--pl"));
+
+    let di = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--diMirror",
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--diMirror"),
+    );
+
+    let addr = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            iff(
+                active_guard.clone(),
+                lit(-1.0),
+                add(mul(var("--es"), lit(16.0)), var("--diMirror")),
+            ),
+        )],
+        lit(-1.0),
+    );
+    // Crucially: val reads via the pointer mirror directly. The
+    // classifier sees this and calls it Copy.
+    let val = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            // some byte-fetch through the pointer mirror — shape doesn't
+            // matter, just that --diMirror appears in the expr tree.
+            call("--readByte", vec![var("--diMirror")]),
+        )],
+        lit(0.0),
+    );
+
+    let asns = vec![
+        assign("--cx0", cx),
+        assign("--ip0", ip_wrapped),
+        assign("--diReg", di),
+        assign("--addr0", addr),
+        assign("--val0", val),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    assert_eq!(d.writes.len(), 1);
+    assert_eq!(
+        d.bulk_class,
+        BulkClass::Copy,
+        "val reads through --diMirror (a pointer self_property) → Copy",
+    );
+}
+
+#[test]
+fn brainfuck_cmps_shape_classifies_identically_to_x86_cmps_shape() {
+    // The cardinal-rule probe extended to phase 3a: an arbitrary-named
+    // CMPS-shaped cabinet must classify the same as cabinet_cmps_shape.
+    let stay_branch_a = StyleTest::And(vec![
+        style_eq("--moodMeter", 1.0),
+        style_eq("--ladleType", 1.0),
+        style_eq("--frothBit", 1.0),
+    ]);
+    let stay_branch_b = StyleTest::And(vec![
+        style_eq("--moodMeter", 1.0),
+        style_eq("--ladleType", 2.0),
+        style_eq("--frothBit", 0.0),
+    ]);
+    let no_rep = style_eq("--cookbookOpen", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--cookbookOpen", 1.0),
+        style_eq("--ladlePoised", 0.0),
+    ]);
+
+    let cx = dispatch(
+        "--recipeStep",
+        vec![(99.0, counter_body(no_rep.clone(), "--priorTapeUses"))],
+        keep_self("--priorTapeUses"),
+    );
+    let ip_inner = dispatch(
+        "--recipeStep",
+        vec![(
+            99.0,
+            ip_body_multi(
+                vec![stay_branch_a, stay_branch_b],
+                "--priorCursor",
+                var("--introBytes"),
+                1,
+            ),
+        )],
+        keep_self("--priorCursor"),
+    );
+    let ip_wrapped = add(ip_inner, var("--introBytes"));
+
+    let p1 = dispatch(
+        "--recipeStep",
+        vec![(
+            99.0,
+            pointer_body(
+                active_guard.clone(),
+                "--priorWriteHead",
+                1,
+                "--priorMoodFlags",
+                7,
+                "--clampLowBits",
+                "--readBitN",
+            ),
+        )],
+        keep_self("--priorWriteHead"),
+    );
+    let p2 = dispatch(
+        "--recipeStep",
+        vec![(
+            99.0,
+            pointer_body(
+                active_guard,
+                "--priorReadHead",
+                1,
+                "--priorMoodFlags",
+                7,
+                "--clampLowBits",
+                "--readBitN",
+            ),
+        )],
+        keep_self("--priorReadHead"),
+    );
+
+    let asns = vec![
+        assign("--tapeUses", cx),
+        assign("--cursor", ip_wrapped),
+        assign("--writeHead", p1),
+        assign("--readHead", p2),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1);
+    let d = &descs[0];
+    assert!(d.counter.is_some());
+    assert_eq!(d.pointers.len(), 2);
+    assert_eq!(d.writes.len(), 0);
+    assert!(d.flag_conditioned);
+    assert_eq!(d.bulk_class, BulkClass::ReadOnly);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3b Step 1: addr_decomposition.
+// ---------------------------------------------------------------------------
+
+/// Cabinet A's STOS / MOVS write addresses are
+/// `add(mul(--__1ES, 16), --__1DI)` — segment-shifted-then-pointer.
+/// Both descriptors should pick up the same `(segment, pointer)` pair.
+#[test]
+fn cabinet_a_writes_decompose_segment_times_sixteen_plus_pointer() {
+    let descs = recognise_loops(&cabinet_a());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        assert!(!d.writes.is_empty(), "expected at least one write entry: {:?}", d);
+        for w in &d.writes {
+            assert_eq!(
+                w.addr_decomposition.as_ref().map(|(s, p)| (s.as_str(), p.as_str())),
+                Some(("--__1ES", "--__1DI")),
+                "expected decomposition (--__1ES, --__1DI), got {:?}",
+                w.addr_decomposition
+            );
+        }
+    }
+}
+
+/// Cabinet B uses unrelated names but the same structural shape, so
+/// decomposition must succeed and produce that cabinet's seg/ptr pair.
+/// This is the cardinal-rule genericity probe for Step 1.
+#[test]
+fn cabinet_b_writes_decompose_to_brainfuck_names() {
+    let descs = recognise_loops(&cabinet_b());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        for w in &d.writes {
+            assert_eq!(
+                w.addr_decomposition.as_ref().map(|(s, p)| (s.as_str(), p.as_str())),
+                Some(("--priorBagPage", "--priorTapeWriteHead")),
+                "expected decomposition (--priorBagPage, --priorTapeWriteHead), got {:?}",
+                w.addr_decomposition
+            );
+        }
+    }
+}
+
+/// The reversed-orientation form `pointer + (segment * 16)` decomposes
+/// the same way. The matcher accepts either ordering of the outer add.
+#[test]
+fn addr_decomposition_accepts_pointer_plus_segment_times_sixteen() {
+    // Hand-roll a one-opcode dispatch family with the reversed addr
+    // shape, otherwise structurally identical to cabinet_a's stos.
+    let pred_continue = style_eq("--rc", 1.0);
+    let no_rep = style_eq("--hr", 0.0);
+    let active = StyleTest::And(vec![
+        style_eq("--hr", 1.0),
+        style_eq("--ra", 0.0),
+    ]);
+
+    let cx = dispatch("--op", vec![(1.0, counter_body(no_rep, "--c"))], keep_self("--c"));
+    let ip = dispatch(
+        "--op",
+        vec![(1.0, ip_body(pred_continue, "--ip", var("--pl"), 1))],
+        keep_self("--ip"),
+    );
+    let ip_wrapped = add(ip, var("--pl"));
+    let p = dispatch(
+        "--op",
+        vec![(1.0, pointer_body(active.clone(), "--di", 1, "--fl", 10, "--lb", "--bit"))],
+        keep_self("--di"),
+    );
+    // Reversed: pointer first, then (segment * 16).
+    let addr = dispatch(
+        "--op",
+        vec![(
+            1.0,
+            iff(
+                active.clone(),
+                lit(-1.0),
+                add(var("--di"), mul(var("--es"), lit(16.0))),
+            ),
+        )],
+        lit(-1.0),
+    );
+    let val = dispatch("--op", vec![(1.0, var("--al"))], lit(0.0));
+
+    let asns = vec![
+        assign("--c", cx),
+        assign("--ip", ip_wrapped),
+        assign("--di", p),
+        assign("--mAddr", addr),
+        assign("--mVal", val),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected 1 descriptor, got {:?}", descs);
+    let w = &descs[0].writes[0];
+    assert_eq!(
+        w.addr_decomposition.as_ref().map(|(s, p)| (s.as_str(), p.as_str())),
+        Some(("--es", "--di")),
+    );
+}
+
+/// `16 * segment` (multiplication operand order swapped) is also accepted.
+/// The rule is "one operand is the literal 16, the other is a bare var",
+/// not "the var must come first".
+#[test]
+fn addr_decomposition_accepts_sixteen_times_segment() {
+    let pred_continue = style_eq("--rc", 1.0);
+    let no_rep = style_eq("--hr", 0.0);
+    let active = StyleTest::And(vec![
+        style_eq("--hr", 1.0),
+        style_eq("--ra", 0.0),
+    ]);
+
+    let cx = dispatch("--op", vec![(1.0, counter_body(no_rep, "--c"))], keep_self("--c"));
+    let ip = dispatch(
+        "--op",
+        vec![(1.0, ip_body(pred_continue, "--ip", var("--pl"), 1))],
+        keep_self("--ip"),
+    );
+    let ip_wrapped = add(ip, var("--pl"));
+    let p = dispatch(
+        "--op",
+        vec![(1.0, pointer_body(active.clone(), "--di", 1, "--fl", 10, "--lb", "--bit"))],
+        keep_self("--di"),
+    );
+    let addr = dispatch(
+        "--op",
+        vec![(
+            1.0,
+            iff(
+                active.clone(),
+                lit(-1.0),
+                // (16 * --es) + --di
+                add(mul(lit(16.0), var("--es")), var("--di")),
+            ),
+        )],
+        lit(-1.0),
+    );
+    let val = dispatch("--op", vec![(1.0, var("--al"))], lit(0.0));
+
+    let asns = vec![
+        assign("--c", cx),
+        assign("--ip", ip_wrapped),
+        assign("--di", p),
+        assign("--mAddr", addr),
+        assign("--mVal", val),
+    ];
+    let descs = recognise_loops(&asns);
+    let w = &descs[0].writes[0];
+    assert_eq!(
+        w.addr_decomposition.as_ref().map(|(s, p)| (s.as_str(), p.as_str())),
+        Some(("--es", "--di")),
+    );
+}
+
+/// An address whose shape is NOT segment*16 + pointer must yield None.
+/// Here the multiplier is 32 (some other paging granule) — the matcher
+/// is committed to literal 16 (the canonical 8086 page constant; any
+/// non-emulator cabinet using a different page size will need its own
+/// matcher entry, which is fine — that's a structural fact about the
+/// shape, not a name-content read).
+#[test]
+fn addr_decomposition_returns_none_for_non_canonical_shape() {
+    let pred_continue = style_eq("--rc", 1.0);
+    let no_rep = style_eq("--hr", 0.0);
+    let active = StyleTest::And(vec![
+        style_eq("--hr", 1.0),
+        style_eq("--ra", 0.0),
+    ]);
+
+    let cx = dispatch("--op", vec![(1.0, counter_body(no_rep, "--c"))], keep_self("--c"));
+    let ip = dispatch(
+        "--op",
+        vec![(1.0, ip_body(pred_continue, "--ip", var("--pl"), 1))],
+        keep_self("--ip"),
+    );
+    let ip_wrapped = add(ip, var("--pl"));
+    let p = dispatch(
+        "--op",
+        vec![(1.0, pointer_body(active.clone(), "--di", 1, "--fl", 10, "--lb", "--bit"))],
+        keep_self("--di"),
+    );
+    // Multiplier is 32, not 16. Decomposer should return None.
+    let addr = dispatch(
+        "--op",
+        vec![(
+            1.0,
+            iff(
+                active.clone(),
+                lit(-1.0),
+                add(mul(var("--es"), lit(32.0)), var("--di")),
+            ),
+        )],
+        lit(-1.0),
+    );
+    let val = dispatch("--op", vec![(1.0, var("--al"))], lit(0.0));
+
+    let asns = vec![
+        assign("--c", cx),
+        assign("--ip", ip_wrapped),
+        assign("--di", p),
+        assign("--mAddr", addr),
+        assign("--mVal", val),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1);
+    assert!(
+        descs[0].writes[0].addr_decomposition.is_none(),
+        "expected None for multiplier-32 shape, got {:?}",
+        descs[0].writes[0].addr_decomposition
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3b Step 2: indirect-read intermediate recognition.
+//
+// MOVS-style cabinets emit the per-iter source byte as a derived
+// intermediate slot whose dispatch body is a function call keyed on a
+// stepping pointer (`var(--_strSrcByte)` in doom8088, with body
+// `--readMem(calc(var(--_strSrcSeg) + var(--__1SI)))`). The pure-shape
+// classifier in phase 3a couldn't see through the intermediate; step 2
+// traces one level into the assignment list so MOVS reclassifies from
+// Fill to Copy.
+// ---------------------------------------------------------------------------
+
+/// Helper: build a STOS-shape cabinet whose val_expr is a bare
+/// `Var(intermediate)`, with the intermediate's body being a function
+/// call keyed on the loop's pointer mirror. With the indirect-read
+/// recogniser, this should classify as Copy (the "MOVS through derived
+/// intermediate" pattern).
+fn cabinet_with_indirect_read(
+    intermediate_name: &str,
+    intermediate_body: Expr,
+) -> Vec<Assignment> {
+    let pred_continue = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = style_eq("--repActive", 0.0);
+
+    let cx = dispatch(
+        "--op",
+        vec![(0xA4 as f64, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            ip_body(pred_continue.clone(), "--ip0", var("--pl"), 1),
+        )],
+        keep_self("--ip0"),
+    );
+    let ip_wrapped = add(ip_inner, var("--pl"));
+
+    let di = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--diMirror",
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--diMirror"),
+    );
+    let si = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--siMirror",
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--siMirror"),
+    );
+
+    let addr = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            iff(
+                active_guard.clone(),
+                lit(-1.0),
+                add(mul(var("--es"), lit(16.0)), var("--diMirror")),
+            ),
+        )],
+        lit(-1.0),
+    );
+
+    // val_expr is a bare Var to the intermediate slot.
+    let val = dispatch(
+        "--op",
+        vec![(0xA4 as f64, var(intermediate_name))],
+        lit(0.0),
+    );
+
+    vec![
+        assign("--cx0", cx),
+        assign("--ip0", ip_wrapped),
+        assign("--diReg", di),
+        assign("--siReg", si),
+        assign("--addr0", addr),
+        assign("--val0", val),
+        // The intermediate's own dispatch body — a function call keyed
+        // on the SI pointer mirror. This is the structural shape the
+        // step-2 recogniser traces into.
+        assign(intermediate_name, intermediate_body),
+    ]
+}
+
+/// Positive: x86-shaped cabinet, MOVS-style. The intermediate's body is
+/// `--readMem(calc(var(--seg) + var(--siMirror)))`. Step 2 must
+/// recognise the indirect read and classify the loop as Copy.
+#[test]
+fn indirect_read_through_intermediate_classifies_as_copy() {
+    // Body: --readMem(calc(var(--srcSeg) + var(--siMirror)))
+    let body = call(
+        "--readMem",
+        vec![add(var("--srcSeg"), var("--siMirror"))],
+    );
+    let asns = cabinet_with_indirect_read("--strSrcByte", body);
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    assert_eq!(d.writes.len(), 1);
+    let w = &d.writes[0];
+    let ir = w
+        .val_indirect_read
+        .as_ref()
+        .expect("indirect_read should be Some");
+    assert_eq!(ir.intermediate_property, "--strSrcByte");
+    assert_eq!(ir.pointer_property, "--siMirror");
+    assert_eq!(ir.seg_property.as_deref(), Some("--srcSeg"));
+    assert_eq!(
+        d.bulk_class,
+        BulkClass::Copy,
+        "indirect-read through pointer mirror promotes Fill → Copy",
+    );
+}
+
+/// Cardinal-rule probe for step 2: a brainfuck-shaped cabinet using the
+/// same structural shape (function-call keyed on a pointer mirror via a
+/// derived intermediate) must produce the same Copy classification.
+/// Names share nothing with x86 land — only the shape matters.
+#[test]
+fn brainfuck_indirect_read_classifies_identically() {
+    let pred_continue = style_eq("--moodMeter", 1.0);
+    let no_rep = style_eq("--cookbookOpen", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--cookbookOpen", 1.0),
+        style_eq("--ladlePoised", 0.0),
+    ]);
+
+    let cx = dispatch(
+        "--recipeStep",
+        vec![(80.0, counter_body(no_rep.clone(), "--priorTapeUses"))],
+        keep_self("--priorTapeUses"),
+    );
+    let cursor_inner = dispatch(
+        "--recipeStep",
+        vec![(
+            80.0,
+            ip_body(pred_continue.clone(), "--priorCursor", var("--introBytes"), 1),
+        )],
+        keep_self("--priorCursor"),
+    );
+    let cursor_wrapped = add(cursor_inner, var("--introBytes"));
+
+    // Two pointers with brainfuck-shaped names.
+    let twh = dispatch(
+        "--recipeStep",
+        vec![(
+            80.0,
+            pointer_body(
+                active_guard.clone(),
+                "--priorTapeWriteHead",
+                1,
+                "--priorMoodFlags",
+                7,
+                "--clampLowBits",
+                "--readBitN",
+            ),
+        )],
+        keep_self("--priorTapeWriteHead"),
+    );
+    let trh = dispatch(
+        "--recipeStep",
+        vec![(
+            80.0,
+            pointer_body(
+                active_guard.clone(),
+                "--priorTapeReadHead",
+                1,
+                "--priorMoodFlags",
+                7,
+                "--clampLowBits",
+                "--readBitN",
+            ),
+        )],
+        keep_self("--priorTapeReadHead"),
+    );
+
+    let bag_addr = dispatch(
+        "--recipeStep",
+        vec![(
+            80.0,
+            iff(
+                active_guard.clone(),
+                lit(-1.0),
+                add(
+                    mul(var("--priorBagPage"), lit(16.0)),
+                    var("--priorTapeWriteHead"),
+                ),
+            ),
+        )],
+        lit(-1.0),
+    );
+    // val reads through an intermediate that itself reads via the
+    // tapeReadHead pointer mirror. Same structural shape as cabinet A's
+    // `--_strSrcByte`, but every name is brainfuck-flavoured.
+    let bag_val = dispatch(
+        "--recipeStep",
+        vec![(80.0, var("--mirrorSourceByte"))],
+        lit(0.0),
+    );
+    // The intermediate's own body — function call keyed on the read
+    // head pointer mirror.
+    let mirror_body = call(
+        "--peekByteAt",
+        vec![add(var("--bagSourceSeg"), var("--priorTapeReadHead"))],
+    );
+
+    let asns = vec![
+        assign("--tapeUses", cx),
+        assign("--cursor", cursor_wrapped),
+        assign("--tapeWriteHead", twh),
+        assign("--tapeReadHead", trh),
+        assign("--bagAddr0", bag_addr),
+        assign("--bagVal0", bag_val),
+        assign("--mirrorSourceByte", mirror_body),
+    ];
+
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    assert_eq!(d.writes.len(), 1);
+    let w = &d.writes[0];
+    let ir = w
+        .val_indirect_read
+        .as_ref()
+        .expect("brainfuck cabinet must also recognise indirect read");
+    assert_eq!(ir.intermediate_property, "--mirrorSourceByte");
+    assert_eq!(ir.pointer_property, "--priorTapeReadHead");
+    assert_eq!(ir.seg_property.as_deref(), Some("--bagSourceSeg"));
+    assert_eq!(
+        d.bulk_class,
+        BulkClass::Copy,
+        "brainfuck cabinet with same shape must classify identically",
+    );
+}
+
+/// Negative: val_expr's intermediate body is NOT a function call — just
+/// a bare Var or a plain literal. Step 2 must not promote this; the
+/// classifier stays at Fill.
+#[test]
+fn intermediate_without_function_call_stays_fill() {
+    // Body is a bare Var, not a function call. Even though it
+    // references the pointer mirror, the recogniser requires the
+    // FunctionCall shape (the canonical "this is a read primitive"
+    // marker). Anything else might be a derived constant or a
+    // pointer-mirror passthrough — promotion is unsafe without the
+    // call-shape signal.
+    let body = var("--siMirror");
+    let asns = cabinet_with_indirect_read("--strSrcByte", body);
+    let descs = recognise_loops(&asns);
+    let w = &descs[0].writes[0];
+    assert!(
+        w.val_indirect_read.is_none(),
+        "non-call-shape body must not produce indirect_read, got {:?}",
+        w.val_indirect_read,
+    );
+    assert_eq!(
+        descs[0].bulk_class,
+        BulkClass::Fill,
+        "without indirect-read recognition, classifier stays Fill",
+    );
+}
+
+/// Negative: the intermediate's body is a function call but its args
+/// don't reference any of the loop's pointer mirrors. The recogniser
+/// must reject this — the read isn't keyed on the stepping pointer, so
+/// it doesn't represent a per-iter source byte.
+#[test]
+fn function_call_without_pointer_mirror_reference_stays_fill() {
+    // Body: --readMem(calc(var(--someConst) + var(--otherConst))) —
+    // function call with no pointer-mirror reference.
+    let body = call(
+        "--readMem",
+        vec![add(var("--someConst"), var("--otherConst"))],
+    );
+    let asns = cabinet_with_indirect_read("--strSrcByte", body);
+    let descs = recognise_loops(&asns);
+    let w = &descs[0].writes[0];
+    assert!(
+        w.val_indirect_read.is_none(),
+        "no pointer mirror in args → no indirect_read, got {:?}",
+        w.val_indirect_read,
+    );
+    assert_eq!(descs[0].bulk_class, BulkClass::Fill);
+}
+
+/// Negative: the intermediate name doesn't resolve to any top-level
+/// assignment in the cabinet. The recogniser cannot trace through it
+/// and must leave the classification unchanged. This matches the
+/// existing `cabinet_a` shape (which references `--_strSrcByte` but
+/// doesn't define it locally) — the existing test that asserts
+/// `Fill | Copy` still holds.
+#[test]
+fn unresolved_intermediate_name_leaves_classification_unchanged() {
+    // Build a cabinet whose val references an intermediate, but DON'T
+    // include the intermediate in the assignment list.
+    let pred_continue = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = style_eq("--repActive", 0.0);
+
+    let cx = dispatch(
+        "--op",
+        vec![(0xA4 as f64, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            ip_body(pred_continue.clone(), "--ip0", var("--pl"), 1),
+        )],
+        keep_self("--ip0"),
+    );
+    let ip_wrapped = add(ip_inner, var("--pl"));
+    let di = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--diMirror",
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--diMirror"),
+    );
+    let addr = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            iff(
+                active_guard.clone(),
+                lit(-1.0),
+                add(mul(var("--es"), lit(16.0)), var("--diMirror")),
+            ),
+        )],
+        lit(-1.0),
+    );
+    let val = dispatch(
+        "--op",
+        // References --notDefinedAnywhere — no assignment for it.
+        vec![(0xA4 as f64, var("--notDefinedAnywhere"))],
+        lit(0.0),
+    );
+
+    let asns = vec![
+        assign("--cx0", cx),
+        assign("--ip0", ip_wrapped),
+        assign("--diReg", di),
+        assign("--addr0", addr),
+        assign("--val0", val),
+    ];
+    let descs = recognise_loops(&asns);
+    let w = &descs[0].writes[0];
+    assert!(
+        w.val_indirect_read.is_none(),
+        "unresolved intermediate must yield None, got {:?}",
+        w.val_indirect_read,
+    );
+    assert_eq!(
+        descs[0].bulk_class,
+        BulkClass::Fill,
+        "unresolved intermediate stays at Fill",
+    );
+}
+
+/// Indirect read where the call argument is a complex expression that
+/// doesn't decompose as `var(base) + var(ptr)` or `var(seg)*16 +
+/// var(ptr)` — only the pointer reference is found, not a clean base
+/// slot. The recogniser still captures the indirect read (so Copy
+/// classification fires) but with `seg_property: None`. The runtime
+/// applier later evaluates the full arg expression rather than relying
+/// on a pre-resolved base slot.
+#[test]
+fn indirect_read_without_clean_seg_decomposition_still_promotes_to_copy() {
+    // Body: --readMem(calc(var(--baseSeg) * var(--scale) + var(--siMirror)))
+    // The arg has the pointer mirror in it, but the base side multiplies
+    // two Vars — not the ×16-literal shape — so decomposition can't
+    // simplify it.
+    let body = call(
+        "--readMem",
+        vec![add(
+            mul(var("--baseSeg"), var("--scale")),
+            var("--siMirror"),
+        )],
+    );
+    let asns = cabinet_with_indirect_read("--strSrcByte", body);
+    let descs = recognise_loops(&asns);
+    let w = &descs[0].writes[0];
+    let ir = w
+        .val_indirect_read
+        .as_ref()
+        .expect("pointer mirror present → indirect_read should be Some");
+    assert_eq!(ir.pointer_property, "--siMirror");
+    assert!(
+        ir.seg_property.is_none(),
+        "undecomposable base expression → seg_property is None, got {:?}",
+        ir.seg_property,
+    );
+    assert_eq!(
+        descs[0].bulk_class,
+        BulkClass::Copy,
+        "Copy promotion fires on pointer-mirror reference alone",
+    );
+}
+
+/// The two clean base shapes and their scaling capture:
+/// `var(seg)*16 + var(ptr)` → `seg_times_sixteen=true` (applier scales);
+/// `var(base) + var(ptr) + K` → `seg_times_sixteen=false` (the slot
+/// already holds the full addend — kiln's seg-override-aware
+/// `--_strSrcSeg` shape) with the literal byte offset peeled.
+#[test]
+fn indirect_read_captures_base_scaling_from_shape() {
+    let scaled = call(
+        "--readMem",
+        vec![add(mul(var("--baseSeg"), lit(16.0)), var("--siMirror"))],
+    );
+    let descs = recognise_loops(&cabinet_with_indirect_read("--strSrcByte", scaled));
+    let ir = descs[0].writes[0].val_indirect_read.as_ref().unwrap();
+    assert_eq!(ir.seg_property.as_deref(), Some("--baseSeg"));
+    assert!(ir.seg_times_sixteen, "×16 in the shape must set the scaling flag");
+
+    // The real kiln high-byte shape: flat base + ptr + literal offset.
+    let flat_offset = call(
+        "--readMem",
+        vec![add(
+            add(var("--srcBase"), var("--siMirror")),
+            lit(1.0),
+        )],
+    );
+    let descs2 = recognise_loops(&cabinet_with_indirect_read("--strSrcByte", flat_offset));
+    let ir2 = descs2[0].writes[0].val_indirect_read.as_ref().unwrap();
+    assert_eq!(
+        ir2.seg_property.as_deref(),
+        Some("--srcBase"),
+        "flat base must be captured through the peeled literal offset",
+    );
+    assert!(
+        !ir2.seg_times_sixteen,
+        "no ×16 in the shape → the slot holds the full addend",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// per_iter_cycles — structural extraction from a "self + literal" dispatch
+// family member.
+//
+// The cardinal-rule probe is split across three tests:
+//
+//   1. `per_iter_cycles_extracted_from_self_add_literal_dispatch` — the
+//      vanilla x86-shaped cabinet has a per-opcode `var(self) + K` dispatch
+//      family member, and the recogniser extracts K for each opcode's
+//      descriptor.
+//
+//   2. `per_iter_cycles_brainfuck_shape_extracts_same_way` — a structurally
+//      identical cabinet with completely different slot names (no shared
+//      naming convention with x86) yields the same extraction outcome on the
+//      same shape. Recogniser is name-blind.
+//
+//   3. `per_iter_cycles_none_when_no_self_add_literal_family_member` — a
+//      cabinet that has no member with the `var(X) + Literal(K)`-per-key
+//      shape returns `None`. The applier will then refuse to fast-forward
+//      and the dispatcher panics rather than charging a fabricated cost.
+// ---------------------------------------------------------------------------
+
+/// Like `cabinet_a` but with one additional family member: a slot named
+/// `cycle_slot` whose per-opcode body is `calc(var(cycle_mirror) +
+/// K_opcode)`. This is structurally what kiln emits for the `cycleCount`
+/// dispatch in the doom8088 cabinet (one of the 94 opcode entries in
+/// `kiln/cycle-counts.mjs`).
+/// Expected `per_iter_cycles` value: the cycle slot's own name + K.
+fn charge(property: &str, per_iter: i32) -> Option<CycleCharge> {
+    Some(CycleCharge { property: property.to_string(), per_iter })
+}
+
+fn cabinet_a_with_cycle_dispatch(
+    cycle_slot: &str,
+    cycle_mirror: &str,
+    k_aa: i32,
+    k_a4: i32,
+) -> Vec<Assignment> {
+    let mut asns = cabinet_a();
+    let cycle_dispatch = dispatch(
+        "--opcode",
+        vec![
+            (0xAA as f64, add(var(cycle_mirror), lit(k_aa as f64))),
+            (0xA4 as f64, add(var(cycle_mirror), lit(k_a4 as f64))),
+        ],
+        var(cycle_mirror),
+    );
+    asns.push(assign(cycle_slot, cycle_dispatch));
+    asns
+}
+
+#[test]
+fn per_iter_cycles_extracted_from_self_add_literal_dispatch() {
+    // x86-shaped cabinet: STOSB (0xAA) costs 10 cycles, MOVSB (0xA4)
+    // costs 17 cycles. The recogniser sees the cycle dispatch as a
+    // family member whose body for each opcode is
+    // `calc(var(--__1cycleCount) + K)` and extracts K.
+    let asns = cabinet_a_with_cycle_dispatch("--cycleCount", "--__1cycleCount", 10, 17);
+    let descs = recognise_loops(&asns);
+    let stos = descs
+        .iter()
+        .find(|d| d.key_value == 0xAA)
+        .expect("STOSB descriptor");
+    let movs = descs
+        .iter()
+        .find(|d| d.key_value == 0xA4)
+        .expect("MOVSB descriptor");
+    assert_eq!(stos.per_iter_cycles, charge("--cycleCount", 10));
+    assert_eq!(movs.per_iter_cycles, charge("--cycleCount", 17));
+}
+
+#[test]
+fn per_iter_cycles_renaming_is_blind() {
+    // Same cabinet shape, completely different cycle slot name. The
+    // recogniser does not inspect characters of the slot name; renaming
+    // does not affect extraction — and the captured property follows
+    // the rename, so the applier commits to the cabinet's own slot.
+    let asns = cabinet_a_with_cycle_dispatch("--zorch", "--__zorchPrev", 10, 17);
+    let descs = recognise_loops(&asns);
+    let stos = descs.iter().find(|d| d.key_value == 0xAA).unwrap();
+    let movs = descs.iter().find(|d| d.key_value == 0xA4).unwrap();
+    assert_eq!(stos.per_iter_cycles, charge("--zorch", 10));
+    assert_eq!(movs.per_iter_cycles, charge("--zorch", 17));
+}
+
+#[test]
+fn per_iter_cycles_brainfuck_shape_extracts_same_way() {
+    // Construct a brainfuck-shaped cabinet structurally equivalent to
+    // cabinet A. Different opcode key values (70, 80 instead of 0xAA,
+    // 0xA4). Different per-key cycle costs (3, 7) — these are *the
+    // cabinet's* per-opcode literals, not x86 ones. The recogniser
+    // produces the cabinet's own K values via the same structural rule.
+    let mut asns = cabinet_b();
+    let cycle_dispatch = dispatch(
+        "--recipeStep",
+        vec![
+            (70.0, add(var("--priorWhiskCount"), lit(3.0))),
+            (80.0, add(var("--priorWhiskCount"), lit(7.0))),
+        ],
+        var("--priorWhiskCount"),
+    );
+    asns.push(assign("--whiskCount", cycle_dispatch));
+    let descs = recognise_loops(&asns);
+    let fill = descs
+        .iter()
+        .find(|d| d.key_value == 70)
+        .expect("brainfuck fill-shape descriptor");
+    let copy = descs
+        .iter()
+        .find(|d| d.key_value == 80)
+        .expect("brainfuck copy-shape descriptor");
+    assert_eq!(
+        fill.per_iter_cycles,
+        charge("--whiskCount", 3),
+        "brainfuck cabinet's K is extracted just like x86's K",
+    );
+    assert_eq!(copy.per_iter_cycles, charge("--whiskCount", 7));
+}
+
+#[test]
+fn per_iter_cycles_none_when_no_self_add_literal_family_member() {
+    // Cabinet A as-is has no cycleCount-style family member: the only
+    // dispatch family members are counter, IP, pointer, memwrite address,
+    // and memwrite value. None of those have `var(X) + Literal(K)` shape
+    // per opcode (counter is `max(0, self - 1)`, pointer involves a
+    // function call, etc.). per_iter_cycles must be None — the applier
+    // will then refuse to fast-forward.
+    let descs = recognise_loops(&cabinet_a());
+    for d in &descs {
+        assert!(
+            d.per_iter_cycles.is_none(),
+            "cabinet without a self+lit dispatch member should yield None, \
+             got Some({:?}) for opcode {:#x}",
+            d.per_iter_cycles,
+            d.key_value,
+        );
+    }
+}
+
+#[test]
+fn per_iter_cycles_picks_most_populated_self_add_literal_family_member() {
+    // Two candidate family members exist for "self+literal" extraction.
+    // The one with more participating opcode keys wins. This is the
+    // structural rule's tiebreaker: the cycle counter is the slot whose
+    // dispatch covers the most opcodes with the self-add-literal shape.
+    let mut asns = cabinet_a();
+
+    // First candidate: only covers ONE opcode (0xAA → +99). Insufficient.
+    let small_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, add(var("--smallPrev"), lit(99.0)))],
+        var("--smallPrev"),
+    );
+    asns.push(assign("--smallSlot", small_dispatch));
+
+    // Second candidate: covers BOTH opcodes (0xAA → +10, 0xA4 → +17).
+    // This is the most-populated; the recogniser picks it.
+    let big_dispatch = dispatch(
+        "--opcode",
+        vec![
+            (0xAA as f64, add(var("--bigPrev"), lit(10.0))),
+            (0xA4 as f64, add(var("--bigPrev"), lit(17.0))),
+        ],
+        var("--bigPrev"),
+    );
+    asns.push(assign("--bigSlot", big_dispatch));
+
+    let descs = recognise_loops(&asns);
+    let stos = descs.iter().find(|d| d.key_value == 0xAA).unwrap();
+    assert_eq!(
+        stos.per_iter_cycles,
+        charge("--bigSlot", 10),
+        "the most-populated self+lit member wins; we should pick K=10 \
+         from --bigSlot, not K=99 from --smallSlot",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ip_extra_advance_slot — structural capture of the stay branch's
+// subtrahend in the per-key IP body (`if(<pred>: calc(self − var(extra));
+// else: calc(self + L))`). In CSS-DOS today the slot is `--prefixLen`,
+// but the recogniser captures whatever name the cabinet uses.
+//
+// The fixed-point rule (see `LoopDescriptor::ip_extra_advance_slot`):
+// on a stay tick the IP slot's new value equals its old value, so any
+// outer wrapper addend cancels and the exit branch's value is
+// `IP + extra + L`. The subtrahend — NOT a top-level `Add` wrapper —
+// is the structurally-correct capture. An earlier model captured the
+// wrapper addend instead; that was wrong (only accidentally right when
+// the two slots coincide) and real cabinets put the wrapper inside a
+// TF/IRQ StyleCondition where the old matcher never even found it.
+//
+// Tests:
+//   1. `ip_extra_advance_slot_captured_for_cabinet_a` — x86-shaped
+//      cabinet's stay branch is `calc(self − var(--prefixLen))`; the
+//      recogniser captures `--prefixLen`.
+//   2. `ip_extra_advance_slot_captured_for_cabinet_b` — the brainfuck
+//      cabinet uses a completely different slot name (`--introBytes`).
+//      The recogniser captures *that* name, proving the rule is shape-
+//      driven, not content-driven.
+//   3. `ip_extra_advance_slot_arbitrary_name` — a synthetic cabinet
+//      where we plug in a fully arbitrary opaque slot name to confirm
+//      the recogniser doesn't care what the string contains.
+//   4. `ip_extra_advance_slot_none_when_subtrahend_is_literal` — a
+//      cabinet whose stay branch subtracts a literal yields None (the
+//      structural shape requires a bare-Var subtrahend), regardless of
+//      whether an outer add wrapper exists.
+//   5. `ip_extra_advance_slot_real_kiln_shape` — the REAL cabinet
+//      shape, verified against cga4-stripes.css 2026-06-09: the IP
+//      assignment is a TF/IRQ-style StyleCondition whose else branch
+//      is `calc(<dispatch> + var(--prefixLen))`, and the per-key body
+//      is the `_repContinue`-gated subtraction. The recogniser must
+//      capture `--prefixLen` from the subtrahend.
+//   6. `ip_extra_advance_slot_reads_subtrahend_not_wrapper` — wrapper
+//      addend and stay subtrahend are DIFFERENT slots; the recogniser
+//      must capture the subtrahend (the fixed-point-correct one).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ip_extra_advance_slot_captured_for_cabinet_a() {
+    let descs = recognise_loops(&cabinet_a());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        assert_eq!(
+            d.ip_extra_advance_slot.as_deref(),
+            Some("--prefixLen"),
+            "cabinet A's IP slot wraps the dispatch in calc(... + var(--prefixLen))",
+        );
+    }
+}
+
+#[test]
+fn ip_extra_advance_slot_captured_for_cabinet_b() {
+    // Cabinet B uses `--introBytes` as its analog of `--prefixLen`.
+    let descs = recognise_loops(&cabinet_b());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        assert_eq!(
+            d.ip_extra_advance_slot.as_deref(),
+            Some("--introBytes"),
+            "cabinet B's IP slot wraps the dispatch in calc(... + var(--introBytes))",
+        );
+    }
+}
+
+/// Build a minimal x86-style cabinet whose IP outer wrapper var-addend
+/// is `extra_slot`. Reuses the `ip_body` / `counter_body` / `pointer_body`
+/// helpers from above. The only "interesting" knob is `extra_slot`.
+fn cabinet_with_named_ip_extra(extra_slot: &str) -> Vec<Assignment> {
+    let pred_continue = style_eq("--_repContinue", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--__1CX"))],
+        keep_self("--__1CX"),
+    );
+    let ip_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            ip_body(pred_continue.clone(), "--__1IP", var(extra_slot), 1),
+        )],
+        keep_self("--__1IP"),
+    );
+    let ip_wrapped = add(ip_dispatch, var(extra_slot));
+    let di_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--__1DI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1DI"),
+    );
+
+    vec![
+        assign("--CX", cx_dispatch),
+        assign("--IP", ip_wrapped),
+        assign("--DI", di_dispatch),
+    ]
+}
+
+#[test]
+fn ip_extra_advance_slot_arbitrary_name() {
+    // A genericity probe: the recogniser captures whatever opaque slot
+    // name the cabinet emits, with no character inspection. We use a
+    // slot name shared with no x86 convention.
+    let descs = recognise_loops(&cabinet_with_named_ip_extra("--zorch"));
+    assert_eq!(descs.len(), 1);
+    assert_eq!(descs[0].ip_extra_advance_slot.as_deref(), Some("--zorch"));
+
+    // Sanity: a different opaque name produces a different captured
+    // name. Same shape, different cabinet vocabulary, no recogniser
+    // change.
+    let descs2 = recognise_loops(&cabinet_with_named_ip_extra("--whatever-this-is"));
+    assert_eq!(descs2.len(), 1);
+    assert_eq!(
+        descs2[0].ip_extra_advance_slot.as_deref(),
+        Some("--whatever-this-is"),
+    );
+}
+
+/// Build a minimal cabinet whose IP per-key stay branch subtracts
+/// `subtrahend`, optionally wrapping the dispatch as
+/// `calc(<dispatch> + wrapper_addend)`. Used by the subtrahend-rule
+/// tests below.
+fn cabinet_with_ip_subtrahend(subtrahend: Expr, wrapper_addend: Option<Expr>) -> Vec<Assignment> {
+    let pred_continue = style_eq("--_repContinue", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--__1CX"))],
+        keep_self("--__1CX"),
+    );
+    let ip_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            ip_body(pred_continue.clone(), "--__1IP", subtrahend, 1),
+        )],
+        keep_self("--__1IP"),
+    );
+    let ip_value = match wrapper_addend {
+        Some(w) => add(ip_dispatch, w),
+        None => ip_dispatch,
+    };
+    let di_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--__1DI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1DI"),
+    );
+
+    vec![
+        assign("--CX", cx_dispatch),
+        assign("--IP", ip_value),
+        assign("--DI", di_dispatch),
+    ]
+}
+
+#[test]
+fn ip_extra_advance_slot_none_when_subtrahend_is_literal() {
+    // A stay branch that subtracts a literal (`calc(self - 0)`) has no
+    // extra-advance slot to capture — None, with or without an outer
+    // add wrapper. The applier reports Unsupported rather than
+    // guessing an advance it can't derive.
+    let descs = recognise_loops(&cabinet_with_ip_subtrahend(lit(0.0), None));
+    assert_eq!(descs.len(), 1);
+    assert!(
+        descs[0].ip_extra_advance_slot.is_none(),
+        "literal subtrahend must yield None, got {:?}",
+        descs[0].ip_extra_advance_slot,
+    );
+
+    let descs2 =
+        recognise_loops(&cabinet_with_ip_subtrahend(lit(0.0), Some(var("--prefixLen"))));
+    assert_eq!(descs2.len(), 1);
+    assert!(
+        descs2[0].ip_extra_advance_slot.is_none(),
+        "the outer wrapper addend must NOT be captured (it cancels on the \
+         stay fixed point); literal subtrahend means None, got {:?}",
+        descs2[0].ip_extra_advance_slot,
+    );
+}
+
+#[test]
+fn ip_extra_advance_slot_real_kiln_shape() {
+    // The REAL cabinet shape (verified against cga4-stripes.css,
+    // 2026-06-09): the IP assignment is an outer StyleCondition (the
+    // cabinet's TF/IRQ override plumbing) whose fallback is
+    // `calc(<dispatch> + var(--prefixLen))`, and the per-key body for
+    // the string op is the `_repContinue`-gated subtraction:
+    //
+    //   --IP: if(style(--_tf: 1): var(--_tfIP);
+    //            style(--_irqActive: 1): var(--_irqIP);
+    //            else: calc(if(
+    //              style(--opcode: 170): if(style(--_repContinue: 1):
+    //                  calc(var(--__1IP) - var(--prefixLen));
+    //                  else: calc(var(--__1IP) + 1));
+    //              ...
+    //              else: var(--__1IP)) + var(--prefixLen)))
+    //
+    // The earlier top-level-Add model returned None on this shape
+    // (the Add is nested inside the StyleCondition fallback) — that
+    // was the exact recogniser gap that made 6/7 smoke carts panic
+    // with "ip_extra_advance_slot not captured".
+    let pred_continue = style_eq("--_repContinue", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--__1CX"))],
+        keep_self("--__1CX"),
+    );
+    let ip_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            ip_body(pred_continue.clone(), "--__1IP", var("--prefixLen"), 1),
+        )],
+        keep_self("--__1IP"),
+    );
+    // The TF/IRQ-style outer wrapper, with the dispatch+addend in the
+    // fallback — exactly where kiln puts it.
+    let ip_value = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--_tf", 1.0),
+                then: var("--_tfIP"),
+            },
+            StyleBranch {
+                condition: style_eq("--_irqActive", 1.0),
+                then: var("--_irqIP"),
+            },
+        ],
+        fallback: Box::new(add(ip_dispatch, var("--prefixLen"))),
+    };
+    let di_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--__1DI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1DI"),
+    );
+
+    let asns = vec![
+        assign("--CX", cx_dispatch),
+        assign("--IP", ip_value),
+        assign("--DI", di_dispatch),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "real kiln IP shape must still recognise: {:?}", descs);
+    assert_eq!(
+        descs[0].ip_extra_advance_slot.as_deref(),
+        Some("--prefixLen"),
+        "the stay subtrahend must be captured through the TF/IRQ wrapper",
+    );
+    assert_eq!(descs[0].ip_advance_literal, 1);
+    assert!(
+        descs[0].precondition.is_some(),
+        "the TF/IRQ wrapper must still be captured as a precondition",
+    );
+}
+
+#[test]
+fn predicate_means_stay_true_for_then_stay_orientation() {
+    // Kiln's shape: the stay body is the branch `then` (predicate true →
+    // loop continues). The recogniser must record that polarity.
+    let descs = recognise_loops(&cabinet_a());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        assert!(
+            d.predicate_means_stay,
+            "stay body in `then` must capture predicate_means_stay=true",
+        );
+    }
+}
+
+#[test]
+fn predicate_means_stay_false_for_inverted_orientation() {
+    // An emitter that inverts the shape — advance in `then`, stay in the
+    // fallback — must produce predicate_means_stay=false, so the runtime
+    // gate knows predicate-true means "the loop exited".
+    let no_rep = style_eq("--hasREP", 0.0);
+    let pred_done = style_eq("--loopDone", 1.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--_repActive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--__1CX"))],
+        keep_self("--__1CX"),
+    );
+    // Inverted IP body: advance on `then`, stay in the fallback.
+    let ip_body_inverted = iff(
+        pred_done.clone(),
+        add(var("--__1IP"), lit(1.0)),
+        sub(var("--__1IP"), var("--prefixLen")),
+    );
+    let ip_dispatch = dispatch(
+        "--opcode",
+        vec![(0xAA as f64, ip_body_inverted)],
+        keep_self("--__1IP"),
+    );
+    let di_dispatch = dispatch(
+        "--opcode",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--__1DI",
+                1,
+                "--__1flags",
+                10,
+                "--lowerBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--__1DI"),
+    );
+
+    let asns = vec![
+        assign("--CX", cx_dispatch),
+        assign("--IP", ip_dispatch),
+        assign("--DI", di_dispatch),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1);
+    assert!(
+        !descs[0].predicate_means_stay,
+        "stay body in the fallback must capture predicate_means_stay=false",
+    );
+    assert_eq!(
+        descs[0].ip_extra_advance_slot.as_deref(),
+        Some("--prefixLen"),
+        "subtrahend capture must work in the inverted orientation too",
+    );
+}
+
+#[test]
+fn ip_extra_advance_slot_reads_subtrahend_not_wrapper() {
+    // Wrapper addend and stay subtrahend are DIFFERENT slots. The
+    // fixed-point algebra says the wrapper cancels and the subtrahend
+    // is the true extra advance — the recogniser must capture the
+    // subtrahend, not the wrapper.
+    let descs = recognise_loops(&cabinet_with_ip_subtrahend(
+        var("--trueExtra"),
+        Some(var("--redHerring")),
+    ));
+    assert_eq!(descs.len(), 1);
+    assert_eq!(
+        descs[0].ip_extra_advance_slot.as_deref(),
+        Some("--trueExtra"),
+        "must capture the stay subtrahend, not the wrapper addend",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 wart 3: ComparisonShape structural capture.
+// ---------------------------------------------------------------------------
+//
+// CMPS/SCAS comparison metadata moved off literal-name reads in the applier
+// onto a `comparison_shape: Option<ComparisonShape>` field on the descriptor.
+// The recogniser identifies the comparison member by finding a family member
+// whose per-key body for this opcode has shape `Calc(Sub(a, b))` (or a
+// `FunctionCall(_, [a, b])` with the same dependency shape), where the
+// operands trace through pointer mirrors / intermediate slots.
+
+/// Build a CMPSB-shape cabinet that includes a `--_cmpDiff`-style
+/// comparison dispatch. The comparison member's body for the rep opcode
+/// is `calc(var(srcByte) - var(dstByte))` where `srcByte` / `dstByte`
+/// are intermediate slots that read memory through DS:SI / ES:DI.
+fn cabinet_cmps_shape_with_comparison(
+    ip_prop: &str,
+    op_key: f64,
+    si_mirror: &str,
+    di_mirror: &str,
+    ds_seg: &str,
+    es_seg: &str,
+    src_byte: &str,
+    dst_byte: &str,
+    cmp_diff: &str,
+    rep_type: &str,
+    zf_bit: &str,
+    flags_slot: &str,
+) -> Vec<Assignment> {
+    let branch_a = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq(rep_type, 1.0),
+        style_eq(zf_bit, 1.0),
+    ]);
+    let branch_b = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq(rep_type, 2.0),
+        style_eq(zf_bit, 0.0),
+    ]);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasRep", 1.0),
+        style_eq("--repInactive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--op",
+        vec![(op_key, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            op_key,
+            ip_body_multi(
+                vec![branch_a.clone(), branch_b.clone()],
+                ip_prop,
+                var("--pl"),
+                1,
+            ),
+        )],
+        keep_self(ip_prop),
+    );
+    let ip_wrapped = add(ip_inner, var("--pl"));
+    let di_dispatch = dispatch(
+        "--op",
+        vec![(
+            op_key,
+            pointer_body(
+                active_guard.clone(),
+                di_mirror,
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self(di_mirror),
+    );
+    let si_dispatch = dispatch(
+        "--op",
+        vec![(
+            op_key,
+            pointer_body(
+                active_guard.clone(),
+                si_mirror,
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self(si_mirror),
+    );
+
+    // The comparison member: `calc(var(src_byte) - var(dst_byte))` for
+    // this opcode key. Other opcode keys land in the fallback (constant).
+    let cmp_diff_dispatch = dispatch(
+        "--op",
+        vec![(op_key, sub(var(src_byte), var(dst_byte)))],
+        lit(1.0),
+    );
+
+    // Intermediate byte reads — these are NOT part of the dispatch
+    // family. The cabinet emits them as top-level assignments whose
+    // bodies are function calls that read memory through SI / DI.
+    let src_byte_body = call("--readMem", vec![add(mul(var(ds_seg), lit(16.0)), var(si_mirror))]);
+    let dst_byte_body = call("--readMem", vec![add(mul(var(es_seg), lit(16.0)), var(di_mirror))]);
+
+    // Flags slot: also part of the dispatch family (keyed on --op).
+    // For this opcode key, its body depends on `cmp_diff` (so the
+    // rep_type-vs-zf-bit identification can distinguish them).
+    let flags_dispatch = dispatch(
+        "--op",
+        vec![(op_key, var(cmp_diff))],
+        keep_self("--flags0"),
+    );
+
+    // zf_bit slot — top-level assignment that depends on `--flags`
+    // (and transitively on `cmp_diff` via the flags slot). The
+    // discriminator-identification rule uses this dependency to peel
+    // it away from the rep_type slot.
+    let zf_body = call("--bit", vec![var(flags_slot), lit(6.0)]);
+
+    // rep_type slot — top-level assignment whose body does NOT depend
+    // on the comparison output. A simple style-condition or a leaf var.
+    let rep_type_body = call("--readByte", vec![lit(0.0)]);
+
+    vec![
+        assign("--cx", cx_dispatch),
+        assign("--ip", ip_wrapped),
+        assign("--di", di_dispatch),
+        assign("--si", si_dispatch),
+        assign(cmp_diff, cmp_diff_dispatch),
+        assign(flags_slot, flags_dispatch),
+        assign(src_byte, src_byte_body),
+        assign(dst_byte, dst_byte_body),
+        assign(zf_bit, zf_body),
+        assign(rep_type, rep_type_body),
+    ]
+}
+
+#[test]
+fn comparison_shape_extracted_for_cmps_with_two_pointers() {
+    let asns = cabinet_cmps_shape_with_comparison(
+        "--ip0",
+        0xA6 as f64,
+        "--si0",
+        "--di0",
+        "--ds",
+        "--es",
+        "--srcByte",
+        "--dstByte",
+        "--cmpDiff",
+        "--repType",
+        "--zfBit",
+        "--flags",
+    );
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    let cmp = d
+        .comparison_shape
+        .as_ref()
+        .expect("comparison shape captured for CMPS");
+    assert_eq!(cmp.width, 1, "byte-step pointer → width 1");
+    // Pointer alphabetic sort: --di0 < --si0, so dst = di0, src = si0.
+    assert_eq!(cmp.dst_ptr_property, "--di0");
+    assert_eq!(cmp.dst_seg_property, "--es");
+    match &cmp.source {
+        ComparisonSource::Pointer { seg_property, ptr_property, .. } => {
+            assert_eq!(ptr_property, "--si0");
+            assert_eq!(seg_property, "--ds");
+        }
+        other => panic!("expected ComparisonSource::Pointer, got {:?}", other),
+    }
+}
+
+#[test]
+fn comparison_shape_renaming_blind() {
+    // Identical structural cabinet, every slot renamed. The recogniser
+    // must produce a comparison shape using the new names — no character
+    // inspection.
+    let asns = cabinet_cmps_shape_with_comparison(
+        "--zorch_ip",
+        0xCC as f64,
+        "--zorch_src_ptr",
+        "--zorch_dst_ptr",
+        "--zorch_src_seg",
+        "--zorch_dst_seg",
+        "--zorch_src_byte",
+        "--zorch_dst_byte",
+        "--zorch_cmp_diff",
+        "--zorch_rep_type",
+        "--zorch_zf_bit",
+        "--zorch_flags",
+    );
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    let cmp = d
+        .comparison_shape
+        .as_ref()
+        .expect("comparison shape captured under renamed slots");
+    assert_eq!(cmp.width, 1);
+    // dst sort order: alphabetic. --zorch_dst_ptr < --zorch_src_ptr,
+    // so dst = zorch_dst_ptr.
+    assert_eq!(cmp.dst_ptr_property, "--zorch_dst_ptr");
+    assert_eq!(cmp.dst_seg_property, "--zorch_dst_seg");
+    match &cmp.source {
+        ComparisonSource::Pointer { seg_property, ptr_property, .. } => {
+            assert_eq!(ptr_property, "--zorch_src_ptr");
+            assert_eq!(seg_property, "--zorch_src_seg");
+        }
+        other => panic!("expected ComparisonSource::Pointer, got {:?}", other),
+    }
+}
+
+#[test]
+fn comparison_shape_rep_type_property_identified_by_non_flag_dependence() {
+    let asns = cabinet_cmps_shape_with_comparison(
+        "--ip0",
+        0xA6 as f64,
+        "--si0",
+        "--di0",
+        "--ds",
+        "--es",
+        "--srcByte",
+        "--dstByte",
+        "--cmpDiff",
+        "--repType",
+        "--zfBit",
+        "--flags",
+    );
+    let descs = recognise_loops(&asns);
+    let d = &descs[0];
+    let cmp = d.comparison_shape.as_ref().expect("comparison shape captured");
+    assert_eq!(
+        cmp.rep_type_property.as_deref(),
+        Some("--repType"),
+        "rep_type slot identified as the predicate slot that varies across \
+         disjunctive branches AND whose body does not depend on the comparison output",
+    );
+}
+
+/// Build a SCAS-shape cabinet: one pointer (DI) + accumulator (AL).
+fn cabinet_scas_shape_with_comparison(
+    op_key: f64,
+    accumulator: &str,
+    di_mirror: &str,
+    es_seg: &str,
+    dst_byte: &str,
+    cmp_diff: &str,
+) -> Vec<Assignment> {
+    let branch_a = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq("--repType", 1.0),
+        style_eq("--zfBit", 1.0),
+    ]);
+    let branch_b = StyleTest::And(vec![
+        style_eq("--cont", 1.0),
+        style_eq("--repType", 2.0),
+        style_eq("--zfBit", 0.0),
+    ]);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasRep", 1.0),
+        style_eq("--repInactive", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--op",
+        vec![(op_key, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            op_key,
+            ip_body_multi(
+                vec![branch_a.clone(), branch_b.clone()],
+                "--ip0",
+                var("--pl"),
+                1,
+            ),
+        )],
+        keep_self("--ip0"),
+    );
+    let ip_wrapped = add(ip_inner, var("--pl"));
+    let di_dispatch = dispatch(
+        "--op",
+        vec![(
+            op_key,
+            pointer_body(
+                active_guard.clone(),
+                di_mirror,
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self(di_mirror),
+    );
+
+    // Comparison: `calc(var(accumulator) - var(dst_byte))`.
+    let cmp_diff_dispatch = dispatch(
+        "--op",
+        vec![(op_key, sub(var(accumulator), var(dst_byte)))],
+        lit(1.0),
+    );
+
+    // Intermediate dst byte read (through ES:DI).
+    let dst_byte_body = call("--readMem", vec![add(mul(var(es_seg), lit(16.0)), var(di_mirror))]);
+
+    // Flags slot depends on cmp_diff.
+    let flags_dispatch = dispatch(
+        "--op",
+        vec![(op_key, var(cmp_diff))],
+        keep_self("--flags0"),
+    );
+
+    let zf_body = call("--bit", vec![var("--flags"), lit(6.0)]);
+    let rep_type_body = call("--readByte", vec![lit(0.0)]);
+
+    vec![
+        assign("--cx", cx_dispatch),
+        assign("--ip", ip_wrapped),
+        assign("--di", di_dispatch),
+        assign(cmp_diff, cmp_diff_dispatch),
+        assign("--flags", flags_dispatch),
+        assign(dst_byte, dst_byte_body),
+        assign("--zfBit", zf_body),
+        assign("--repType", rep_type_body),
+    ]
+}
+
+#[test]
+fn comparison_shape_extracted_for_scas_with_accumulator() {
+    let asns = cabinet_scas_shape_with_comparison(
+        0xAE as f64,
+        "--AL",
+        "--di0",
+        "--es",
+        "--dstByte",
+        "--cmpDiff",
+    );
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    let cmp = d
+        .comparison_shape
+        .as_ref()
+        .expect("comparison shape captured for SCAS");
+    assert_eq!(cmp.width, 1);
+    assert_eq!(cmp.dst_ptr_property, "--di0");
+    assert_eq!(cmp.dst_seg_property, "--es");
+    match &cmp.source {
+        ComparisonSource::Accumulator { byte_property, word_property } => {
+            assert_eq!(byte_property, "--AL");
+            assert_eq!(word_property, "--AL");
+        }
+        other => panic!("expected ComparisonSource::Accumulator, got {:?}", other),
+    }
+}
+
+#[test]
+fn comparison_shape_none_when_no_comparison_member() {
+    // The CMPS test from earlier in the file builds a cabinet WITHOUT
+    // a --_cmpDiff-style member. The recogniser should set
+    // comparison_shape to None.
+    let descs = recognise_loops(&cabinet_cmps_shape());
+    assert_eq!(descs.len(), 1);
+    let d = &descs[0];
+    assert!(d.flag_conditioned, "predicate has multiple slots — flag_conditioned");
+    assert!(
+        d.comparison_shape.is_none(),
+        "no comparison member in the family → comparison_shape is None, got {:?}",
+        d.comparison_shape,
+    );
+}
+
+#[test]
+fn comparison_shape_none_for_non_flag_conditioned_loop() {
+    // STOSB-shape (Fill class): no comparison expected even if the
+    // cabinet happens to have a Sub-shaped slot elsewhere.
+    let descs = recognise_loops(&cabinet_a());
+    let stosb = descs.iter().find(|d| d.key_value == 0xAA).unwrap();
+    assert!(
+        stosb.comparison_shape.is_none(),
+        "STOSB is Fill-class, not flag-conditioned → no comparison shape",
+    );
+}
+
+#[test]
+fn comparison_shape_brainfuck_cabinet_extracts_equivalent_structure() {
+    // Cardinal-rule probe at the source: a cabinet using brainfuck-style
+    // slot names with the same structural shape must produce a
+    // structurally equivalent ComparisonShape (only the slot-name
+    // payloads differ).
+    let x86 = cabinet_cmps_shape_with_comparison(
+        "--ip0",
+        0xA6 as f64,
+        "--si0",
+        "--di0",
+        "--ds",
+        "--es",
+        "--srcByte",
+        "--dstByte",
+        "--cmpDiff",
+        "--repType",
+        "--zfBit",
+        "--flags",
+    );
+    let brainfuck = cabinet_cmps_shape_with_comparison(
+        "--tape_ip",
+        0x42 as f64,
+        "--tape_src_head",
+        "--tape_dst_head",
+        "--tape_src_page",
+        "--tape_dst_page",
+        "--tape_src_cell",
+        "--tape_dst_cell",
+        "--tape_diff",
+        "--tape_mode",
+        "--tape_zero_flag",
+        "--tape_status",
+    );
+    let dx = recognise_loops(&x86);
+    let db = recognise_loops(&brainfuck);
+    assert_eq!(dx.len(), 1);
+    assert_eq!(db.len(), 1);
+    let cx = dx[0].comparison_shape.as_ref().expect("x86 shape");
+    let cb = db[0].comparison_shape.as_ref().expect("brainfuck shape");
+    assert_eq!(cx.width, cb.width);
+    // Same shape variant (Pointer / Pointer).
+    assert!(
+        matches!(
+            (&cx.source, &cb.source),
+            (ComparisonSource::Pointer { .. }, ComparisonSource::Pointer { .. })
+        ),
+        "both must classify the source as Pointer",
+    );
+    // Both extract a rep_type slot (the one that varies across
+    // disjunctive branches AND doesn't depend on the comparison output).
+    assert!(cx.rep_type_property.is_some());
+    assert!(cb.rep_type_property.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Precondition (Wart 6) — outer-guard predicate capture.
+// ---------------------------------------------------------------------------
+
+/// Build a CMPS-shape cabinet whose IP slot is wrapped in an outer
+/// `if(<override-A>: var(self); <override-B>: var(self); else: <dispatch>)`
+/// guard. Two override branches; both gate the normal dispatch.
+///
+/// `override_a_slot` / `override_b_slot` are the slot names the guard
+/// branches test against (each tests for equality with `1`). Naming
+/// them as parameters lets us test the renaming-blind property.
+fn cabinet_with_outer_ip_guard(
+    override_a_slot: &str,
+    override_b_slot: &str,
+) -> Vec<Assignment> {
+    let pred = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--inhibit", 0.0),
+    ]);
+
+    let cx_dispatch = dispatch(
+        "--op",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--prevCount"))],
+        keep_self("--prevCount"),
+    );
+    let ip_dispatch = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            ip_body(pred.clone(), "--prevPC", var("--introBytes"), 1),
+        )],
+        keep_self("--prevPC"),
+    );
+    let di_dispatch = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--prevHand",
+                1,
+                "--prevMood",
+                10,
+                "--clampLow",
+                "--bitN",
+            ),
+        )],
+        keep_self("--prevHand"),
+    );
+
+    // Wrap the IP dispatch in an outer guard.
+    let ip_wrapped = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq(override_a_slot, 1.0),
+                then: var("--prevPC"),
+            },
+            StyleBranch {
+                condition: style_eq(override_b_slot, 1.0),
+                then: var("--prevPC"),
+            },
+        ],
+        fallback: Box::new(ip_dispatch),
+    };
+
+    vec![
+        assign("--count", cx_dispatch),
+        assign("--pc", ip_wrapped),
+        assign("--hand", di_dispatch),
+    ]
+}
+
+/// Cabinet identical to `cabinet_a` but without any outer-wrapper on
+/// the IP slot: its IP assignment is `Calc::Add(<dispatch>, ...)`, where
+/// `<dispatch>` is a bare single-key dispatch. No StyleCondition wrapper
+/// gates the dispatch. This is the "brainfuck cabinet without override
+/// plumbing" shape — precondition must be `None`.
+fn cabinet_no_outer_ip_guard() -> Vec<Assignment> {
+    cabinet_a()
+}
+
+#[test]
+fn precondition_captured_from_outer_ip_guard() {
+    let asns = cabinet_with_outer_ip_guard("--trapMode", "--alarmActive");
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor, got {:?}", descs);
+    let pre = descs[0]
+        .precondition
+        .as_ref()
+        .expect("outer-wrapped IP should produce a precondition");
+    let Precondition::NoOverrides(tests) = pre;
+    assert_eq!(
+        tests.len(),
+        2,
+        "both override branches should be captured: {:?}",
+        tests,
+    );
+    // Verify the captured slot names are the wrapper's verbatim
+    // (cardinal-rule: no name mangling).
+    let captured_slots: Vec<&str> = tests
+        .iter()
+        .map(|t| match t {
+            StyleTest::Single { property, .. } => property.as_str(),
+            _ => panic!("expected Single tests, got {:?}", t),
+        })
+        .collect();
+    assert!(captured_slots.contains(&"--trapMode"));
+    assert!(captured_slots.contains(&"--alarmActive"));
+}
+
+/// Cardinal-rule probe: renaming the override slots produces a
+/// structurally-equivalent precondition with the new names —
+/// no character-level inspection of slot names anywhere.
+#[test]
+fn precondition_renaming_blind() {
+    let a = recognise_loops(&cabinet_with_outer_ip_guard("--trapMode", "--alarmActive"));
+    let b = recognise_loops(&cabinet_with_outer_ip_guard("--zorch", "--quux"));
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), 1);
+    let pa = a[0].precondition.as_ref().expect("a precondition");
+    let pb = b[0].precondition.as_ref().expect("b precondition");
+    let Precondition::NoOverrides(ta) = pa;
+    let Precondition::NoOverrides(tb) = pb;
+    // Same count of override branches, both Single shape — structurally
+    // equivalent. Slot names differ as expected.
+    assert_eq!(ta.len(), tb.len());
+    let extract = |ts: &[StyleTest]| -> Vec<String> {
+        ts.iter()
+            .map(|t| match t {
+                StyleTest::Single { property, .. } => property.clone(),
+                _ => unreachable!(),
+            })
+            .collect()
+    };
+    let names_a = extract(ta);
+    let names_b = extract(tb);
+    assert!(names_a.contains(&"--trapMode".to_string()));
+    assert!(names_a.contains(&"--alarmActive".to_string()));
+    assert!(names_b.contains(&"--zorch".to_string()));
+    assert!(names_b.contains(&"--quux".to_string()));
+    // The structurally renamed cabinet must produce zero name overlap
+    // with the original — proves no name was hardcoded by the
+    // recogniser.
+    for n in &names_a {
+        assert!(
+            !names_b.contains(n),
+            "renamed cabinet should not share any slot names: {} appeared in both",
+            n,
+        );
+    }
+}
+
+#[test]
+fn precondition_none_when_no_outer_wrapper() {
+    // cabinet_a's IP is `Calc::Add(<bare dispatch>, var(--prefixLen))`
+    // — no StyleCondition wrapper around the dispatch. The
+    // recogniser must report `precondition = None`, not an empty
+    // `NoOverrides(vec![])`.
+    let descs = recognise_loops(&cabinet_no_outer_ip_guard());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        assert!(
+            d.precondition.is_none(),
+            "cabinet_a has no outer IP wrapper; descriptor for 0x{:x} should have precondition=None, got {:?}",
+            d.key_value,
+            d.precondition,
+        );
+    }
+}
+
+#[test]
+fn precondition_captured_for_outer_wrappers_are_stripped_shape() {
+    // Sanity check: the existing `outer_wrappers_are_stripped` test
+    // builds a cabinet whose IP wrapper has branches keyed on
+    // --trapMode / --alarmActive. That test asserts the loop is still
+    // recognised; this test asserts the wrapper branches end up as
+    // the descriptor's precondition.
+    let pred = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasREP", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--hasREP", 1.0),
+        style_eq("--inhibit", 0.0),
+    ]);
+    let cx_inner = dispatch(
+        "--op",
+        vec![(0xAA as f64, counter_body(no_rep, "--prevCount"))],
+        keep_self("--prevCount"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            ip_body(pred.clone(), "--prevPC", var("--introBytes"), 1),
+        )],
+        keep_self("--prevPC"),
+    );
+    let di_inner = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--prevHand",
+                1,
+                "--prevMood",
+                10,
+                "--clampLow",
+                "--bitN",
+            ),
+        )],
+        keep_self("--prevHand"),
+    );
+    let ip_passthrough = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--trapMode", 1.0),
+                then: var("--prevPC"),
+            },
+            StyleBranch {
+                condition: style_eq("--alarmActive", 1.0),
+                then: var("--prevPC"),
+            },
+        ],
+        fallback: Box::new(ip_inner),
+    };
+    // The IP is then wrapped in calc(... + var(introBytes)) — the
+    // recogniser must descend through Calc *and* the StyleCondition.
+    let ip_wrapped = add(ip_passthrough, var("--introBytes"));
+    let cx_wrapped = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--trapMode", 1.0),
+                then: var("--prevCount"),
+            },
+            StyleBranch {
+                condition: style_eq("--alarmActive", 1.0),
+                then: var("--prevCount"),
+            },
+        ],
+        fallback: Box::new(cx_inner),
+    };
+    let di_wrapped = Expr::StyleCondition {
+        branches: vec![
+            StyleBranch {
+                condition: style_eq("--trapMode", 1.0),
+                then: var("--prevHand"),
+            },
+            StyleBranch {
+                condition: style_eq("--alarmActive", 1.0),
+                then: var("--prevHand"),
+            },
+        ],
+        fallback: Box::new(di_inner),
+    };
+    let asns = vec![
+        assign("--count", cx_wrapped),
+        assign("--pc", ip_wrapped),
+        assign("--hand", di_wrapped),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1);
+    let pre = descs[0]
+        .precondition
+        .as_ref()
+        .expect("calc-wrapped style-wrapped IP should still produce precondition");
+    let Precondition::NoOverrides(tests) = pre;
+    assert_eq!(tests.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Precondition runtime evaluation.
+// ---------------------------------------------------------------------------
+
+/// Build a minimal CompiledProgram with the given property→slot
+/// mapping. Only `property_slots` and `slot_count` are populated —
+/// the precondition evaluator never touches the rest.
+fn program_with_slots(slots: &[&str]) -> crate::compile::CompiledProgram {
+    use std::collections::HashMap;
+    let mut property_slots: HashMap<String, u32> = HashMap::new();
+    for (i, name) in slots.iter().enumerate() {
+        property_slots.insert((*name).to_string(), i as u32);
+    }
+    crate::compile::CompiledProgram {
+        ops: Vec::new(),
+        slot_count: slots.len() as u32,
+        writeback: Vec::new(),
+        broadcast_writes: Vec::new(),
+        packed_broadcast_writes: Vec::new(),
+        packed_cell_tables: Vec::new(),
+        packed_exception_tables: Vec::new(),
+        dispatch_tables: Vec::new(),
+        chain_tables: Vec::new(),
+        flat_dispatch_arrays: Vec::new(),
+        property_slots,
+        functions: Vec::new(),
+        windowed_byte_array: None,
+        loop_descriptors: Vec::new(),
+    }
+}
+
+#[test]
+fn evaluate_precondition_no_overrides_all_false_returns_true() {
+    // Precondition: "dispatch fires iff no override is true". When
+    // every override slot reads 0, dispatch fires → returns true.
+    let pre = Precondition::NoOverrides(vec![
+        style_eq("--trap", 1.0),
+        style_eq("--alarm", 1.0),
+    ]);
+    let prog = program_with_slots(&["--trap", "--alarm"]);
+    let state = crate::state::State::new(1 << 10);
+    let slots = [0, 0]; // both override slots = 0
+    assert!(evaluate_precondition(&pre, &prog, &state, &slots));
+}
+
+#[test]
+fn evaluate_precondition_no_overrides_one_true_returns_false() {
+    let pre = Precondition::NoOverrides(vec![
+        style_eq("--trap", 1.0),
+        style_eq("--alarm", 1.0),
+    ]);
+    let prog = program_with_slots(&["--trap", "--alarm"]);
+    let state = crate::state::State::new(1 << 10);
+
+    // --trap = 1 → override fires → dispatch did NOT fire → precondition false.
+    let slots = [1, 0];
+    assert!(!evaluate_precondition(&pre, &prog, &state, &slots));
+
+    // --alarm = 1 → same.
+    let slots = [0, 1];
+    assert!(!evaluate_precondition(&pre, &prog, &state, &slots));
+
+    // Both set: still false.
+    let slots = [1, 1];
+    assert!(!evaluate_precondition(&pre, &prog, &state, &slots));
+}
+
+#[test]
+fn evaluate_precondition_resolves_through_state_vars_when_slot_missing() {
+    // Override slot lives in state_vars (the read_mem / state_var
+    // routing applier shares). The evaluator's read_prop_runtime
+    // tries property_slots first, then state.get_var by bare name.
+    use crate::types::{CssValue, PropertyDef, PropertySyntax};
+    let pre = Precondition::NoOverrides(vec![style_eq("--_irqActive", 1.0)]);
+    let prog = program_with_slots(&[]); // no slot for --_irqActive
+    let mut state = crate::state::State::new(1 << 10);
+    state.load_properties(&[PropertyDef {
+        name: "--_irqActive".to_string(),
+        syntax: PropertySyntax::Integer,
+        inherits: false,
+        initial_value: Some(CssValue::Integer(0)),
+    }]);
+    let slots: [i32; 0] = [];
+
+    // _irqActive = 0 → precondition holds.
+    assert!(evaluate_precondition(&pre, &prog, &state, &slots));
+
+    // _irqActive = 1 → override fires.
+    state.set_var("_irqActive", 1);
+    assert!(!evaluate_precondition(&pre, &prog, &state, &slots));
+}

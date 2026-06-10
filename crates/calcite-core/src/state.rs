@@ -120,6 +120,28 @@ pub struct State {
     /// per-tick gate + apply path entirely. The per-tick cost for a
     /// cabinet with input edges is the same as for one without: zero.
     pub input_edge_groups: Vec<InputEdgeGroup>,
+    /// Linear-address ranges backed by something other than the flat
+    /// `state.memory` byte array. Bulk paths consult this list before
+    /// committing wide writes, so they can bail when the destination would
+    /// overlap (e.g., a windowed-byte-array region whose CSS dispatch
+    /// can't be substituted with a flat memset). Populated at compile time
+    /// by the recognisers that install such regions.
+    pub virtual_regions: Vec<VirtualRegion>,
+}
+
+/// A linear-address range backed by something other than the flat
+/// `state.memory` byte array. Bulk paths consult this list before
+/// committing wide writes, so they can bail when the destination would
+/// overlap (e.g., a windowed-byte-array region whose CSS dispatch
+/// can't be substituted with a flat memset).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualRegion {
+    /// First linear address inside the region (inclusive).
+    pub start: i32,
+    /// One past the last linear address inside the region.
+    pub end: i32,
+    /// Recogniser-supplied label, free-form, used for diagnostics only.
+    pub source: &'static str,
 }
 
 /// One gated state-var slot's worth of input edges. The slot is
@@ -197,6 +219,7 @@ impl State {
             windowed_byte_array: None,
             pseudo_active: std::collections::HashSet::new(),
             input_edge_groups: Vec::new(),
+            virtual_regions: Vec::new(),
         }
     }
 
