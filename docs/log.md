@@ -11,6 +11,82 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-06-09 — rep-generic: smoke 7/7 + byte-identical A/B + bench — cheat removal verified on the branch
+
+Branch `feat/rep-generic` (`247b274` → `17fe7da`, pushed). Cross-link:
+CSS-DOS LOGBOOK 2026-06-09. Continues the 2026-06-08 FINDING below; the
+"one recogniser gap" turned out to be the first of **five** layered
+defects, each only visible once the previous was fixed:
+
+1. **`ip_extra_advance_slot` captured from the wrong shape** (the known
+   gap). Correct capture is the *stay branch's subtrahend* in the
+   per-key IP body. Fixed-point argument: on a stay tick the IP slot's
+   new value equals its old value, so any wrapper addend W cancels
+   (`self − S + W = IP` pins `self`), and the exit branch is always
+   `IP + S + L`. The old top-level-`Add` rule was unreachable on real
+   cabinets (the Add sits inside the TF/IRQ wrapper's else-`calc`) and
+   wrong even where it matched (captures W, which cancels).
+2. **Mirror names unresolvable at runtime.** `--__1DI` etc. resolve in
+   compiled code via the buffer-copy rule; the applier's `read_prop`
+   didn't know it → "pointer self_property unresolved" panic. Now
+   routed via `eval::to_bare_name` (pure fn — the first attempt used
+   `property_to_address`, whose thread-local ADDRESS_MAP is empty on
+   the debugger's tokio workers: CLI passed, debugger hung).
+3. **No loop-continuation gate.** The dispatcher applied on *any* tick
+   whose opcode had a descriptor — single-shot (non-rep) string ops got
+   bulk-applied with stale counters (first observed as cycleCount going
+   hugely negative). Now: `evaluate_loop_predicate` — the descriptor's
+   own predicate with polarity (`predicate_means_stay`) — evaluated
+   against the post-tick slot view, reproducing the CSS's stay/advance
+   decision exactly. Generalises the deleted path's hasREP +
+   already-exited-via-ZF guards.
+4. **Source-base scaling.** `IndirectRead` / `ComparisonShape` now
+   record whether the captured base sat inside `* 16` in the shape.
+   Kiln's `--_strSrcSeg` is a *flat* base (override-aware, already
+   `DS*16`); unconditionally rescaling it read sources 16× off (CMPS
+   exited early on garbage → stale-flags Jcc divergence at tick 450375
+   of dos-smoke). High-byte `+ 1` literal offsets now peel during
+   decomposition, modelled positionally like the dst side.
+5. **CMPS/SCAS flags commit silently no-opped** — `flag_property` is
+   the mirror name (`--__1flags`); bare-strip missed the state var.
+   Same `to_bare_name` routing fixes it. Also: LODS-shape Full commit
+   now *refuses* (accumulator target not modelled) instead of silently
+   leaving the accumulator stale — loud-not-wrong; no current cart
+   reaches it (proven by the A/B below).
+
+**Verification.** (a) `cargo test -p calcite-core`: 287 green, incl.
+new shape-true tests (real kiln IP shape through the TF/IRQ wrapper;
+subtrahend-not-wrapper pin; predicate polarity; gate behaviour; flat vs
+×16 base scaling). The old `ip_extra_advance_slot_*` tests encoded the
+wrong model and were rewritten. (b) **A/B vs `main`: byte-identical** —
+calcite-cli on all 7 smoke cabinets for 2M ticks gives identical
+cycleCount and IP on both builds (tick-count bisection was the
+diagnostic; forks at ticks 445075 / 450375 of dos-smoke closed by
+fixes 4 / 5). (c) CSS-DOS smoke **7/7 PASS** (111 s — previously the
+panicked debugger hung the whole run). (d) Web bench, 3-run `doom-all
+--headed` medians (JSONs: CSS-DOS `docs/benches/doom-all-2026-06-09-*`):
+rep-generic 73.8 s runMsToInGame / 459.6K t/s / 63.3 s doomLoad vs
+fresh main baseline 73.4 s / 466.6K / 62.8 s → **+0.50% wall /
+−1.49% t/s / +0.85% doomLoad**. Wall metrics inside the ±1% gate; the
+t/s median delta is inside the documented ±3% run noise and the run
+distributions overlap. Since the A/B state evolution is byte-identical,
+any real residual cost is the dispatcher gate's predicate evaluation on
+string-op ticks — optimisable (pre-resolve predicate slot indices at
+descriptor build) without touching semantics. A further 3 alternating
+bench pairs were attempted but the machine suspended overnight
+mid-session; the contaminated runs (main-run5 failed,
+repgeneric-run5/6 degraded) are kept alongside, self-identifying.
+
+**Residual warts (on the branch, logged for merge review, not
+blockers):**
+- `commit_ip_and_cycles` still reads/writes literal `"IP"` /
+  `"cycleCount"` names instead of descriptor-carried ones; per-iter
+  cycle extraction captures the constant but not the cycle slot's name.
+  Both should become descriptor fields.
+- The dispatcher reads `--opcode` and panic diagnostics by literal name
+  (pre-existing, documented inline).
+- LODS-shape Full commit is a deliberate loud hole (see 5).
+
 ## 2026-06-09 — FINDING: per-tick op profile — 845 ops/tick, >⅓ pure data movement; copy elimination is the biggest unlisted lever
 
 Read-only analysis on `main` `8de61a8`, no code changes. Cross-link:
