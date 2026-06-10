@@ -3729,18 +3729,34 @@ impl CopyFacts {
         self.map.clear();
         self.dependents.clear();
     }
-    /// Restore from a plain dst→root snapshot.
-    fn from_map(map: FxMap<Slot, Slot>) -> Self {
-        let mut dependents: FxMap<Slot, Vec<Slot>> = FxMap::default();
-        for (&d, &r) in &map {
-            dependents.entry(r).or_default().push(d);
+    /// Recompute `dependents` from `map` (after wholesale map replacement).
+    fn rebuild_deps(&mut self) {
+        self.dependents.clear();
+        for (&d, &r) in &self.map {
+            self.dependents.entry(r).or_default().push(d);
         }
-        CopyFacts { map, dependents }
     }
     /// Keep only facts present (with equal root) in `other`.
     fn intersect_map(a: &mut FxMap<Slot, Slot>, b: &FxMap<Slot, Slot>) {
         a.retain(|k, v| b.get(k) == Some(v));
     }
+}
+
+/// Reusable buffers for `copy_opt_stream`. A cabinet can have hundreds of
+/// thousands of (mostly tiny) dispatch-entry streams; allocating the
+/// working buffers per stream dominates the pass cost (especially on the
+/// wasm allocator), so the driver allocates once and reuses.
+#[derive(Default)]
+struct CopyOptScratch {
+    is_label: Vec<bool>,
+    noop: Vec<bool>,
+    dead: Vec<bool>,
+    barrier_live: FxSet<Slot>,
+    facts: CopyFacts,
+    pending: FxMap<usize, FxMap<Slot, Slot>>,
+    live: FxSet<Slot>,
+    live_at: FxMap<usize, FxSet<Slot>>,
+    new_indices: Vec<u32>,
 }
 
 /// The real control-flow target of an op at this pipeline stage, if any.
@@ -3903,11 +3919,23 @@ fn copy_opt_stream(
     ops: &mut Vec<Op>,
     external: &FxSet<Slot>,
     table_reads: &[FxSet<Slot>],
+    scratch: &mut CopyOptScratch,
 ) -> (usize, usize) {
     let len = ops.len();
     if len == 0 {
         return (0, 0);
     }
+    let CopyOptScratch {
+        is_label,
+        noop,
+        dead,
+        barrier_live,
+        facts,
+        pending,
+        live,
+        live_at,
+        new_indices,
+    } = scratch;
 
     // --- Pre-scan: bail on shapes this pass doesn't model, mark labels ---
     // `barrier_live` collects the transitive read-sets of every dispatch
@@ -3918,8 +3946,9 @@ fn copy_opt_stream(
     // per-label snapshot a huge clone. Conservative (a slot read by some
     // dispatch is unremovable even below the last Dispatch op), but those
     // slots are genuine cross-stream parameters anyway.
-    let mut is_label = vec![false; len + 1];
-    let mut barrier_live: FxSet<Slot> = FxSet::default();
+    is_label.clear();
+    is_label.resize(len + 1, false);
+    barrier_live.clear();
     for (i, op) in ops.iter().enumerate() {
         match op {
             Op::BranchIfNotEqLit2 { .. }
@@ -3945,12 +3974,13 @@ fn copy_opt_stream(
     }
 
     // --- Forward copy propagation ---
-    let mut facts = CopyFacts::default();
+    facts.clear();
     // Facts snapshot arriving at each label via jumps (intersected per edge).
-    let mut pending: FxMap<usize, FxMap<Slot, Slot>> = FxMap::default();
+    pending.clear();
     // Whether the previous op can fall through into the current one.
     let mut ft_reachable = true;
-    let mut noop = vec![false; len];
+    noop.clear();
+    noop.resize(len, false);
     let mut propagated = 0usize;
 
     for i in 0..len {
@@ -3958,21 +3988,24 @@ fn copy_opt_stream(
             match (ft_reachable, pending.remove(&i)) {
                 (true, Some(p)) => {
                     CopyFacts::intersect_map(&mut facts.map, &p);
-                    facts = CopyFacts::from_map(std::mem::take(&mut facts.map));
+                    facts.rebuild_deps();
                 }
                 (true, None) => {
                     // Label with no recorded jump-in snapshot (shouldn't happen
                     // on forward-only CFGs) — be conservative.
                     facts.clear();
                 }
-                (false, Some(p)) => facts = CopyFacts::from_map(p),
+                (false, Some(p)) => {
+                    facts.map = p;
+                    facts.rebuild_deps();
+                }
                 (false, None) => facts.clear(), // unreachable code
             }
             ft_reachable = true;
         }
 
         let op = &mut ops[i];
-        propagated += rewrite_op_reads(op, &facts);
+        propagated += rewrite_op_reads(op, facts);
 
         // Helper to merge the current facts into a jump target's pending set.
         macro_rules! snapshot_to {
@@ -4004,7 +4037,7 @@ fn copy_opt_stream(
                     // branchy streams quadratic. Copies are consumed close to
                     // where they're made; dropping facts past the cap only
                     // costs optimisation, not correctness.
-                    if facts.map.len() < 512 {
+                    if facts.map.len() < 128 {
                         facts.add(d, s);
                     }
                 }
@@ -4054,13 +4087,14 @@ fn copy_opt_stream(
 
     // --- Backward liveness DCE ---
     // `live` tracks only ordinary (scratch) slots. External and
-    // dispatch-read slots are handled as always-live via the membership
-    // checks at the removal decision below — keeping them out of `live`
-    // keeps the per-label snapshots small.
-    let mut live: FxSet<Slot> = FxSet::default();
+    // dispatch-read slots are NEVER inserted — their producers are kept
+    // unconditionally by the membership checks at the removal decision, so
+    // tracking them would only bloat the per-label snapshot clones (the
+    // main stream reads tens of thousands of pinned property slots).
+    live.clear();
     // live-in set at each label index (available because targets are forward:
     // in the reverse walk a target is always visited before its branch).
-    let mut live_at: FxMap<usize, FxSet<Slot>> = FxMap::default();
+    live_at.clear();
     let live_in = |live_at: &FxMap<usize, FxSet<Slot>>, t: u32| {
         if (t as usize) >= len {
             FxSet::default()
@@ -4068,8 +4102,18 @@ fn copy_opt_stream(
             live_at.get(&(t as usize)).cloned().unwrap_or_default()
         }
     };
-    let mut dead = vec![false; len];
+    dead.clear();
+    dead.resize(len, false);
     let mut removed = 0usize;
+
+    macro_rules! gen_read {
+        ($s:expr) => {{
+            let s = $s;
+            if !external.contains(&s) && !barrier_live.contains(&s) {
+                live.insert(s);
+            }
+        }};
+    }
 
     for i in (0..len).rev() {
         let op = &ops[i];
@@ -4078,43 +4122,43 @@ fn copy_opt_stream(
         } else {
             match op {
                 Op::Jump { target } => {
-                    live = live_in(&live_at, *target);
+                    *live = live_in(live_at, *target);
                 }
                 Op::BranchIfZero { cond, target } => {
-                    live.extend(live_in(&live_at, *target));
-                    live.insert(*cond);
+                    live.extend(live_in(live_at, *target));
+                    gen_read!(*cond);
                 }
                 Op::BranchIfNotEqLit { a, target, .. } => {
-                    live.extend(live_in(&live_at, *target));
-                    live.insert(*a);
+                    live.extend(live_in(live_at, *target));
+                    gen_read!(*a);
                 }
                 Op::LoadStateAndBranchIfNotEqLit { dst, target, .. } => {
-                    live.extend(live_in(&live_at, *target));
+                    live.extend(live_in(live_at, *target));
                     live.remove(dst);
                 }
                 Op::MemoryFill { dst_slot, val_slot, count_slot, exit_target } => {
-                    live = live_in(&live_at, *exit_target);
-                    live.insert(*dst_slot);
-                    live.insert(*val_slot);
-                    live.insert(*count_slot);
+                    *live = live_in(live_at, *exit_target);
+                    gen_read!(*dst_slot);
+                    gen_read!(*val_slot);
+                    gen_read!(*count_slot);
                 }
                 Op::MemoryCopy { src_slot, dst_slot, count_slot, exit_target } => {
-                    live = live_in(&live_at, *exit_target);
-                    live.insert(*src_slot);
-                    live.insert(*dst_slot);
-                    live.insert(*count_slot);
+                    *live = live_in(live_at, *exit_target);
+                    gen_read!(*src_slot);
+                    gen_read!(*dst_slot);
+                    gen_read!(*count_slot);
                 }
                 Op::Dispatch { dst, key, .. } => {
                     // Table read-set handled via barrier_live.
                     live.remove(dst);
-                    live.insert(*key);
+                    gen_read!(*key);
                 }
                 Op::StoreState { src, .. } => {
-                    live.insert(*src);
+                    gen_read!(*src);
                 }
                 Op::StoreMem { addr_slot, src } => {
-                    live.insert(*addr_slot);
-                    live.insert(*src);
+                    gen_read!(*addr_slot);
+                    gen_read!(*src);
                 }
                 other => {
                     debug_assert!(op_is_pure(other));
@@ -4190,12 +4234,12 @@ fn copy_opt_stream(
                             }
                         } else {
                             live.remove(&r);
-                            live.insert(x);
+                            gen_read!(x);
                         }
                     } else {
                         live.remove(&d);
                         for r in op_slots_read(other) {
-                            live.insert(r);
+                            gen_read!(r);
                         }
                     }
                 }
@@ -4208,7 +4252,8 @@ fn copy_opt_stream(
 
     // --- Remove dead ops, remapping branch targets ---
     if dead.iter().any(|&d| d) {
-        let mut new_indices = vec![0u32; len];
+        new_indices.clear();
+        new_indices.resize(len, 0u32);
         let mut offset = 0u32;
         for i in 0..len {
             new_indices[i] = i as u32 - offset;
@@ -4328,33 +4373,39 @@ fn copy_propagate_and_dce(program: &mut CompiledProgram) -> (usize, usize) {
 
     let mut propagated = 0usize;
     let mut removed = 0usize;
+    let mut scratch = CopyOptScratch::default();
+    let mut ext_single: FxSet<Slot> = FxSet::default();
 
-    let (p, r) = copy_opt_stream(&mut program.ops, &main_external, &table_reads);
+    let (p, r) = copy_opt_stream(&mut program.ops, &main_external, &table_reads, &mut scratch);
     propagated += p;
     removed += r;
 
     for table in &mut program.dispatch_tables {
         for (entry_ops, result_slot) in table.entries.values_mut() {
-            let ext: FxSet<Slot> = std::iter::once(*result_slot).collect();
-            let (p, r) = copy_opt_stream(entry_ops, &ext, &table_reads);
+            ext_single.clear();
+            ext_single.insert(*result_slot);
+            let (p, r) = copy_opt_stream(entry_ops, &ext_single, &table_reads, &mut scratch);
             propagated += p;
             removed += r;
         }
-        let ext: FxSet<Slot> = std::iter::once(table.fallback_slot).collect();
-        let (p, r) = copy_opt_stream(&mut table.fallback_ops, &ext, &table_reads);
+        ext_single.clear();
+        ext_single.insert(table.fallback_slot);
+        let (p, r) = copy_opt_stream(&mut table.fallback_ops, &ext_single, &table_reads, &mut scratch);
         propagated += p;
         removed += r;
     }
 
     for bw in &mut program.broadcast_writes {
-        let ext: FxSet<Slot> = std::iter::once(bw.value_slot).collect();
-        let (p, r) = copy_opt_stream(&mut bw.value_ops, &ext, &table_reads);
+        ext_single.clear();
+        ext_single.insert(bw.value_slot);
+        let (p, r) = copy_opt_stream(&mut bw.value_ops, &ext_single, &table_reads, &mut scratch);
         propagated += p;
         removed += r;
         if let Some(ref mut sp) = bw.spillover {
             for (spill_ops, spill_slot) in sp.entries.values_mut() {
-                let ext: FxSet<Slot> = std::iter::once(*spill_slot).collect();
-                let (p, r) = copy_opt_stream(spill_ops, &ext, &table_reads);
+                ext_single.clear();
+                ext_single.insert(*spill_slot);
+                let (p, r) = copy_opt_stream(spill_ops, &ext_single, &table_reads, &mut scratch);
                 propagated += p;
                 removed += r;
             }
@@ -9224,6 +9275,14 @@ mod tests {
         slots.iter().copied().collect()
     }
 
+    fn opt_stream(
+        ops: &mut Vec<Op>,
+        external: &FxSet<Slot>,
+        table_reads: &[FxSet<Slot>],
+    ) -> (usize, usize) {
+        copy_opt_stream(ops, external, table_reads, &mut CopyOptScratch::default())
+    }
+
     #[test]
     fn copy_elim_collapses_chain() {
         let mut ops = vec![
@@ -9233,7 +9292,7 @@ mod tests {
             Op::Add { dst: 3, a: 2, b: 2 },
         ];
         let before = run(&ops, 8);
-        let (prop, removed) = copy_opt_stream(&mut ops, &ext(&[3]), &[]);
+        let (prop, removed) = opt_stream(&mut ops,&ext(&[3]), &[]);
         assert!(prop >= 2, "expected chain reads redirected, got {prop}");
         assert_eq!(removed, 2, "both copies should die");
         assert_eq!(ops.len(), 2);
@@ -9266,7 +9325,7 @@ mod tests {
         for k in [0, 5] {
             let mut ops = build(k);
             let before = run(&ops, 8);
-            let (_, removed) = copy_opt_stream(&mut ops, &ext(&[3]), &[]);
+            let (_, removed) = opt_stream(&mut ops,&ext(&[3]), &[]);
             assert_eq!(removed, 1, "copy should die after facts cross the labels (k={k})");
             assert_eq!(ops.len(), 6);
             let after = run(&ops, 8);
@@ -9283,7 +9342,7 @@ mod tests {
             Op::Add { dst: 2, a: 0, b: 1 },
         ];
         let before = run(&ops, 8);
-        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[2]), &[]);
+        let (_, removed) = opt_stream(&mut ops,&ext(&[2]), &[]);
         assert_eq!(removed, 2);
         assert_eq!(ops.len(), 2);
         let after = run(&ops, 8);
@@ -9299,7 +9358,7 @@ mod tests {
             Op::Add { dst: 2, a: 0, b: 1 },
             Op::LoadLit { dst: 3, val: 5 },
         ];
-        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[3]), &[]);
+        let (_, removed) = opt_stream(&mut ops,&ext(&[3]), &[]);
         assert_eq!(removed, 3, "whole dead compute chain should cascade away");
         assert_eq!(ops.len(), 1);
         assert!(matches!(ops[0], Op::LoadLit { dst: 3, val: 5 }));
@@ -9315,7 +9374,7 @@ mod tests {
             Op::Dispatch { dst: 8, key: 5, table_id: 0, fallback_target: 0 },
             Op::Add { dst: 9, a: 8, b: 7 },
         ];
-        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[9]), &table_reads);
+        let (_, removed) = opt_stream(&mut ops,&ext(&[9]), &table_reads);
         assert_eq!(removed, 0, "copy feeding a dispatch entry must survive");
         assert_eq!(ops.len(), 4);
         // The read of slot 7 after the Dispatch must NOT have been rewritten
@@ -9330,7 +9389,7 @@ mod tests {
             Op::LoadSlot { dst: 10, src: 0 }, // external (e.g. writeback)
             Op::LoadSlot { dst: 11, src: 0 }, // dead
         ];
-        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[10]), &[]);
+        let (_, removed) = opt_stream(&mut ops,&ext(&[10]), &[]);
         // The dead copy dies, and store-forwarding folds the external copy
         // into its producer: LoadLit writes slot 10 directly.
         assert_eq!(removed, 2);
@@ -9347,7 +9406,7 @@ mod tests {
             Op::LoadSlot { dst: 2, src: 1 }, // result copy
         ];
         let before = run(&ops, 8);
-        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[2]), &[]);
+        let (_, removed) = opt_stream(&mut ops,&ext(&[2]), &[]);
         assert_eq!(removed, 1);
         assert!(matches!(ops[1], Op::AddLit { dst: 2, a: 0, val: 1 }));
         let after = run(&ops, 8);
@@ -9371,7 +9430,7 @@ mod tests {
         for k in [0, 1] {
             let mut ops = build(k);
             let before = run(&ops, 8);
-            copy_opt_stream(&mut ops, &ext(&[2]), &[]);
+            opt_stream(&mut ops,&ext(&[2]), &[]);
             let after = run(&ops, 8);
             assert_eq!(before[2], after[2], "label forwarding broke semantics for k={k}");
         }
@@ -9386,7 +9445,7 @@ mod tests {
             Op::Add { dst: 3, a: 1, b: 2 },  // still reads slot 1
         ];
         let before = run(&ops, 8);
-        copy_opt_stream(&mut ops, &ext(&[3]), &[]);
+        opt_stream(&mut ops,&ext(&[3]), &[]);
         let after = run(&ops, 8);
         assert_eq!(before[3], after[3]);
         assert_eq!(after[3], 14);
@@ -9400,7 +9459,7 @@ mod tests {
             Op::BranchIfZero { cond: 1, target: 0 },
         ];
         let orig = format!("{ops:?}");
-        let (prop, removed) = copy_opt_stream(&mut ops, &ext(&[1]), &[]);
+        let (prop, removed) = opt_stream(&mut ops,&ext(&[1]), &[]);
         assert_eq!((prop, removed), (0, 0));
         assert_eq!(format!("{ops:?}"), orig, "stream with backward edge must be untouched");
     }
@@ -9412,7 +9471,7 @@ mod tests {
             Op::LoadSlot { dst: 1, src: 0 },
             Op::MemoryFill { dst_slot: 1, val_slot: 0, count_slot: 3, exit_target: 3 },
         ];
-        let (_, removed) = copy_opt_stream(&mut ops, &ext(&[1]), &[]);
+        let (_, removed) = opt_stream(&mut ops,&ext(&[1]), &[]);
         assert_eq!(removed, 0);
         // dst_slot is read+written: must keep pointing at slot 1, and the
         // copy producing slot 1 must stay.
@@ -9439,7 +9498,7 @@ mod tests {
         for k in [0, 1] {
             let mut ops = build(k);
             let before = run(&ops, 8);
-            let (_, removed) = copy_opt_stream(&mut ops, &ext(&[3]), &[]);
+            let (_, removed) = opt_stream(&mut ops,&ext(&[3]), &[]);
             assert_eq!(removed, 1);
             let after = run(&ops, 8);
             assert_eq!(before[3], after[3], "branch remap broke semantics for k={k}");
