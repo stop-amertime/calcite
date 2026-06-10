@@ -11,6 +11,46 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-06-10 — rep-generic MERGED to main (`cc729b2`): hardcoded x86 string-op path is gone
+
+Cross-link: CSS-DOS LOGBOOK 2026-06-10. Closes the 2026-06-09 entry's
+"remaining step". Two parts:
+
+**Merge-review fixes (branch `b2dc52d`)** — the 2026-06-09 warts, fixed
+before merging rather than carried as debt. No literal cabinet-property
+name remains anywhere in the generic rep path:
+
+- `LoopDescriptor.per_iter_cycles` is now `Option<CycleCharge>
+  { property, per_iter }` — the structurally identified cycle-counter
+  member's *name* rides with the per-key literal, and
+  `commit_ip_and_cycles` charges through it (and advances IP through
+  `descriptor.ip_property`) instead of hardcoded `"IP"`/`"cycleCount"`.
+  New test: a `--pc_y`/`--zorch` cabinet commits to its own slots —
+  could not pass before.
+- The dispatcher routes on each descriptor's `key_property` instead of
+  literal `--opcode` (a last-read cache keeps it one slot read per tick
+  when descriptors share a family).
+- Panic diagnostics and `CALCITE_REP_DIAG` counters are descriptor-
+  driven: the x86 opname/REP-prefix decode tables are deleted, fires
+  tally per dispatch-key value, and `describe_loop_state` dumps the
+  loop's own slots by descriptor-carried names.
+
+**Verification.** Branch: 288 unit tests; calcite-cli A/B vs the
+pre-merge main binary **byte-identical** (cycles+IP, 7 smoke cabinets ×
+2M ticks); CSS-DOS smoke 7/7 (109 s). Post-merge from `main`: 288 unit
+tests; smoke 7/7 (113 s); doom8088 title screen verified via
+fast-shoot at tick 6M (mode 13h render correct). No new bench — the
+binary behaviour is byte-identical to the branch benched 2026-06-09
+(+0.50% wall / −1.49% t/s, inside gate/noise).
+
+**Remaining genericity residue on main (not blockers, tracked):**
+`column_drawer_fast_forward` + `COLUMN_DRAWER_BODY` (~280 lines) is
+upstream-knowledge code but **default-off** (env `CALCITE_FUSION_FASTFWD`,
+disabled 2026-04-29 as a perf net-loss; hard-`false` on wasm) — queued
+for deletion as dead code. LODS-shape `Full` commit still refuses
+loudly (accumulator target not modelled; unreached by any current
+cart, proven by the A/B).
+
 ## 2026-06-09 — rep-generic: smoke 7/7 + byte-identical A/B + bench — cheat removal verified on the branch
 
 Branch `feat/rep-generic` (`247b274` → `17fe7da`, pushed). Cross-link:
