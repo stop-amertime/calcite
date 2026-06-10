@@ -815,35 +815,25 @@ pub(crate) fn apply_read_only_with_commit(
     if !descriptor.flag_conditioned {
         // LODS shape. No memory writes, no early exit, n iterations.
         //
-        // The hardcoded `rep_fast_forward` does NOT fast-forward LODS at
-        // all (it's not in `is_stos_movs` or `is_cmps_scas`), so the
-        // dispatch site in `compile.rs::rep_fast_forward` never reaches
-        // this branch with `commit == Full`. The applier is wired to
-        // produce a defensible iteration count for the dual harness, but
-        // the state-var commit below is unused in practice. We commit it
-        // anyway because if a future caller does feed LODS through this
-        // path, partial commits would be a worse failure mode than
-        // committing what we know.
+        // A LODS-shape loop loads the accumulator from memory every
+        // iteration; its post-loop accumulator is mem[last pointer
+        // position]. The applier does not yet model the accumulator
+        // target structurally, so a Full commit would advance pointer /
+        // counter / IP while leaving the accumulator stale — silent
+        // corruption. Loud-not-wrong: refuse, so the dispatcher panics
+        // and the gap is extended deliberately rather than discovered
+        // as misbehaviour downstream. (No smoke-set or doom cabinet
+        // reaches this arm — verified by byte-identical A/B against the
+        // hardcoded path, which never fast-forwarded LODS at all.)
         if p_count != 1 {
             return ApplyOutcome::Unsupported(
                 "LODS shape (flag_conditioned=false) expects exactly 1 pointer",
             );
         }
         if commit == CommitMode::Full {
-            let ptr_entry = &descriptor.pointers[0];
-            let Some(ptr_value) = read_prop(program, state, slots, &ptr_entry.self_property)
-            else {
-                return ApplyOutcome::Unsupported("LODS pointer unresolved");
-            };
-            let Some(flags) = read_prop(program, state, slots, &ptr_entry.flag_property) else {
-                return ApplyOutcome::Unsupported("LODS flag_property unresolved");
-            };
-            let df_active = ((flags >> ptr_entry.flag_bit) & 1) != 0;
-            let signed_step = if df_active { -ptr_entry.base_step } else { ptr_entry.base_step };
-            let new_ptr = (ptr_value + n * signed_step) & 0xFFFF;
-            commit_pointer(state, &ptr_entry.property, new_ptr);
-            commit_counter(state, &counter.property, 0);
-            commit_ip_and_cycles(program, state, slots, descriptor, n, per_iter);
+            return ApplyOutcome::Unsupported(
+                "LODS-shape Full commit not implemented (accumulator target not modelled)",
+            );
         }
         return ApplyOutcome::Applied { iterations: n };
     }
