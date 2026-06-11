@@ -11,6 +11,38 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-06-11 — short dense dispatch chains (`f2c8615`): chain threshold 6→2 on the flat path, ~+3-5% web throughput
+
+Follows the 2026-06-10 headroom note (BIfNEL = top op bucket, 22.6%).
+Runtime adjacency profiling showed 62% of `BranchIfNotEqLit`
+executions are immediately followed by another — chain-walking in
+probe runs shorter than `MIN_CHAIN_LEN = 6`, which
+`build_dispatch_chains` refused to convert. New `MIN_FLAT_CHAIN_LEN
+= 2`: chains of 2–5 probes convert **only when the dense flat-array
+path applies** (range ≤ 256, ≤ 3× count); the HashMap path keeps
+threshold 6 (linear probes beat a map lookup at that size).
+
+**doom8088.** Chains 208 → 358; dispatched ops/tick 700 → 678
+(−3.1%); BIfNEL 178 → 137/tick. All short chains on this cabinet are
+dense — a sparse-short-chain linear-scan variant (`small_table`) was
+built, exposed a remap hazard (passes that reindex ops remap
+chain-table PCs via `entries`/`flat_table` and must cover any new
+field), then **reverted as dead weight** (zero sparse short chains;
+chain count unchanged). Remaining BIfNEL self-follow (58%) is
+cross-slot guard sequences, not convertible chains.
+
+**Verification.** 300 lib tests; doom8088 state dump byte-identical
+@2M ticks; cycles+IP identical @8M; smoke 7/7. **Host caveat:** the
+bench host ran ~35% below the 2026-06-10 baseline all day (310K vs
+477K t/s web) — cross-day absolute comparison invalid. Same-day
+3-run web A/B medians (ref vs new wasm, same host state): **+4.8%
+t/s / −5.8% runMsToInGame / −4.4% doomLoad**; CLI A/B +2–3%; one ref
+run overlapped the new band, so quote this as ~+3–5%. JSONs: CSS-DOS
+`docs/benches/doom-all-2026-06-11-chainlen{2,-ref}-run{1,2,3}.json`.
+Re-baseline STATUS numbers on a healthy host before next perf claim.
+
+---
+
 ## 2026-06-10 — copy propagation + DCE landed (`967ddad` + `9ecc6de`): −17.8% dispatched ops, +4.6% web throughput
 
 Executes the copy-elimination proposal from the 2026-06-09 op-profile
