@@ -5252,9 +5252,16 @@ fn build_dispatch_chains(program: &mut CompiledProgram) -> usize {
     total
 }
 
-/// Minimum chain length to convert. Below this, linear BranchIfNotEqLit
-/// is probably faster than a HashMap lookup (which costs ~30ns vs ~5ns/op).
+/// Minimum chain length to convert via the HashMap path. Below this, linear
+/// BranchIfNotEqLit is probably faster than a HashMap lookup (which costs
+/// ~30ns vs ~5ns/op).
 const MIN_CHAIN_LEN: usize = 6;
+
+/// Minimum chain length to convert when the dense flat-array path applies.
+/// A flat-array lookup costs about as much as a single BranchIfNotEqLit, so
+/// replacing even a two-probe chain saves an interpreter dispatch whenever
+/// the first probe misses.
+const MIN_FLAT_CHAIN_LEN: usize = 2;
 
 fn chains_in_ops(ops: &mut [Op], chain_tables: &mut Vec<DispatchChainTable>) -> usize {
     let mut built = 0;
@@ -5287,7 +5294,7 @@ fn chains_in_ops(ops: &mut [Op], chain_tables: &mut Vec<DispatchChainTable>) -> 
             }
         }
 
-        if entries.len() >= MIN_CHAIN_LEN {
+        if entries.len() >= MIN_FLAT_CHAIN_LEN {
             // Build the table.
             let mut table = DispatchChainTable::default();
             for (v, pc) in &entries {
@@ -5315,12 +5322,18 @@ fn chains_in_ops(ops: &mut [Op], chain_tables: &mut Vec<DispatchChainTable>) -> 
                     table.flat_table = Some(FlatChainTable { base: min_k, targets });
                 }
             }
-            let chain_id = chain_tables.len() as u32;
-            chain_tables.push(table);
-            ops[i] = Op::DispatchChain { a: key_slot, chain_id, miss_target: miss };
-            built += 1;
-            // Advance past the whole chain so we don't nest chains.
-            i = last_branch_pc + 1;
+            // Short chains only pay off through the flat-array path; without
+            // it, linear probes beat a HashMap lookup, so leave them alone.
+            if table.flat_table.is_some() || entries.len() >= MIN_CHAIN_LEN {
+                let chain_id = chain_tables.len() as u32;
+                chain_tables.push(table);
+                ops[i] = Op::DispatchChain { a: key_slot, chain_id, miss_target: miss };
+                built += 1;
+                // Advance past the whole chain so we don't nest chains.
+                i = last_branch_pc + 1;
+            } else {
+                i += 1;
+            }
         } else {
             i += 1;
         }
