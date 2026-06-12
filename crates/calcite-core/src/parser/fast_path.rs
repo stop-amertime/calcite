@@ -59,7 +59,7 @@ use std::collections::HashMap;
 
 use crate::pattern::broadcast_write::BroadcastWrite;
 use crate::pattern::packed_broadcast_write::PackedSlotPort;
-use crate::types::{CalcOp, CssValue, Expr, PropertyDef, StyleBranch, StyleTest};
+use crate::types::{CalcOp, CssValue, Expr, FnDispatchRun, PropertyDef, StyleBranch, StyleTest};
 
 /// What the fast-path produces.
 ///
@@ -81,6 +81,10 @@ pub struct FastPathResult {
     /// know they're "absorbed" so dispatch-table recognition and the
     /// regular broadcast recogniser skip them.
     pub absorbed_properties: std::collections::HashSet<String>,
+    /// Dense literal dispatch runs found inside `@function` bodies
+    /// (`style(--key: N): V;` with N, V integer literals). The evaluator
+    /// merges these into the function's recognised `DispatchTable`.
+    pub fn_dispatch_runs: Vec<FnDispatchRun>,
     /// Byte ranges [start, end) in the original CSS the caller should
     /// overwrite with spaces before feeding to cssparser. The ranges are
     /// guaranteed non-overlapping and sorted.
@@ -94,6 +98,7 @@ impl FastPathResult {
             broadcast_writes: Vec::new(),
             packed_broadcast_ports: Vec::new(),
             absorbed_properties: std::collections::HashSet::new(),
+            fn_dispatch_runs: Vec::new(),
             blank_ranges: Vec::new(),
         }
     }
@@ -116,6 +121,10 @@ pub fn recognise(css: &str) -> FastPathResult {
 
     // Attempt assignment-templated runs (e.g. `--mN: if(...);`).
     recognise_assignment_run(bytes, &mut result);
+
+    // Attempt dense literal dispatch runs inside `@function` bodies
+    // (e.g. rom-disk byte tables: `style(--idx: N): V;`).
+    recognise_fn_dispatch_runs(bytes, &mut result);
 
     // Sort blank ranges.
     result.blank_ranges.sort_by_key(|&(s, _)| s);
@@ -1134,6 +1143,266 @@ fn extract_branches(
 
 const PROPERTY_ANCHOR: &[u8] = b"\n@property --";
 
+// ---------------------------------------------------------------------------
+// `@function` literal dispatch runs
+// ---------------------------------------------------------------------------
+//
+// Cabinets encode bulk byte data (rom-disk images, ROM regions) as huge
+// dispatch functions:
+//
+//   @function --readDiskByte(--idx <integer>) returns <integer> {
+//     result: if(
+//       style(--idx: 5): 23;
+//       style(--idx: 7): 99;
+//       ... millions of branches ...
+//     else: 0);
+//   }
+//
+// Each branch is pure data — an integer key and an integer value — yet the
+// slow path tokenises every byte, builds a `StyleBranch` (with a fresh heap
+// `String` for the key property) per branch, then clones the lot three more
+// times on the way to a flat array. Here we byte-match dense runs of the
+// literal shape, collect `(key, value)` pairs directly, and blank the
+// source so cssparser sees only whitespace. Entries whose value is NOT an
+// integer literal (`style(--at: N): mod(var(--__1mcK), 256);`) terminate
+// the current run and are left for the normal parser — only the pure
+// literal stretches are absorbed.
+
+/// Minimum entries before a literal dispatch run is worth absorbing.
+/// Below this the slow path is cheap and recognise_dispatch's behaviour
+/// (4-branch threshold etc.) should stay exactly as-is.
+const MIN_FN_DISPATCH_RUN: usize = 1000;
+
+const FUNCTION_ANCHOR: &[u8] = b"@function";
+
+/// A/B switch: `CALCITE_NO_FN_DISPATCH_FAST=1` disables the function-
+/// dispatch fast path (native only; wasm has no env). Same pattern as
+/// `CALCITE_NO_COPY_ELIM`.
+fn fn_dispatch_fast_enabled() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var_os("CALCITE_NO_FN_DISPATCH_FAST").is_none()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        true
+    }
+}
+
+fn recognise_fn_dispatch_runs(bytes: &[u8], result: &mut FastPathResult) {
+    if !fn_dispatch_fast_enabled() {
+        return;
+    }
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let offset = match find_subslice(&bytes[cursor..], FUNCTION_ANCHOR) {
+            Some(o) => cursor + o,
+            None => break,
+        };
+        let after_anchor = offset + FUNCTION_ANCHOR.len();
+        // Parse the function name: whitespace then `--ident`.
+        let mut i = skip_ws(bytes, after_anchor);
+        let name_start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
+        {
+            i += 1;
+        }
+        if i == name_start || !bytes[name_start..].starts_with(b"--") {
+            cursor = after_anchor;
+            continue;
+        }
+        let fn_name = match std::str::from_utf8(&bytes[name_start..i]) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                cursor = after_anchor;
+                continue;
+            }
+        };
+        // Find the body: first `{` after the prelude (the prelude's parens /
+        // `<integer>` types contain no braces).
+        let brace = match bytes[i..].iter().position(|&b| b == b'{') {
+            Some(p) => i + p,
+            None => break,
+        };
+        let body_end = match scan_balanced_braces(bytes, brace) {
+            Some(e) => e,
+            None => {
+                cursor = after_anchor;
+                continue;
+            }
+        };
+        scan_fn_dispatch_body(bytes, brace + 1, body_end, &fn_name, result);
+        cursor = body_end + 1;
+    }
+}
+
+/// Within a function body `[start, end)`, locate `result: if(` and absorb
+/// dense literal entry runs from the `if()` argument list.
+fn scan_fn_dispatch_body(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    fn_name: &str,
+    result: &mut FastPathResult,
+) {
+    // Find a `result` ident at declaration position followed by `: if(`.
+    let mut search = start;
+    let entries_start = loop {
+        let off = match find_subslice(&bytes[search..end], b"result") {
+            Some(o) => search + o,
+            None => return,
+        };
+        search = off + b"result".len();
+        // Must sit at a declaration boundary, not inside another ident
+        // (e.g. `--myresult`).
+        let prev = if off == 0 { b'{' } else { bytes[off - 1] };
+        if !matches!(prev, b'{' | b'}' | b';' | b' ' | b'\t' | b'\n' | b'\r') {
+            continue;
+        }
+        let mut j = skip_ws(bytes, off + b"result".len());
+        if bytes.get(j) != Some(&b':') {
+            continue;
+        }
+        j = skip_ws(bytes, j + 1);
+        if !bytes[j..end.min(bytes.len())].starts_with(b"if(") {
+            continue;
+        }
+        break j + b"if(".len();
+    };
+
+    // Walk entries. A run accumulates consecutive literal entries sharing
+    // one key property; anything else flushes the run.
+    let mut run_entries: Vec<(i64, i32)> = Vec::new();
+    let mut run_key: Option<String> = None;
+    let mut run_start = 0usize;
+    let mut run_end = 0usize;
+    let mut p = entries_start;
+
+    macro_rules! flush_run {
+        () => {
+            if run_entries.len() >= MIN_FN_DISPATCH_RUN {
+                result.blank_ranges.push((run_start, run_end));
+                result.fn_dispatch_runs.push(FnDispatchRun {
+                    function: fn_name.to_string(),
+                    key_property: run_key.take().unwrap_or_default(),
+                    entries: std::mem::take(&mut run_entries),
+                });
+            } else {
+                run_entries.clear();
+                run_key = None;
+            }
+        };
+    }
+
+    while p < end {
+        p = skip_ws(bytes, p);
+        if p >= end || bytes[p] == b')' || bytes[p..end].starts_with(b"else") {
+            break;
+        }
+        match try_literal_entry(bytes, p, end) {
+            Some((entry_end, key_prop, key, val)) => {
+                let same_key = run_key.as_deref() == Some(key_prop);
+                if !same_key {
+                    flush_run!();
+                    run_key = Some(key_prop.to_string());
+                    run_start = p;
+                }
+                if run_entries.is_empty() {
+                    run_start = p;
+                }
+                run_entries.push((key, val));
+                run_end = entry_end;
+                p = entry_end;
+            }
+            None => {
+                // Not a literal entry (templated value, compound test, …):
+                // flush and skip one entry. scan_balanced_to_semicolon
+                // tolerates nested parens in the value expression.
+                flush_run!();
+                match scan_balanced_to_semicolon(bytes, p) {
+                    Some(semi) if semi < end => p = semi + 1,
+                    _ => return, // malformed — leave everything to cssparser
+                }
+            }
+        }
+    }
+    flush_run!();
+}
+
+/// Try to match one `style(--key: <int>) : <int> ;` entry at `p`.
+/// Returns `(end_offset_past_semicolon, key_property, key, value)`.
+fn try_literal_entry<'a>(
+    bytes: &'a [u8],
+    p: usize,
+    end: usize,
+) -> Option<(usize, &'a str, i64, i32)> {
+    let mut i = p;
+    if !bytes[i..end].starts_with(b"style(") {
+        return None;
+    }
+    i = skip_ws(bytes, i + b"style(".len());
+    if !bytes[i..].starts_with(b"--") {
+        return None;
+    }
+    let key_start = i;
+    while i < end && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_') {
+        i += 1;
+    }
+    let key_prop = std::str::from_utf8(&bytes[key_start..i]).ok()?;
+    i = skip_ws(bytes, i);
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    i = skip_ws(bytes, i + 1);
+    let (key, ni) = parse_int(bytes, i, end)?;
+    i = skip_ws(bytes, ni);
+    if bytes.get(i) != Some(&b')') {
+        return None;
+    }
+    i = skip_ws(bytes, i + 1);
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    i = skip_ws(bytes, i + 1);
+    let (val, ni) = parse_int(bytes, i, end)?;
+    let val32 = i32::try_from(val).ok()?;
+    i = skip_ws(bytes, ni);
+    if bytes.get(i) != Some(&b';') {
+        return None;
+    }
+    Some((i + 1, key_prop, key, val32))
+}
+
+/// Parse an optionally-negative decimal integer at `p`. Returns the value
+/// and the offset past the last digit.
+fn parse_int(bytes: &[u8], p: usize, end: usize) -> Option<(i64, usize)> {
+    let mut i = p;
+    let neg = if bytes.get(i) == Some(&b'-') {
+        i += 1;
+        true
+    } else {
+        false
+    };
+    let digit_start = i;
+    let mut val: i64 = 0;
+    while i < end && bytes[i].is_ascii_digit() {
+        val = val.checked_mul(10)?.checked_add((bytes[i] - b'0') as i64)?;
+        i += 1;
+    }
+    if i == digit_start {
+        return None;
+    }
+    Some((if neg { -val } else { val }, i))
+}
+
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
 fn recognise_property_run(bytes: &[u8], result: &mut FastPathResult) {
     let mut cursor = 0usize;
     while cursor < bytes.len() {
@@ -1526,5 +1795,90 @@ mod tests {
         // Remove "world" (offsets 6..11), expect a newline inserted.
         let out = apply_blank_ranges(css, &[(6, 11)]);
         assert_eq!(out, "hello\n\n\nfoo");
+    }
+
+    // ---- fn-dispatch run recognition ----
+
+    /// Build a dispatch function with `n` literal entries on `--idx`,
+    /// bracketed by one non-literal entry on each side.
+    fn dispatch_css(n: usize) -> String {
+        let mut css = String::new();
+        css.push_str("@function --rdb(--idx <integer>) returns <integer> {\n");
+        css.push_str("  result: if(\n");
+        css.push_str("    style(--idx: 4096): var(--special);\n");
+        for i in 0..n {
+            css.push_str(&format!("    style(--idx: {}): {};\n", 10_000 + 2 * i, i % 256));
+        }
+        css.push_str("    style(--idx: 8192): mod(var(--other), 256);\n");
+        css.push_str("  else: 0);\n");
+        css.push_str("}\n");
+        css
+    }
+
+    #[test]
+    fn fn_dispatch_run_recognised() {
+        let css = dispatch_css(1500);
+        let result = recognise(&css);
+        assert_eq!(result.fn_dispatch_runs.len(), 1);
+        let run = &result.fn_dispatch_runs[0];
+        assert_eq!(run.function, "--rdb");
+        assert_eq!(run.key_property, "--idx");
+        assert_eq!(run.entries.len(), 1500);
+        assert_eq!(run.entries[0], (10_000, 0));
+        assert_eq!(run.entries[700], (10_000 + 1400, 700 % 256));
+        // The blanked text must still parse, with only the non-literal
+        // entries surviving as branches.
+        let blanked = apply_blank_ranges(&css, &result.blank_ranges);
+        let prog = crate::parser::parse_stylesheet(&blanked).unwrap();
+        let func = &prog.functions[0];
+        let Expr::StyleCondition { branches, fallback } = &func.result else {
+            panic!("expected if() result, got {:?}", func.result);
+        };
+        assert_eq!(branches.len(), 2, "only the two non-literal entries remain");
+        assert_eq!(**fallback, Expr::Literal(0.0));
+    }
+
+    #[test]
+    fn fn_dispatch_run_below_threshold_left_alone() {
+        let css = dispatch_css(MIN_FN_DISPATCH_RUN - 1);
+        let result = recognise(&css);
+        assert!(result.fn_dispatch_runs.is_empty());
+        assert!(result.blank_ranges.is_empty());
+    }
+
+    #[test]
+    fn fn_dispatch_key_change_splits_runs() {
+        let mut css = String::new();
+        css.push_str("@function --f(--a <integer>, --b <integer>) returns <integer> {\n");
+        css.push_str("  result: if(\n");
+        for i in 0..1200 {
+            css.push_str(&format!("    style(--a: {i}): 1;\n"));
+        }
+        for i in 0..1100 {
+            css.push_str(&format!("    style(--b: {i}): 2;\n"));
+        }
+        css.push_str("  else: 0);\n}\n");
+        let result = recognise(&css);
+        assert_eq!(result.fn_dispatch_runs.len(), 2);
+        assert_eq!(result.fn_dispatch_runs[0].key_property, "--a");
+        assert_eq!(result.fn_dispatch_runs[0].entries.len(), 1200);
+        assert_eq!(result.fn_dispatch_runs[1].key_property, "--b");
+        assert_eq!(result.fn_dispatch_runs[1].entries.len(), 1100);
+    }
+
+    #[test]
+    fn fn_dispatch_ignores_non_if_results_and_assignments() {
+        // No `result: if(` shape — nothing should be absorbed, even with
+        // many style() lines elsewhere (e.g. in a style rule).
+        let mut css = String::new();
+        css.push_str("@function --g(--x <integer>) returns <integer> {\n");
+        css.push_str("  result: calc(var(--x) + 1);\n}\n");
+        css.push_str(".cpu {\n");
+        for i in 0..2000 {
+            css.push_str(&format!("  --p{i}: {i};\n"));
+        }
+        css.push_str("}\n");
+        let result = recognise(&css);
+        assert!(result.fn_dispatch_runs.is_empty());
     }
 }

@@ -308,7 +308,7 @@ impl Evaluator {
     /// Build an evaluator from a `ParsedProgram`.
     pub fn from_parsed(program: &ParsedProgram) -> Self {
         let _t = Instant::now();
-        let functions: HashMap<String, FunctionDef> = program
+        let mut functions: HashMap<String, FunctionDef> = program
             .functions
             .iter()
             .map(|f| (f.name.clone(), f.clone()))
@@ -331,6 +331,57 @@ impl Evaluator {
                     dispatch_tables.insert(func.name.clone(), table);
                 }
             }
+        }
+
+        // Merge fast-path function-dispatch runs — dense literal entries the
+        // parser absorbed without ever building Expr trees — into the
+        // recognised tables. Three cases:
+        //  - a table was recognised on the same key → extend its entries;
+        //  - no table (the run absorbed everything, or the leftover branches
+        //    were below recognise_dispatch's threshold) but the leftovers
+        //    are compatible (same key, literal tests) → build the table here;
+        //  - anything else → re-inject the entries as plain branches so
+        //    behaviour is identical to the no-fast-path route.
+        // Key collisions between a run and parsed branches keep last-insert-
+        // wins semantics, matching recognise_dispatch (emitters don't
+        // duplicate keys).
+        let mut merged_entries = 0usize;
+        for run in &program.prebuilt_fn_dispatch_runs {
+            if let Some(table) = dispatch_tables.get_mut(&run.function) {
+                if table.key_property == run.key_property {
+                    table.entries.reserve(run.entries.len());
+                    for &(k, v) in &run.entries {
+                        table.entries.insert(k, Expr::Literal(v as f64));
+                    }
+                    merged_entries += run.entries.len();
+                } else {
+                    // Mixed keys: the original (unabsorbed) function would not
+                    // have been recognised as a table at all. Drop the table
+                    // and fall back to branch re-injection.
+                    log::warn!(
+                        "fn-dispatch run in {} keyed on {} conflicts with recognised table key {}; re-injecting as branches",
+                        run.function, run.key_property, table.key_property,
+                    );
+                    dispatch_tables.remove(&run.function);
+                    reinject_fn_dispatch_run(&mut functions, run);
+                }
+            } else if let Some(table) = build_table_from_run(&functions, run) {
+                merged_entries += run.entries.len();
+                dispatch_tables.insert(run.function.clone(), table);
+            } else {
+                log::warn!(
+                    "fn-dispatch run in {} ({} entries) not table-compatible; re-injecting as branches",
+                    run.function, run.entries.len(),
+                );
+                reinject_fn_dispatch_run(&mut functions, run);
+            }
+        }
+        if merged_entries > 0 {
+            log::info!(
+                "[fast-path] merged {} fn-dispatch runs ({} literal entries) into dispatch tables",
+                program.prebuilt_fn_dispatch_runs.len(),
+                merged_entries,
+            );
         }
 
         // Merge memory address mappings from identity-read dispatch tables into
@@ -1653,6 +1704,80 @@ fn parse_mem_address(s: &str) -> Option<i32> {
 /// Analyses function body structure to find mathematical patterns that can
 /// be compiled to efficient native operations. Also checks dispatch tables
 /// for identity-read patterns.
+/// Build a `DispatchTable` for a function whose dense literal entries were
+/// absorbed by the parser fast-path, when no table was recognised from the
+/// leftover branches alone (typically because the run absorbed everything
+/// and fewer than recognise_dispatch's 4-branch minimum remained). The
+/// leftover branches must be compatible — single tests on the run's key
+/// property with literal test values — and are folded into the table.
+fn build_table_from_run(
+    functions: &HashMap<String, FunctionDef>,
+    run: &crate::types::FnDispatchRun,
+) -> Option<DispatchTable> {
+    let func = functions.get(&run.function)?;
+    let Expr::StyleCondition { branches, fallback } = &func.result else {
+        return None;
+    };
+    let mut entries: HashMap<i64, Expr> =
+        HashMap::with_capacity(run.entries.len() + branches.len());
+    for branch in branches {
+        match &branch.condition {
+            StyleTest::Single {
+                property,
+                value: Expr::Literal(v),
+            } if *property == run.key_property => {
+                entries.insert(*v as i64, branch.then.clone());
+            }
+            _ => return None,
+        }
+    }
+    for &(k, v) in &run.entries {
+        entries.insert(k, Expr::Literal(v as f64));
+    }
+    Some(DispatchTable {
+        key_property: run.key_property.clone(),
+        entries,
+        fallback: (**fallback).clone(),
+    })
+}
+
+/// Correctness fallback: put a fast-path-absorbed dispatch run back into its
+/// function as ordinary branches (appended; key order is irrelevant because
+/// style() tests on distinct literals are mutually exclusive). Used when the
+/// function turns out not to be table-shaped, so the slow path sees exactly
+/// what it would have parsed.
+fn reinject_fn_dispatch_run(
+    functions: &mut HashMap<String, FunctionDef>,
+    run: &crate::types::FnDispatchRun,
+) {
+    let Some(func) = functions.get_mut(&run.function) else {
+        log::warn!(
+            "fn-dispatch run references unknown function {} — {} entries dropped",
+            run.function,
+            run.entries.len(),
+        );
+        return;
+    };
+    if let Expr::StyleCondition { branches, .. } = &mut func.result {
+        branches.reserve(run.entries.len());
+        for &(k, v) in &run.entries {
+            branches.push(StyleBranch {
+                condition: StyleTest::Single {
+                    property: run.key_property.clone(),
+                    value: Expr::Literal(k as f64),
+                },
+                then: Expr::Literal(v as f64),
+            });
+        }
+    } else {
+        log::warn!(
+            "fn-dispatch run in {} cannot be re-injected (result is not an if()) — {} entries dropped",
+            run.function,
+            run.entries.len(),
+        );
+    }
+}
+
 fn detect_function_patterns(
     functions: &HashMap<String, FunctionDef>,
     dispatch_tables: &HashMap<String, DispatchTable>,

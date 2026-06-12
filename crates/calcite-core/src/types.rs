@@ -280,11 +280,37 @@ pub struct ParsedProgram {
     /// filters these out of `assignments` and broadcast-write phase 2 by
     /// union with `BroadcastResult::absorbed_properties`.
     pub fast_path_absorbed: std::collections::HashSet<String>,
+    /// Dense literal dispatch runs pre-recognised by the fast-path inside
+    /// `@function` bodies. The corresponding branches do NOT appear in the
+    /// parsed `FunctionDef.result` — `eval::from_parsed` merges them into
+    /// the recognised `DispatchTable` for that function (or re-injects them
+    /// as branches if the function turns out not to be table-shaped).
+    pub prebuilt_fn_dispatch_runs: Vec<FnDispatchRun>,
     /// Input edges recognised from nested `&:has(#ID:pseudo) { --PROP: V; }`
     /// rules. Each edge says: when the host reports `(pseudo, selector)` is
     /// active, the gated property takes `value`. The compile pass collapses
     /// all edges sharing a property into a single synthesised assignment.
     pub input_edges: Vec<InputEdge>,
+}
+
+/// A dense run of literal dispatch entries pre-recognised by the parser
+/// fast-path inside a `@function` body: `style(--key: N): V;` lines where
+/// both N and V are integer literals. The run's source bytes are blanked
+/// before cssparser runs, so no `Expr` trees are ever built for these
+/// entries — `eval::from_parsed` merges them straight into the function's
+/// recognised `DispatchTable`.
+///
+/// Like the rest of the fast-path, this is structural recognition learned
+/// from the input bytes: the function name and key property are whatever
+/// the cabinet says they are.
+#[derive(Debug, Clone, Default)]
+pub struct FnDispatchRun {
+    /// The `@function` name the run was found in (e.g. `"--readDiskByte"`).
+    pub function: String,
+    /// The property every entry tests (e.g. `"--idx"`), with leading dashes.
+    pub key_property: String,
+    /// `(key, value)` pairs in source order.
+    pub entries: Vec<(i64, i32)>,
 }
 
 /// A gated assignment recognised from a nested `:has(...:pseudo)` rule.

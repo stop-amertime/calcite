@@ -495,11 +495,14 @@ pub fn parse_stylesheet(css: &str) -> Result<ParsedProgram> {
     };
     if !fast.blank_ranges.is_empty() {
         let blanked: usize = fast.blank_ranges.iter().map(|&(s, e)| e - s).sum();
+        let fn_run_entries: usize = fast.fn_dispatch_runs.iter().map(|r| r.entries.len()).sum();
         log::info!(
-            "[parse fast-path] recognised {} properties + {} broadcast writes + {} packed ports, blanked {:.1} MB ({:.1}% of input) in {:.2}s",
+            "[parse fast-path] recognised {} properties + {} broadcast writes + {} packed ports + {} fn-dispatch runs ({} entries), blanked {:.1} MB ({:.1}% of input) in {:.2}s",
             fast.properties.len(),
             fast.broadcast_writes.len(),
             fast.packed_broadcast_ports.len(),
+            fast.fn_dispatch_runs.len(),
+            fn_run_entries,
             blanked as f64 / 1_048_576.0,
             100.0 * blanked as f64 / total_bytes as f64,
             fast_elapsed,
@@ -561,6 +564,7 @@ pub fn parse_stylesheet(css: &str) -> Result<ParsedProgram> {
         prebuilt_broadcast_writes: fast.broadcast_writes,
         prebuilt_packed_broadcast_ports: fast.packed_broadcast_ports,
         fast_path_absorbed: fast.absorbed_properties,
+        prebuilt_fn_dispatch_runs: fast.fn_dispatch_runs,
         input_edges,
     })
 }

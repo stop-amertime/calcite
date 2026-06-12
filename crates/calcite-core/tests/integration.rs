@@ -1012,3 +1012,98 @@ fn input_edges_drive_keyboard_via_set_pseudo_class_active() {
     eval.tick(&mut state);
     assert_eq!(state.get_var("keyboard").unwrap(), 0);
 }
+
+// --- Parser fast-path: @function literal dispatch runs ---
+
+/// >1MB cabinet-shaped CSS whose dispatch function is mostly dense literal
+/// entries — the fast-path must absorb them without building Expr trees,
+/// and evaluation must be identical to the slow path's semantics.
+#[test]
+fn fn_dispatch_fast_path_end_to_end() {
+    let n: usize = 42_000; // pushes the file past the 1 MB fast-path gate
+    let mut css = String::new();
+    css.push_str("@property --sel { syntax: '<integer>'; inherits: true; initial-value: 0; }\n");
+    css.push_str("@property --out { syntax: '<integer>'; inherits: true; initial-value: 0; }\n");
+    css.push_str("@function --rdb(--idx <integer>) returns <integer> {\n  result: if(\n");
+    for i in 0..n {
+        css.push_str(&format!("    style(--idx: {}): {};\n", i, (i * 7) % 251));
+    }
+    css.push_str("  else: 99);\n}\n");
+    css.push_str(".cpu {\n  --out: --rdb(var(--sel));\n}\n");
+    assert!(css.len() > 1_000_000, "test CSS must exceed the fast-path gate");
+
+    let parsed = parse_css(&css).expect("should parse");
+    let absorbed: usize = parsed
+        .prebuilt_fn_dispatch_runs
+        .iter()
+        .map(|r| r.entries.len())
+        .sum();
+    assert_eq!(absorbed, n, "every literal entry should be absorbed");
+
+    // load_properties before from_parsed (same order as setup() / wasm):
+    // state var addresses must be registered before compilation.
+    let mut state = State::default();
+    state.load_properties(&parsed.properties);
+    let mut eval = Evaluator::from_parsed(&parsed);
+    let table = eval
+        .dispatch_tables
+        .get("--rdb")
+        .expect("dispatch table built from the fast-path run");
+    assert_eq!(table.entries.len(), n);
+    assert_eq!(table.key_property, "--idx");
+
+    for (sel, want) in [
+        (0, 0),
+        (1, 7),
+        (4096, (4096 * 7) % 251),
+        (41_999, (41_999 * 7) % 251),
+        (60_000, 99), // fallback
+    ] {
+        assert!(state.set_var("sel", sel as i32));
+        eval.tick(&mut state);
+        assert_eq!(
+            state.get_var("out").unwrap(),
+            want as i32,
+            "wrong dispatch result for key {sel}",
+        );
+    }
+}
+
+/// If the function turns out not to be table-shaped (here: leftover
+/// branches keyed on a different property), the absorbed entries must be
+/// re-injected as branches — same behaviour as the slow path, which would
+/// have refused to recognise a mixed-key table.
+#[test]
+fn fn_dispatch_fast_path_reinjects_on_mixed_keys() {
+    let n: usize = 42_000;
+    let mut css = String::new();
+    css.push_str("@property --sel { syntax: '<integer>'; inherits: true; initial-value: 0; }\n");
+    css.push_str("@property --osel { syntax: '<integer>'; inherits: true; initial-value: 0; }\n");
+    css.push_str("@property --out { syntax: '<integer>'; inherits: true; initial-value: 0; }\n");
+    css.push_str("@function --mixed(--idx <integer>, --oth <integer>) returns <integer> {\n  result: if(\n");
+    for i in 0..n {
+        css.push_str(&format!("    style(--idx: {}): {};\n", i, i % 200));
+    }
+    // Leftovers on a different key: recognise_dispatch must not produce a
+    // table for this function at all.
+    for i in 0..5 {
+        css.push_str(&format!("    style(--oth: {}): {};\n", 7_000_000 + i, 250 + i));
+    }
+    css.push_str("  else: 99);\n}\n");
+    css.push_str(".cpu {\n  --out: --mixed(var(--sel), var(--osel));\n}\n");
+    assert!(css.len() > 1_000_000);
+
+    let parsed = parse_css(&css).expect("should parse");
+    let eval = Evaluator::from_parsed(&parsed);
+    assert!(
+        !eval.dispatch_tables.contains_key("--mixed"),
+        "mixed-key function must not be table-recognised",
+    );
+    let func = eval.functions.get("--mixed").expect("function present");
+    let calcite_core::types::Expr::StyleCondition { branches, .. } = &func.result else {
+        panic!("expected if() result");
+    };
+    // 5 small-run --oth branches survive... wait, those 5 form their own
+    // sub-threshold run and are parsed normally; plus n re-injected.
+    assert_eq!(branches.len(), n + 5, "absorbed entries re-injected as branches");
+}
