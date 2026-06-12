@@ -1570,9 +1570,14 @@ fn load_css(path: &std::path::Path, base_interval: u32) -> Result<DebugSession, 
 
     let mut state = State::default();
     state.load_properties(&parsed.properties);
+    let (properties_count, functions_count, assignments_count) = (
+        parsed.properties.len(),
+        parsed.functions.len(),
+        parsed.assignments.len(),
+    );
 
     let t1 = std::time::Instant::now();
-    let evaluator = Evaluator::from_parsed(&parsed);
+    let (evaluator, _properties) = Evaluator::from_parsed_owned(parsed);
     eprintln!("Compiled in {:.2}s", t1.elapsed().as_secs_f64());
 
     // BIOS ROM bytes are emitted as literal branches inside --readMem, not as
@@ -1603,9 +1608,9 @@ fn load_css(path: &std::path::Path, base_interval: u32) -> Result<DebugSession, 
         bases: vec![(0u32, state)],
         deltas: Vec::new(),
         base_interval,
-        properties_count: parsed.properties.len(),
-        functions_count: parsed.functions.len(),
-        assignments_count: parsed.assignments.len(),
+        properties_count,
+        functions_count,
+        assignments_count,
         css_file: path.display().to_string(),
         property_names,
         summary: None,

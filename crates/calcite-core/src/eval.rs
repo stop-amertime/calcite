@@ -305,26 +305,76 @@ impl Evaluator {
         );
     }
 
-    /// Build an evaluator from a `ParsedProgram`.
+    /// Build an evaluator from a borrowed `ParsedProgram`. Thin wrapper
+    /// over [`Self::from_parsed_owned`] that clones the whole program —
+    /// fine for small inputs and native tools; the wasm/CLI hot paths use
+    /// the owned form to avoid duplicating multi-million-node ASTs.
     pub fn from_parsed(program: &ParsedProgram) -> Self {
+        Self::from_parsed_owned(program.clone()).0
+    }
+
+    /// Build an evaluator from an owned `ParsedProgram`, moving the parsed
+    /// data into the evaluator instead of cloning it (dispatch-table
+    /// entries, function defs, broadcast ports, assignments). Returns the
+    /// `@property` definitions back to the caller — the evaluator doesn't
+    /// keep them, and hosts need them for state resets.
+    pub fn from_parsed_owned(program: ParsedProgram) -> (Self, Vec<PropertyDef>) {
+        let ParsedProgram {
+            properties,
+            functions: program_functions,
+            assignments: program_assignments,
+            prebuilt_broadcast_writes,
+            prebuilt_packed_broadcast_ports,
+            fast_path_absorbed,
+            prebuilt_fn_dispatch_runs,
+            input_edges,
+        } = program;
+
         let _t = Instant::now();
-        // Recognise dispatch tables in function result expressions
+        // Recognise dispatch tables in function result expressions and
+        // build the functions map in one pass. For a recognised table the
+        // branches are DRAINED into it (the `then` expressions move — no
+        // clones) and the function is stored with an empty branch list:
+        // every runtime path (interpreter eval_function_call,
+        // compile_function_call) consults the table before the body, so
+        // the branches are dead weight there.
         let mut dispatch_tables = HashMap::new();
-        for func in &program.functions {
-            if let Expr::StyleCondition {
-                branches, fallback, ..
-            } = &func.result
-            {
-                if let Some(table) = dispatch_table::recognise_dispatch(branches, fallback) {
+        let mut functions: HashMap<String, FunctionDef> =
+            HashMap::with_capacity(program_functions.len());
+        for mut func in program_functions {
+            if let Expr::StyleCondition { branches, fallback } = &mut func.result {
+                if let Some(key) = dispatch_table::recognise_dispatch_key(branches) {
+                    let key_property = key.to_string();
+                    let mut entries = dispatch_table::DispatchEntries::with_capacity_and_hasher(
+                        branches.len(),
+                        Default::default(),
+                    );
+                    for branch in branches.drain(..) {
+                        if let StyleTest::Single {
+                            value: Expr::Literal(v),
+                            ..
+                        } = branch.condition
+                        {
+                            entries.insert(v as i64, branch.then);
+                        }
+                    }
                     log::info!(
                         "Recognised dispatch table in @function {}: {} entries on {}",
                         func.name,
-                        table.entries.len(),
-                        table.key_property,
+                        entries.len(),
+                        key_property,
                     );
-                    dispatch_tables.insert(func.name.clone(), table);
+                    dispatch_tables.insert(
+                        func.name.clone(),
+                        DispatchTable {
+                            key_property,
+                            entries,
+                            fallback: (**fallback).clone(),
+                        },
+                    );
                 }
             }
+            functions.insert(func.name.clone(), func);
         }
 
         // Merge fast-path function-dispatch runs — dense literal entries the
@@ -335,14 +385,13 @@ impl Evaluator {
         //    were below recognise_dispatch's threshold) but the leftovers
         //    are compatible (same key, literal tests) → build the table here;
         //  - anything else → re-inject the entries as plain branches so
-        //    behaviour is identical to the no-fast-path route (deferred
-        //    until the functions map exists below).
+        //    behaviour is identical to the no-fast-path route.
         // Key collisions between a run and parsed branches keep last-insert-
         // wins semantics, matching recognise_dispatch (emitters don't
         // duplicate keys).
         let mut merged_entries = 0usize;
-        let mut deferred_reinjects: Vec<&crate::types::FnDispatchRun> = Vec::new();
-        for run in &program.prebuilt_fn_dispatch_runs {
+        let run_count = prebuilt_fn_dispatch_runs.len();
+        for run in prebuilt_fn_dispatch_runs {
             if let Some(table) = dispatch_tables.get_mut(&run.function) {
                 if table.key_property == run.key_property {
                     table.entries.reserve(run.entries.len());
@@ -353,17 +402,30 @@ impl Evaluator {
                 } else {
                     // Mixed keys: the original (unabsorbed) function would not
                     // have been recognised as a table at all. Drop the table
-                    // and fall back to branch re-injection.
+                    // and fall back to branch re-injection. (The dropped
+                    // table's entries came from this function's drained
+                    // branches — put those back too.)
                     log::warn!(
                         "fn-dispatch run in {} keyed on {} conflicts with recognised table key {}; re-injecting as branches",
                         run.function, run.key_property, table.key_property,
                     );
-                    dispatch_tables.remove(&run.function);
-                    deferred_reinjects.push(run);
+                    let dropped = dispatch_tables.remove(&run.function);
+                    if let (Some(table), Some(func)) = (dropped, functions.get_mut(&run.function)) {
+                        if let Expr::StyleCondition { branches, .. } = &mut func.result {
+                            branches.extend(table.entries.into_iter().map(|(k, then)| {
+                                StyleBranch {
+                                    condition: StyleTest::Single {
+                                        property: table.key_property.clone(),
+                                        value: Expr::Literal(k as f64),
+                                    },
+                                    then,
+                                }
+                            }));
+                        }
+                    }
+                    reinject_fn_dispatch_run(&mut functions, &run);
                 }
-            } else if let Some(table) =
-                build_table_from_run(&program.functions, run)
-            {
+            } else if let Some(table) = build_table_from_run(&functions, &run) {
                 merged_entries += run.entries.len();
                 dispatch_tables.insert(run.function.clone(), table);
             } else {
@@ -371,55 +433,17 @@ impl Evaluator {
                     "fn-dispatch run in {} ({} entries) not table-compatible; re-injecting as branches",
                     run.function, run.entries.len(),
                 );
-                deferred_reinjects.push(run);
+                reinject_fn_dispatch_run(&mut functions, &run);
             }
         }
         if merged_entries > 0 {
             log::info!(
                 "[fast-path] merged {} fn-dispatch runs ({} literal entries) into dispatch tables",
-                program.prebuilt_fn_dispatch_runs.len(),
+                run_count,
                 merged_entries,
             );
         }
         crate::compile_stats::record("eval.dispatch_recognition", _t.elapsed().as_secs_f64());
-
-        // Build the functions map. For table-recognised functions the
-        // branches are dead weight — every runtime path (interpreter
-        // eval_function_call, compile_function_call) consults the dispatch
-        // table before the function body — so clone those defs with an
-        // empty branch list instead of deep-copying multi-hundred-K-branch
-        // trees (~4 s in wasm on the doom cabinet).
-        let _tc = Instant::now();
-        let mut functions: HashMap<String, FunctionDef> = program
-            .functions
-            .iter()
-            .map(|f| {
-                if dispatch_tables.contains_key(&f.name) {
-                    if let Expr::StyleCondition { fallback, .. } = &f.result {
-                        return (
-                            f.name.clone(),
-                            FunctionDef {
-                                name: f.name.clone(),
-                                parameters: f.parameters.clone(),
-                                locals: f.locals.clone(),
-                                result: Expr::StyleCondition {
-                                    branches: Vec::new(),
-                                    fallback: fallback.clone(),
-                                },
-                            },
-                        );
-                    }
-                }
-                (f.name.clone(), f.clone())
-            })
-            .collect();
-        crate::compile_stats::record("eval.functions_clone", _tc.elapsed().as_secs_f64());
-
-        // Correctness fallback for non-table-shaped functions whose runs
-        // were absorbed: put the entries back as plain branches.
-        for run in deferred_reinjects {
-            reinject_fn_dispatch_run(&mut functions, run);
-        }
 
         // Merge memory address mappings from identity-read dispatch tables into
         // the address map. State var addresses (from load_properties) take priority.
@@ -440,12 +464,12 @@ impl Evaluator {
         // never reached `program.assignments` (their Expr trees were never
         // built), so the recogniser can't see them.
         let mut broadcast_result =
-            broadcast_write::recognise_broadcast(&program.assignments);
-        for pre in &program.prebuilt_broadcast_writes {
-            broadcast_result.writes.push(pre.clone());
+            broadcast_write::recognise_broadcast(&program_assignments);
+        for pre in prebuilt_broadcast_writes {
+            broadcast_result.writes.push(pre);
         }
-        for name in &program.fast_path_absorbed {
-            broadcast_result.absorbed_properties.insert(name.clone());
+        for name in fast_path_absorbed {
+            broadcast_result.absorbed_properties.insert(name);
         }
         for bw in &broadcast_result.writes {
             let gate = bw.gate_property.as_deref().unwrap_or("(ungated)");
@@ -462,7 +486,7 @@ impl Evaluator {
         // so the assignment loop drops them.
         let mut packed_bw_result =
             crate::pattern::packed_broadcast_write::recognise_packed_broadcast(
-                &program.assignments,
+                &program_assignments,
             );
         for name in &packed_bw_result.absorbed_properties {
             broadcast_result.absorbed_properties.insert(name.clone());
@@ -471,7 +495,7 @@ impl Evaluator {
         // (gate, addr, val, width) tuple already present in the
         // AST-recognised result, union the address_map; otherwise push a
         // new port.
-        if !program.prebuilt_packed_broadcast_ports.is_empty() {
+        if !prebuilt_packed_broadcast_ports.is_empty() {
             use std::collections::HashMap;
             let mut idx_by_key: HashMap<(String, String, String, String), usize> =
                 HashMap::new();
@@ -486,7 +510,7 @@ impl Evaluator {
                     i,
                 );
             }
-            for pre in &program.prebuilt_packed_broadcast_ports {
+            for pre in prebuilt_packed_broadcast_ports {
                 let key = (
                     pre.gate_property.clone(),
                     pre.addr_property.clone(),
@@ -494,14 +518,12 @@ impl Evaluator {
                     pre.width_property.clone(),
                 );
                 if let Some(&i) = idx_by_key.get(&key) {
-                    for (&addr, name) in &pre.address_map {
-                        packed_bw_result.ports[i]
-                            .address_map
-                            .insert(addr, name.clone());
+                    for (addr, name) in pre.address_map {
+                        packed_bw_result.ports[i].address_map.insert(addr, name);
                     }
                 } else {
                     idx_by_key.insert(key, packed_bw_result.ports.len());
-                    packed_bw_result.ports.push(pre.clone());
+                    packed_bw_result.ports.push(pre);
                 }
             }
         }
@@ -518,7 +540,7 @@ impl Evaluator {
         let _t = Instant::now();
         // Identify string properties from @property syntax
         let mut string_property_names: HashSet<String> = HashSet::new();
-        for prop in &program.properties {
+        for prop in &properties {
             if matches!(&prop.syntax, PropertySyntax::Custom(s) if
                 s.contains("content-list") || s.contains("string"))
                 || matches!(&prop.syntax, PropertySyntax::Any)
@@ -530,17 +552,29 @@ impl Evaluator {
             }
         }
 
-        // Filter out:
+        // Recognise opcode-keyed self-loops in the dispatch family before
+        // the assignments are consumed below. (Pure function of the
+        // assignment list; historically ran after compile.)
+        let loop_descriptors =
+            crate::pattern::loop_descriptor::recognise_loops(&program_assignments);
+        log::info!(
+            "[loop-descriptor] recognised {} self-loop opcodes",
+            loop_descriptors.len(),
+        );
+
+        // Filter out (consuming the parsed assignments — no clones):
         // 1. Assignments absorbed into broadcast writes (would overwrite with stale values)
         // 2. Triple-buffer copies (--__0*, --__1*, --__2*) which are no-ops in mutable state
-        let all_assignments: Vec<Assignment> = program
-            .assignments
-            .iter()
+        let mut buffer_copies = 0usize;
+        let all_assignments: Vec<Assignment> = program_assignments
+            .into_iter()
             .filter(|a| {
+                if is_buffer_copy(&a.property) {
+                    buffer_copies += 1;
+                    return false;
+                }
                 !broadcast_result.absorbed_properties.contains(&a.property)
-                    && !is_buffer_copy(&a.property)
             })
-            .cloned()
             .collect();
 
         // Partition: string properties go to interpreter, rest to compiler
@@ -571,12 +605,6 @@ impl Evaluator {
         log::info!("[compile phase] topological sort: {:.2}s", _t.elapsed().as_secs_f64());
         crate::compile_stats::record("eval.topological_sort", _t.elapsed().as_secs_f64());
         let _t = Instant::now();
-        let buffer_copies = program
-            .assignments
-            .iter()
-            .filter(|a| is_buffer_copy(&a.property))
-            .count();
-
         log::info!(
             "Assignments: {} numeric, {} string, {} absorbed into broadcast writes, {} buffer copies skipped",
             assignments.len(),
@@ -621,8 +649,8 @@ impl Evaluator {
 
         // Compile input edges. Only literal values are supported in v1;
         // non-literal RHS expressions are skipped with a warning.
-        let mut input_edge_bindings = Vec::with_capacity(program.input_edges.len());
-        for edge in &program.input_edges {
+        let mut input_edge_bindings = Vec::with_capacity(input_edges.len());
+        for edge in input_edges {
             let value = match &edge.value {
                 Expr::Literal(v) => *v as i32,
                 _ => {
@@ -636,9 +664,9 @@ impl Evaluator {
                 }
             };
             input_edge_bindings.push(InputEdgeBinding {
-                property: edge.property.clone(),
-                pseudo: edge.pseudo.clone(),
-                selector: edge.selector.clone(),
+                property: edge.property,
+                pseudo: edge.pseudo,
+                selector: edge.selector,
                 value,
             });
         }
@@ -649,19 +677,10 @@ impl Evaluator {
             );
         }
 
-        // Recognise opcode-keyed self-loops in the cabinet's dispatch
-        // family. Phase 1 of the rep_fast_forward genericity mission:
-        // descriptors are produced but not yet consumed at runtime.
-        let loop_descriptors =
-            crate::pattern::loop_descriptor::recognise_loops(&program.assignments);
-        log::info!(
-            "[loop-descriptor] recognised {} self-loop opcodes",
-            loop_descriptors.len(),
-        );
         let mut compiled = compiled;
         compiled.loop_descriptors = loop_descriptors.clone();
 
-        Evaluator {
+        let evaluator = Evaluator {
             functions,
             assignments,
             dispatch_tables,
@@ -677,7 +696,8 @@ impl Evaluator {
             slots: Vec::with_capacity(slot_count),
             input_edge_bindings,
             loop_descriptors,
-        }
+        };
+        (evaluator, properties)
     }
 
     /// Return the input edges the recogniser bound, as
@@ -1753,10 +1773,10 @@ fn parse_mem_address(s: &str) -> Option<i32> {
 /// leftover branches must be compatible — single tests on the run's key
 /// property with literal test values — and are folded into the table.
 fn build_table_from_run(
-    functions: &[FunctionDef],
+    functions: &HashMap<String, FunctionDef>,
     run: &crate::types::FnDispatchRun,
 ) -> Option<DispatchTable> {
-    let func = functions.iter().find(|f| f.name == run.function)?;
+    let func = functions.get(&run.function)?;
     let Expr::StyleCondition { branches, fallback } = &func.result else {
         return None;
     };

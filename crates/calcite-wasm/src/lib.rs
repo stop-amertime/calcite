@@ -76,7 +76,12 @@ impl CalciteEngine {
         log::info!("Properties loaded, memory size: {} bytes", state.memory.len());
 
         log::info!("Creating evaluator...");
-        let evaluator = calcite_core::Evaluator::from_parsed(&parsed);
+        // Owned form: moves the parsed ASTs into the evaluator instead of
+        // cloning them (the borrow form deep-copies the whole program —
+        // seconds of wasm time on big cabinets). Returns the @property
+        // defs, which the engine keeps for reset().
+        let (evaluator, initial_properties) =
+            calcite_core::Evaluator::from_parsed_owned(parsed);
         log::info!("Evaluator created");
 
         // Copy literal BIOS-byte entries out of the --readMem dispatch table
@@ -108,7 +113,6 @@ impl CalciteEngine {
         // slot(s) directly — no per-tick apply path is needed.
         evaluator.wire_state_for_input_edges(&mut state);
 
-        let initial_properties = parsed.properties;
         // Wasm builds use the in-memory dump sink because the SW /
         // worker has no filesystem access; payloads ride out on
         // MeasurementEvents that the host drains.

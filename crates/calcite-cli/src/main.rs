@@ -564,7 +564,8 @@ fn main() {
             state.load_properties(&parsed.properties);
 
             let t1 = std::time::Instant::now();
-            let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
+            let (mut evaluator, _properties) =
+                calcite_core::Evaluator::from_parsed_owned(parsed);
             let compile_time = t1.elapsed();
 
             // --op-profile: enable adjacency tracking before the run starts.

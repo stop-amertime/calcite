@@ -26,6 +26,30 @@ pub struct DispatchTable {
     pub fallback: Expr,
 }
 
+/// Validation-only twin of [`recognise_dispatch`]: returns the shared key
+/// property if the branches form a dispatch table (≥4 single tests on one
+/// property, all against integer literals), without building or cloning
+/// anything. Owning callers use this to decide whether to *drain* the
+/// branches into a table instead of cloning them.
+pub fn recognise_dispatch_key(branches: &[StyleBranch]) -> Option<&str> {
+    if branches.len() < 4 {
+        return None;
+    }
+    let StyleTest::Single { property: key, .. } = &branches[0].condition else {
+        return None; // Compound conditions can't form a dispatch table
+    };
+    for branch in branches {
+        match &branch.condition {
+            StyleTest::Single {
+                property,
+                value: Expr::Literal(_),
+            } if property == key => {}
+            _ => return None, // mixed key / non-literal / compound
+        }
+    }
+    Some(key)
+}
+
 /// Try to recognise a `StyleCondition` as a dispatch table pattern.
 ///
 /// Returns `Some(DispatchTable)` if:
@@ -33,37 +57,20 @@ pub struct DispatchTable {
 /// - All test values are integer literals
 /// - There are enough branches to justify a table (threshold: 4)
 pub fn recognise_dispatch(branches: &[StyleBranch], fallback: &Expr) -> Option<DispatchTable> {
-    if branches.len() < 4 {
-        return None;
-    }
-
-    // Check that all branches are simple Single tests on the same property with integer literals
-    let key_property = match &branches[0].condition {
-        StyleTest::Single { property, .. } => property,
-        _ => return None, // Compound conditions can't form a dispatch table
-    };
+    let key_property = recognise_dispatch_key(branches)?.to_string();
     let mut entries =
         DispatchEntries::with_capacity_and_hasher(branches.len(), Default::default());
-
     for branch in branches {
-        match &branch.condition {
-            StyleTest::Single { property, value } => {
-                if property != key_property {
-                    return None; // Different properties — not a dispatch table
-                }
-                match value {
-                    Expr::Literal(v) => {
-                        entries.insert(*v as i64, branch.then.clone());
-                    }
-                    _ => return None, // Non-literal comparison
-                }
-            }
-            _ => return None, // Compound condition — not a dispatch table
+        if let StyleTest::Single {
+            value: Expr::Literal(v),
+            ..
+        } = &branch.condition
+        {
+            entries.insert(*v as i64, branch.then.clone());
         }
     }
-
     Some(DispatchTable {
-        key_property: key_property.clone(),
+        key_property,
         entries,
         fallback: fallback.clone(),
     })
