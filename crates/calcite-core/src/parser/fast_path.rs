@@ -340,24 +340,25 @@ fn try_assignment_run_from<'a>(
     if bytes.get(name_start) != Some(&b'-') || bytes.get(name_start + 1) != Some(&b'-') {
         return None;
     }
-    // Read the prefix — alphanumeric+underscore+dash until first digit.
+    // Read the full name — alphanumeric+underscore+dash — then split at
+    // its TRAILING digit run: `--__1mc4096` → prefix `__1mc`, addr 4096.
+    // (Splitting at the *first* digit would mis-handle names with digits
+    // mid-prefix, e.g. the `--__1*` buffer-copy genre.)
     let mut i = name_start + 2;
     while i < bytes.len() {
         let c = bytes[i];
-        if c.is_ascii_digit() {
-            break;
-        }
         if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
-            return None;
+            break;
         }
         i += 1;
     }
-    // Need at least one digit and a colon after the prefix.
-    let prefix_end = i;
-    if prefix_end == name_start + 2 {
-        return None;
+    let name_end = i;
+    let mut prefix_end = name_end;
+    while prefix_end > name_start + 2 && bytes[prefix_end - 1].is_ascii_digit() {
+        prefix_end -= 1;
     }
-    if !bytes.get(prefix_end).is_some_and(|b| b.is_ascii_digit()) {
+    // Need a non-empty prefix and at least one trailing digit.
+    if prefix_end == name_start + 2 || prefix_end == name_end {
         return None;
     }
     // The prefix spans [name_start+2 .. prefix_end) — strip leading `--`.
@@ -482,6 +483,26 @@ fn emit_assignment_run(
     if entries.len() < 3 {
         return;
     }
+
+    // Buffer-copy runs (`--__0*` / `--__1*` / `--__2*`) are dropped BY NAME
+    // in Evaluator::from_parsed (no-ops in mutable state — reads of these
+    // names resolve to the underlying state var instead). Parsing hundreds
+    // of thousands of them just so the filter can throw them away costs
+    // seconds on big cabinets; blank them here. Name-only check, mirroring
+    // eval::is_buffer_copy — the value expression is irrelevant to the
+    // downstream filter, so no template verification is needed.
+    if prefix.starts_with(b"__0") || prefix.starts_with(b"__1") || prefix.starts_with(b"__2") {
+        for &(s, e, _) in entries {
+            result.blank_ranges.push((s, e));
+        }
+        log::info!(
+            "[fast-path] assignment run `--{}` is buffer-copies: {} entries blanked (dropped by the evaluator's is_buffer_copy filter anyway)",
+            String::from_utf8_lossy(prefix),
+            entries.len(),
+        );
+        return;
+    }
+
     let (ra_idx, rb_idx, rc_idx) = pick_reference_triple(entries);
     let (ra_start, ra_end, ra_addr) = entries[ra_idx];
     let (rb_start, rb_end, rb_addr) = entries[rb_idx];
@@ -1864,6 +1885,25 @@ mod tests {
         assert_eq!(result.fn_dispatch_runs[0].entries.len(), 1200);
         assert_eq!(result.fn_dispatch_runs[1].key_property, "--b");
         assert_eq!(result.fn_dispatch_runs[1].entries.len(), 1100);
+    }
+
+    #[test]
+    fn buffer_copy_runs_blanked_without_template() {
+        // `--__1mcN: var(--__2mcN, K);` buffer reads are dropped by name in
+        // the evaluator; the fast path should blank them wholesale. The
+        // digit inside `__1` exercises the trailing-digit-run prefix split.
+        let mut css = String::from(".cpu {\n");
+        for i in 0..1500 {
+            css.push_str(&format!("  --__1mc{i}: var(--__2mc{i}, 0);\n"));
+        }
+        css.push_str("  --keep: 7;\n}\n");
+        let result = recognise(&css);
+        assert!(!result.blank_ranges.is_empty(), "buffer-copy run should blank");
+        assert!(result.broadcast_writes.is_empty());
+        let blanked = apply_blank_ranges(&css, &result.blank_ranges);
+        let prog = crate::parser::parse_stylesheet(&blanked).unwrap();
+        assert_eq!(prog.assignments.len(), 1, "only --keep survives");
+        assert_eq!(prog.assignments[0].property, "--keep");
     }
 
     #[test]
