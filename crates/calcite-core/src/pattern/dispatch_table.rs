@@ -5,9 +5,12 @@
 //!
 //! Replaces: linear scan with `table[key]` lookup.
 
-use std::collections::HashMap;
-
 use crate::types::*;
+
+/// Entry map for dispatch tables. FxHashMap rather than std: cabinets
+/// produce tables with millions of i64 keys, and SipHash dominates the
+/// insert/clone cost at that scale (especially in wasm).
+pub type DispatchEntries = rustc_hash::FxHashMap<i64, Expr>;
 
 /// A dispatch table built from a large `if(style())` chain.
 ///
@@ -18,7 +21,7 @@ pub struct DispatchTable {
     /// The property being dispatched on (e.g., `--at` in readMem).
     pub key_property: String,
     /// Map from integer key value → result expression.
-    pub entries: HashMap<i64, Expr>,
+    pub entries: DispatchEntries,
     /// Fallback expression when the key doesn't match any entry.
     pub fallback: Expr,
 }
@@ -39,7 +42,8 @@ pub fn recognise_dispatch(branches: &[StyleBranch], fallback: &Expr) -> Option<D
         StyleTest::Single { property, .. } => property,
         _ => return None, // Compound conditions can't form a dispatch table
     };
-    let mut entries = HashMap::with_capacity(branches.len());
+    let mut entries =
+        DispatchEntries::with_capacity_and_hasher(branches.len(), Default::default());
 
     for branch in branches {
         match &branch.condition {

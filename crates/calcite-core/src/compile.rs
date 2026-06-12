@@ -9380,7 +9380,7 @@ mod tests {
             "--readMem".to_string(),
             DispatchTable {
                 key_property: "--at".to_string(),
-                entries,
+                entries: entries.into_iter().collect(),
                 fallback: Expr::Literal(0.0),
             },
         );
@@ -9572,7 +9572,7 @@ mod tests {
             "--lookup".to_string(),
             DispatchTable {
                 key_property: "--key".to_string(),
-                entries,
+                entries: entries.into_iter().collect(),
                 fallback: Expr::Literal(0.0),
             },
         );
@@ -9642,7 +9642,7 @@ mod tests {
             "--readByte".to_string(),
             DispatchTable {
                 key_property: "--idx".to_string(),
-                entries,
+                entries: entries.into_iter().collect(),
                 fallback: Expr::Literal(-1.0),
             },
         );

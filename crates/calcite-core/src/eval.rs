@@ -1760,8 +1760,10 @@ fn build_table_from_run(
     let Expr::StyleCondition { branches, fallback } = &func.result else {
         return None;
     };
-    let mut entries: HashMap<i64, Expr> =
-        HashMap::with_capacity(run.entries.len() + branches.len());
+    let mut entries = crate::pattern::dispatch_table::DispatchEntries::with_capacity_and_hasher(
+        run.entries.len() + branches.len(),
+        Default::default(),
+    );
     for branch in branches {
         match &branch.condition {
             StyleTest::Single {
@@ -2257,7 +2259,7 @@ impl Evaluator {
         // Check for a dispatch table optimisation.
         if let Some(table) = self.dispatch_tables.get(name) {
             let table_key = &table.key_property as *const String;
-            let table_entries = &table.entries as *const HashMap<i64, Expr>;
+            let table_entries = &table.entries as *const crate::pattern::dispatch_table::DispatchEntries;
             let table_fallback = &table.fallback as *const Expr;
             // SAFETY: dispatch_tables is not modified during evaluation.
             return unsafe {
@@ -2338,7 +2340,7 @@ impl Evaluator {
         &mut self,
         name: &str,
         key_property: &str,
-        entries: &HashMap<i64, Expr>,
+        entries: &crate::pattern::dispatch_table::DispatchEntries,
         fallback: &Expr,
         args: &[Expr],
         state: &State,
@@ -2591,7 +2593,7 @@ mod tests {
             "--lookup".to_string(),
             crate::pattern::dispatch_table::DispatchTable {
                 key_property: "--key".to_string(),
-                entries,
+                entries: entries.into_iter().collect(),
                 fallback: Expr::Literal(0.0),
             },
         );
