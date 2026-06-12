@@ -11,6 +11,27 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-06-12 — column_drawer_fast_forward DELETED: last x86-aware code block removed
+
+Release-audit cleanup; closes the "remaining genericity residue" item
+from the 2026-06-10 merge note. Deleted from
+`crates/calcite-core/src/compile.rs`: the `post_tick_apply` call site,
+`FusionDiag` + its thread-local diag fns, both `fusion_fastfwd_enabled`
+definitions (env gate `CALCITE_FUSION_FASTFWD`), `COLUMN_DRAWER_BODY`
+(21-byte doom8088 opcode pattern), `column_drawer_fast_forward()` and
+`rom_match()` — ~285 lines, default-off since 2026-04-29 (perf
+net-loss), hard-`false` on wasm, so no behaviour change. Also removed
+the `CALCITE_FUSION_DIAG` hooks + fire-count print from
+`calcite-cli/src/main.rs`. A pre-deletion audit swept crates/ for other
+upstream knowledge: none found outside comments and test fixtures —
+with this deletion the cardinal rule holds tree-wide.
+
+**Verification.** `cargo build --release` green; `cargo test -p
+calcite-core --release` all targets pass; CSS-DOS smoke gate run
+post-deletion. (`cargo test --workspace` fails on this host compiling
+`windows-sys`/`chrono` test deps — `dlltool.exe` missing — pre-existing
+environment issue, unrelated.) Cross-link: CSS-DOS LOGBOOK 2026-06-12.
+
 ## 2026-06-11 — short dense dispatch chains (`f2c8615`): chain threshold 6→2 on the flat path, ~+3-5% web throughput
 
 Follows the 2026-06-10 headroom note (BIfNEL = top op bucket, 22.6%).
@@ -131,12 +152,12 @@ binary behaviour is byte-identical to the branch benched 2026-06-09
 (+0.50% wall / −1.49% t/s, inside gate/noise).
 
 **Remaining genericity residue on main (not blockers, tracked):**
-`column_drawer_fast_forward` + `COLUMN_DRAWER_BODY` (~280 lines) is
-upstream-knowledge code but **default-off** (env `CALCITE_FUSION_FASTFWD`,
-disabled 2026-04-29 as a perf net-loss; hard-`false` on wasm) — queued
-for deletion as dead code. LODS-shape `Full` commit still refuses
-loudly (accumulator target not modelled; unreached by any current
-cart, proven by the A/B).
+`column_drawer_fast_forward` + `COLUMN_DRAWER_BODY` (~280 lines) was
+upstream-knowledge code, **default-off** (env `CALCITE_FUSION_FASTFWD`,
+disabled 2026-04-29 as a perf net-loss; hard-`false` on wasm) —
+**DELETED 2026-06-12** (see entry above). LODS-shape `Full` commit
+still refuses loudly (accumulator target not modelled; unreached by
+any current cart, proven by the A/B).
 
 ## 2026-06-09 — rep-generic: smoke 7/7 + byte-identical A/B + bench — cheat removal verified on the branch
 

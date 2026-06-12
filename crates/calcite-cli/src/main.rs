@@ -567,15 +567,6 @@ fn main() {
             let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
             let compile_time = t1.elapsed();
 
-            // Fusion FFD diag: enable thread-local funnel counters before
-            // the run starts so column_drawer_fast_forward records every
-            // tick. Cheap (one TLS load + branch per tick when disabled;
-            // a few non-atomic increments when enabled). End-of-run prints
-            // via fusion_diag_snapshot().report().
-            if std::env::var("CALCITE_FUSION_DIAG").is_ok() {
-                calcite_core::compile::fusion_diag_enable();
-            }
-
             // --op-profile: enable adjacency tracking before the run starts.
             // The CSV + summary print happens at end-of-run.
             if cli.op_profile_path.is_some() {
@@ -1579,14 +1570,6 @@ fn main() {
                 ticks_run,
                 ticks_run as f64 / tick_time.as_secs_f64(),
             );
-            let fusion_fires = calcite_core::compile::fusion_fire_count();
-            if fusion_fires > 0 {
-                eprintln!("Fusion fast-forward: {} body iterations applied", fusion_fires);
-            }
-            if std::env::var("CALCITE_FUSION_DIAG").is_ok() {
-                eprint!("{}", calcite_core::compile::fusion_diag_snapshot().report());
-            }
-
             // --op-profile: dump matrix CSV + print summary to stderr.
             if let Some(path) = &cli.op_profile_path {
                 let snap = calcite_core::pattern::op_profile::op_profile_snapshot();
