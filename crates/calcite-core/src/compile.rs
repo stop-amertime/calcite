@@ -3191,6 +3191,7 @@ pub fn compile(
     let _ct = web_time::Instant::now();
     let mut compiler = Compiler::new(functions, dispatch_tables);
     log::info!("[compile detail] Compiler::new clone: {:.2}s", _ct.elapsed().as_secs_f64());
+    crate::compile_stats::record("compile.compiler_new_clone", _ct.elapsed().as_secs_f64());
     let mut ops = Vec::new();
     let mut writeback = Vec::new();
 
@@ -3232,6 +3233,7 @@ pub fn compile(
     }
     log::info!("[compile detail] assignments ({} items): {:.2}s, {} ops, {} dispatch tables",
         assignments.len(), _ct.elapsed().as_secs_f64(), ops.len(), compiler.compiled_dispatches.len());
+    crate::compile_stats::record("compile.assignments", _ct.elapsed().as_secs_f64());
 
 
     let _ct = web_time::Instant::now();
@@ -3258,6 +3260,7 @@ pub fn compile(
     }
     log::info!("[compile detail] broadcast writes total ({} items): {:.2}s",
         broadcast_writes.len(), _ct.elapsed().as_secs_f64());
+    crate::compile_stats::record("compile.broadcast_writes", _ct.elapsed().as_secs_f64());
 
     // Compile packed-broadcast write ports. Each port becomes a
     // CompiledPackedBroadcastWrite whose runtime arm reads gate/addr/val,
@@ -3341,6 +3344,7 @@ pub fn compile(
     let inlined = inline_calls(&mut program);
     log::info!("[compile detail] inline calls: {} sites inlined, {:.2}s",
         inlined, _ct.elapsed().as_secs_f64());
+    crate::compile_stats::record("compile.inline_calls", _ct.elapsed().as_secs_f64());
 
     // Copy propagation + DCE. Disable with CALCITE_NO_COPY_ELIM=1 (native
     // only; wasm has no env) for A/B measurement.
@@ -3362,18 +3366,22 @@ pub fn compile(
     };
     log::info!("[compile detail] copy-elim: {} reads redirected, {} ops removed, {:.2}s",
         copies_propagated, copy_ops_removed, _ct.elapsed().as_secs_f64());
+    crate::compile_stats::record("compile.copy_elim", _ct.elapsed().as_secs_f64());
 
     let _ct = web_time::Instant::now();
     let fused = fuse_cmp_branch(&mut program);
     log::info!("[compile detail] fuse_cmp_branch: {} fused, {:.2}s", fused, _ct.elapsed().as_secs_f64());
+    crate::compile_stats::record("compile.fuse_cmp_branch", _ct.elapsed().as_secs_f64());
 
     let _ct = web_time::Instant::now();
     let chains = build_dispatch_chains(&mut program);
     log::info!("[compile detail] dispatch chains: {} chains built, {:.2}s", chains, _ct.elapsed().as_secs_f64());
+    crate::compile_stats::record("compile.dispatch_chains", _ct.elapsed().as_secs_f64());
 
     let _ct = web_time::Instant::now();
     let lsfused = fuse_loadstate_branch(&mut program);
     log::info!("[compile detail] fuse_loadstate_branch: {} fused, {:.2}s", lsfused, _ct.elapsed().as_secs_f64());
+    crate::compile_stats::record("compile.fuse_loadstate", _ct.elapsed().as_secs_f64());
 
     // BIfNEL2 fusion: HARDCODED OFF for current bench measurement
     // (2026-05-08, isolating the keyboard-revert win from the BIF2 win).
@@ -3390,6 +3398,7 @@ pub fn compile(
     let _ct = web_time::Instant::now();
     compact_slots(&mut program);
     log::info!("[compile detail] slot compaction: {:.2}s", _ct.elapsed().as_secs_f64());
+    crate::compile_stats::record("compile.slot_compaction", _ct.elapsed().as_secs_f64());
 
     // Replicated-body recognition: fold long unrolled straight-line regions
     // (e.g. emitter-unrolled column drawers) into a single Op::ReplicatedBody.
@@ -3399,6 +3408,7 @@ pub fn compile(
     let folded = recognise_replicated_bodies(&mut program);
     log::info!("[compile detail] replicated_body: {} regions folded, {:.2}s",
         folded, _ct.elapsed().as_secs_f64());
+    crate::compile_stats::record("compile.replicated_body", _ct.elapsed().as_secs_f64());
 
     profile_compile_dump();
     program

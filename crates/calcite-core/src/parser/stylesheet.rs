@@ -460,6 +460,7 @@ fn skip_to_block_end<'i, 't>(input: &mut Parser<'i, 't>) {
 
 /// Parse a full CSS stylesheet into a `ParsedProgram`.
 pub fn parse_stylesheet(css: &str) -> Result<ParsedProgram> {
+    crate::compile_stats::reset();
     let total_bytes = css.len();
     let show_progress = std::env::var_os("CALCITE_NO_PROGRESS").is_none()
         && total_bytes >= 1_000_000;
@@ -488,11 +489,14 @@ pub fn parse_stylesheet(css: &str) -> Result<ParsedProgram> {
         super::fast_path::FastPathResult::empty_pub()
     };
     let fast_elapsed = t_fast.elapsed().as_secs_f64();
+    crate::compile_stats::record("parse.fast_scan", fast_elapsed);
+    let t_blank = web_time::Instant::now();
     let cssparser_input: std::borrow::Cow<str> = if fast.blank_ranges.is_empty() {
         std::borrow::Cow::Borrowed(css)
     } else {
         std::borrow::Cow::Owned(super::fast_path::apply_blank_ranges(css, &fast.blank_ranges))
     };
+    crate::compile_stats::record("parse.blank", t_blank.elapsed().as_secs_f64());
     if !fast.blank_ranges.is_empty() {
         let blanked: usize = fast.blank_ranges.iter().map(|&(s, e)| e - s).sum();
         let fn_run_entries: usize = fast.fn_dispatch_runs.iter().map(|r| r.entries.len()).sum();
@@ -509,6 +513,7 @@ pub fn parse_stylesheet(css: &str) -> Result<ParsedProgram> {
         );
     }
 
+    let t_walk = web_time::Instant::now();
     let css_for_parser: &str = &cssparser_input;
     let mut input = cssparser::ParserInput::new(css_for_parser);
     let mut parser = Parser::new(&mut input);
@@ -556,6 +561,8 @@ pub fn parse_stylesheet(css: &str) -> Result<ParsedProgram> {
         );
         eprintln!();
     }
+
+    crate::compile_stats::record("parse.cssparser", t_walk.elapsed().as_secs_f64());
 
     Ok(ParsedProgram {
         properties,

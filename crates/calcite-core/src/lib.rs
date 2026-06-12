@@ -7,6 +7,8 @@
 
 /// CSS expression compiler — flattens Expr trees into flat bytecode.
 pub mod compile;
+/// Per-phase compile timing, retrievable by hosts (wasm phase report).
+pub mod compile_stats;
 /// Chrome conformance comparison utilities (requires `conformance` feature).
 #[cfg(feature = "conformance")]
 pub mod conformance;

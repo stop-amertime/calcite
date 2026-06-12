@@ -117,6 +117,14 @@ impl CalciteEngine {
         Ok(CalciteEngine { state, evaluator, initial_properties, watch_registry })
     }
 
+    /// Diagnostic: per-phase compile timing as a JSON array
+    /// (`[{"phase":"parse.cssparser","secs":12.3}, …]`). Recorded during
+    /// the constructor's parse+compile; wasm has no stderr so this is the
+    /// only way hosts can see the breakdown.
+    pub fn compile_phase_report(&self) -> String {
+        calcite_core::compile_stats::report_json()
+    }
+
     /// Diagnostic: number of recognised packed-broadcast ports.
     /// 0 = recogniser didn't fire (cabinet falls back to slow per-cell eval).
     /// 3 = current 3-slot scheme; 6 = legacy byte-slot scheme.

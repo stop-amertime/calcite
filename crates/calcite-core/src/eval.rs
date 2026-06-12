@@ -313,6 +313,7 @@ impl Evaluator {
             .iter()
             .map(|f| (f.name.clone(), f.clone()))
             .collect();
+        crate::compile_stats::record("eval.functions_clone", _t.elapsed().as_secs_f64());
 
         // Recognise dispatch tables in function result expressions
         let mut dispatch_tables = HashMap::new();
@@ -396,6 +397,7 @@ impl Evaluator {
         }
 
         log::info!("[compile phase] dispatch tables: {:.2}s", _t.elapsed().as_secs_f64());
+        crate::compile_stats::record("eval.dispatch_tables", _t.elapsed().as_secs_f64());
         let _t = Instant::now();
         // Recognise broadcast write patterns in assignments. Then merge in
         // any broadcast writes the parser fast-path already produced: those
@@ -476,6 +478,7 @@ impl Evaluator {
         }
 
         log::info!("[compile phase] broadcast recognition: {:.2}s", _t.elapsed().as_secs_f64());
+        crate::compile_stats::record("eval.broadcast_recognition", _t.elapsed().as_secs_f64());
         let _t = Instant::now();
         // Identify string properties from @property syntax
         let mut string_property_names: HashSet<String> = HashSet::new();
@@ -521,6 +524,7 @@ impl Evaluator {
         }
 
         log::info!("[compile phase] filter+partition: {:.2}s ({} numeric, {} string)", _t.elapsed().as_secs_f64(), numeric_assignments.len(), string_assignments.len());
+        crate::compile_stats::record("eval.filter_partition", _t.elapsed().as_secs_f64());
         let _t = Instant::now();
         // Topological sort: reorder assignments by data dependencies.
         // CSS evaluates all properties simultaneously, but our sequential evaluator
@@ -529,6 +533,7 @@ impl Evaluator {
         let assignments = topological_sort_assignments(numeric_assignments, &functions);
 
         log::info!("[compile phase] topological sort: {:.2}s", _t.elapsed().as_secs_f64());
+        crate::compile_stats::record("eval.topological_sort", _t.elapsed().as_secs_f64());
         let _t = Instant::now();
         let buffer_copies = program
             .assignments
@@ -560,6 +565,7 @@ impl Evaluator {
         );
 
         log::info!("[compile phase] compile::compile: {:.2}s", _t.elapsed().as_secs_f64());
+        crate::compile_stats::record("eval.compile_total", _t.elapsed().as_secs_f64());
         log::info!(
             "Compiled: {} ops, {} slots, {} dispatch tables, {} broadcast writes",
             compiled.ops.len(),
