@@ -38,6 +38,18 @@ Final official driver numbers (same day, same host):
 `compile-only` **29.96 s (pre) → 10.64 s (post)**. JSONs: CSS-DOS
 `docs/benches/compile-only-2026-06-12-fnfast-{baseline,final}.json`.
 
+**Addendum (same day): owned from_parsed (`4b107d1`) → 4.59 s
+(−85% total).** `from_parsed(&ParsedProgram)` forced clones of
+everything the evaluator kept; the owned form drains dispatch
+branches straight into table entries (no 656K readMem expr clones —
+dispatch recognition 3.9 → 0.20 s) and moves the prebuilt packed
+ports (broadcast recognition 1.5 → 0.04 s). wasm/CLI/debugger use it;
+the borrow form stays as a clone-wrapper for small inputs. Driver
+JSON `...fnfast-final2.json`. Remaining ~4.6 s: fast-path byte scan
+1.5 s, cssparser 1.4 s, compile passes 1.7 s — next lever is a
+templated-expr dispatch-run fast path (readMem mod/round pairs) or
+fusing the three full-file scans.
+
 **Phase visibility (`4cc3d1a`)**: the wasm compile breakdown was
 unobservable (worker console doesn't reach the page; CDP console
 capture adds ~12 s to a 30 s compile). New `compile_stats` module
