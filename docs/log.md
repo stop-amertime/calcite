@@ -11,6 +11,63 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-06-12 — cabinet compile wall 30.0 → 10.6 s (wasm, −64%): data-as-code fast paths + copy elimination
+
+The doom cabinet (332 MB) is ~90% byte data encoded as CSS (rom-disk
+dispatch functions, memory-cell scaffolding); the compile spent most
+of its wall building ASTs for that data and then deep-copying the
+recognised structures. Five commits on main, each A/B'd same-day with
+single `compile-only` runs per the owner's directive (compile wall is
+consistent to ~±0.5 s; deltas below that are noise):
+
+| Step | Change | wasm compile |
+|---|---|---|
+| baseline (`788389d`) | — | 30.0 s |
+| `6228955` | fast-path: dense literal `@function` dispatch runs (`style(--k: N): V;`) absorbed at byte level, merged into DispatchTable | 31.5 s¹ |
+| `22efecd` | stop cloning dispatch_tables in Compiler::new (&mut borrow); stop cloning branches of table-recognised functions | **19.6 → 10.1 s** |
+| `89ce961` | FxHashMap for DispatchTable entries | 9.7 s |
+| `3099813` | blank buffer-copy assignment runs (--__N*, dropped-by-name anyway); fix run-prefix split (trailing digit run) | ~10.1 s (noise)² |
+
+¹ Step 1 alone didn't move the wasm wall because the absorbed entries
+still landed in the same HashMaps and clones — but it's what made the
+clone removals possible/cheap, and it cut native parse 4.7 → 3.6 s.
+² Clear native win (parse 3.59 → 1.41 s, assignments 362,242 → 178,
+78.2% of input blanked); wasm single runs straddle step 4's number.
+
+Final official driver numbers (same day, same host):
+`compile-only` **29.96 s (pre) → 10.64 s (post)**. JSONs: CSS-DOS
+`docs/benches/compile-only-2026-06-12-fnfast-{baseline,final}.json`.
+
+**Phase visibility (`4cc3d1a`)**: the wasm compile breakdown was
+unobservable (worker console doesn't reach the page; CDP console
+capture adds ~12 s to a 30 s compile). New `compile_stats` module
+records per-phase seconds; `CalciteEngine::compile_phase_report()`
+returns JSON; the CSS-DOS bridge answers `{type:'phase-report'}` and
+`web/tests/compile-phase-capture.playwright.mjs` prints it. The
+breakdown is what redirected the work: parse was only ~3.5 s of the
+31 s — `Compiler::new` table clone (11.1 s), dispatch
+recognition+merge (12.3 s incl. functions clone 4.7 s) dominated.
+
+**Where the remaining ~10 s lives** (phase report, post-landing):
+fast-path byte scan 1.3 s, cssparser 1.2 s, dispatch recognition
+~3-4 s (recognise_dispatch still clones 656K readMem branch Exprs;
+an owned `from_parsed` could move instead), broadcast recognition
+1.5 s (cloning prebuilt packed-port address maps — Arc them),
+compile passes 1.6 s, engine setup remainder. A templated-expr
+dispatch-run fast path (readMem's mod/round pairs) is the next
+structural lever if compile wall matters more later.
+
+**Verification.** Every step: calcite-cli full state dump at 2M ticks
+byte-identical to the pre-change path on doom8088; 305 lib + 30
+integration tests (7 new); CSS-DOS smoke 7/7.
+`CALCITE_NO_FN_DISPATCH_FAST=1` disables the dispatch-run fast path
+(native only) for future A/B. Cardinal-rule note: all recognition is
+learned from input bytes (anchors + digit-run splitting), no cabinet
+names hardcoded; the buffer-copy blank mirrors the evaluator's
+existing name-prefix filter.
+
+---
+
 ## 2026-06-12 — column_drawer_fast_forward DELETED: last x86-aware code block removed
 
 Release-audit cleanup; closes the "remaining genericity residue" item
