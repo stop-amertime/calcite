@@ -308,13 +308,6 @@ impl Evaluator {
     /// Build an evaluator from a `ParsedProgram`.
     pub fn from_parsed(program: &ParsedProgram) -> Self {
         let _t = Instant::now();
-        let mut functions: HashMap<String, FunctionDef> = program
-            .functions
-            .iter()
-            .map(|f| (f.name.clone(), f.clone()))
-            .collect();
-        crate::compile_stats::record("eval.functions_clone", _t.elapsed().as_secs_f64());
-
         // Recognise dispatch tables in function result expressions
         let mut dispatch_tables = HashMap::new();
         for func in &program.functions {
@@ -342,11 +335,13 @@ impl Evaluator {
         //    were below recognise_dispatch's threshold) but the leftovers
         //    are compatible (same key, literal tests) → build the table here;
         //  - anything else → re-inject the entries as plain branches so
-        //    behaviour is identical to the no-fast-path route.
+        //    behaviour is identical to the no-fast-path route (deferred
+        //    until the functions map exists below).
         // Key collisions between a run and parsed branches keep last-insert-
         // wins semantics, matching recognise_dispatch (emitters don't
         // duplicate keys).
         let mut merged_entries = 0usize;
+        let mut deferred_reinjects: Vec<&crate::types::FnDispatchRun> = Vec::new();
         for run in &program.prebuilt_fn_dispatch_runs {
             if let Some(table) = dispatch_tables.get_mut(&run.function) {
                 if table.key_property == run.key_property {
@@ -364,9 +359,11 @@ impl Evaluator {
                         run.function, run.key_property, table.key_property,
                     );
                     dispatch_tables.remove(&run.function);
-                    reinject_fn_dispatch_run(&mut functions, run);
+                    deferred_reinjects.push(run);
                 }
-            } else if let Some(table) = build_table_from_run(&functions, run) {
+            } else if let Some(table) =
+                build_table_from_run(&program.functions, run)
+            {
                 merged_entries += run.entries.len();
                 dispatch_tables.insert(run.function.clone(), table);
             } else {
@@ -374,7 +371,7 @@ impl Evaluator {
                     "fn-dispatch run in {} ({} entries) not table-compatible; re-injecting as branches",
                     run.function, run.entries.len(),
                 );
-                reinject_fn_dispatch_run(&mut functions, run);
+                deferred_reinjects.push(run);
             }
         }
         if merged_entries > 0 {
@@ -383,6 +380,45 @@ impl Evaluator {
                 program.prebuilt_fn_dispatch_runs.len(),
                 merged_entries,
             );
+        }
+        crate::compile_stats::record("eval.dispatch_recognition", _t.elapsed().as_secs_f64());
+
+        // Build the functions map. For table-recognised functions the
+        // branches are dead weight — every runtime path (interpreter
+        // eval_function_call, compile_function_call) consults the dispatch
+        // table before the function body — so clone those defs with an
+        // empty branch list instead of deep-copying multi-hundred-K-branch
+        // trees (~4 s in wasm on the doom cabinet).
+        let _tc = Instant::now();
+        let mut functions: HashMap<String, FunctionDef> = program
+            .functions
+            .iter()
+            .map(|f| {
+                if dispatch_tables.contains_key(&f.name) {
+                    if let Expr::StyleCondition { fallback, .. } = &f.result {
+                        return (
+                            f.name.clone(),
+                            FunctionDef {
+                                name: f.name.clone(),
+                                parameters: f.parameters.clone(),
+                                locals: f.locals.clone(),
+                                result: Expr::StyleCondition {
+                                    branches: Vec::new(),
+                                    fallback: fallback.clone(),
+                                },
+                            },
+                        );
+                    }
+                }
+                (f.name.clone(), f.clone())
+            })
+            .collect();
+        crate::compile_stats::record("eval.functions_clone", _tc.elapsed().as_secs_f64());
+
+        // Correctness fallback for non-table-shaped functions whose runs
+        // were absorbed: put the entries back as plain branches.
+        for run in deferred_reinjects {
+            reinject_fn_dispatch_run(&mut functions, run);
         }
 
         // Merge memory address mappings from identity-read dispatch tables into
@@ -561,7 +597,7 @@ impl Evaluator {
             &broadcast_result.writes,
             &packed_bw_result.ports,
             &functions,
-            &dispatch_tables,
+            &mut dispatch_tables,
         );
 
         log::info!("[compile phase] compile::compile: {:.2}s", _t.elapsed().as_secs_f64());
@@ -1717,10 +1753,10 @@ fn parse_mem_address(s: &str) -> Option<i32> {
 /// leftover branches must be compatible — single tests on the run's key
 /// property with literal test values — and are folded into the table.
 fn build_table_from_run(
-    functions: &HashMap<String, FunctionDef>,
+    functions: &[FunctionDef],
     run: &crate::types::FnDispatchRun,
 ) -> Option<DispatchTable> {
-    let func = functions.get(&run.function)?;
+    let func = functions.iter().find(|f| f.name == run.function)?;
     let Expr::StyleCondition { branches, fallback } = &func.result else {
         return None;
     };
@@ -2377,10 +2413,10 @@ mod tests {
     /// Also returns a State with matching state vars.
     fn test_evaluator(
         functions: HashMap<String, FunctionDef>,
-        dispatch_tables: HashMap<String, DispatchTable>,
+        mut dispatch_tables: HashMap<String, DispatchTable>,
     ) -> (Evaluator, State) {
         let state = install_test_address_map();
-        let compiled = crate::compile::compile(&[], &[], &[], &functions, &dispatch_tables);
+        let compiled = crate::compile::compile(&[], &[], &[], &functions, &mut dispatch_tables);
         let function_patterns = detect_function_patterns(&functions, &dispatch_tables);
         let evaluator = Evaluator {
             functions,

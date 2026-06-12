@@ -1611,8 +1611,11 @@ struct Compiler<'a> {
     property_slots: HashMap<String, Slot>,
     /// Functions available for inlining (borrowed — avoids cloning 1M-node ASTs).
     functions: &'a HashMap<String, FunctionDef>,
-    /// Recognised dispatch tables (owned — remove/insert pattern needs ownership).
-    dispatch_tables: HashMap<String, DispatchTable>,
+    /// Recognised dispatch tables (mutably borrowed — the remove/insert
+    /// pattern in compile_dispatch_body_then_call needs ownership of one
+    /// table at a time, but cloning the whole map costs ~11 s in wasm on
+    /// a multi-million-entry cabinet).
+    dispatch_tables: &'a mut HashMap<String, DispatchTable>,
     /// Compiled dispatch table data (populated during compilation).
     compiled_dispatches: Vec<CompiledDispatchTable>,
     /// Compiled flat-array dispatch tables (fast path for literal-only dispatches).
@@ -1650,13 +1653,13 @@ struct Compiler<'a> {
 impl<'a> Compiler<'a> {
     fn new(
         functions: &'a HashMap<String, FunctionDef>,
-        dispatch_tables: &HashMap<String, DispatchTable>,
+        dispatch_tables: &'a mut HashMap<String, DispatchTable>,
     ) -> Self {
         Compiler {
             next_slot: 0,
             property_slots: HashMap::new(),
             functions,
-            dispatch_tables: dispatch_tables.clone(),
+            dispatch_tables,
             compiled_dispatches: Vec::new(),
             compiled_flat_arrays: Vec::new(),
             dispatch_cache: HashMap::new(),
@@ -3184,14 +3187,14 @@ pub fn compile(
     broadcast_writes: &[BroadcastWrite],
     packed_broadcast_ports: &[crate::pattern::packed_broadcast_write::PackedSlotPort],
     functions: &HashMap<String, FunctionDef>,
-    dispatch_tables: &HashMap<String, DispatchTable>,
+    dispatch_tables: &mut HashMap<String, DispatchTable>,
 ) -> CompiledProgram {
     profile_compile_init();
     prof!("compile");
     let _ct = web_time::Instant::now();
     let mut compiler = Compiler::new(functions, dispatch_tables);
-    log::info!("[compile detail] Compiler::new clone: {:.2}s", _ct.elapsed().as_secs_f64());
-    crate::compile_stats::record("compile.compiler_new_clone", _ct.elapsed().as_secs_f64());
+    log::info!("[compile detail] Compiler::new: {:.2}s", _ct.elapsed().as_secs_f64());
+    crate::compile_stats::record("compile.compiler_new", _ct.elapsed().as_secs_f64());
     let mut ops = Vec::new();
     let mut writeback = Vec::new();
 
@@ -9247,8 +9250,8 @@ mod tests {
     fn compile_literal() {
         let expr = Expr::Literal(42.0);
         let empty_fns = HashMap::new();
-        let empty_dt = HashMap::new();
-        let mut compiler = Compiler::new(&empty_fns, &empty_dt);
+        let mut empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&empty_fns, &mut empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
         assert_eq!(ops.len(), 1);
@@ -9266,8 +9269,8 @@ mod tests {
             Box::new(Expr::Literal(20.0)),
         ));
         let empty_fns = HashMap::new();
-        let empty_dt = HashMap::new();
-        let mut compiler = Compiler::new(&empty_fns, &empty_dt);
+        let mut empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&empty_fns, &mut empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
@@ -9285,8 +9288,8 @@ mod tests {
             fallback: None,
         };
         let empty_fns = HashMap::new();
-        let empty_dt = HashMap::new();
-        let mut compiler = Compiler::new(&empty_fns, &empty_dt);
+        let mut empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&empty_fns, &mut empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
@@ -9319,8 +9322,8 @@ mod tests {
             fallback: Box::new(Expr::Literal(0.0)),
         };
         let empty_fns = HashMap::new();
-        let empty_dt = HashMap::new();
-        let mut compiler = Compiler::new(&empty_fns, &empty_dt);
+        let mut empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&empty_fns, &mut empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
@@ -9387,7 +9390,7 @@ mod tests {
             name: "--readMem".to_string(),
             args: vec![Expr::Literal(-1.0)], // AX register
         };
-        let mut compiler = Compiler::new(&functions, &dispatch_tables);
+        let mut compiler = Compiler::new(&functions, &mut dispatch_tables);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
@@ -9437,8 +9440,8 @@ mod tests {
             name: "--lowerBytes".to_string(),
             args: vec![Expr::Literal(0xFF as f64), Expr::Literal(4.0)],
         };
-        let empty_dt = HashMap::new();
-        let mut compiler = Compiler::new(&functions, &empty_dt);
+        let mut empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&functions, &mut empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
@@ -9462,7 +9465,7 @@ mod tests {
             },
         ];
 
-        let program = compile(&assignments, &[], &[], &HashMap::new(), &HashMap::new());
+        let program = compile(&assignments, &[], &[], &HashMap::new(), &mut HashMap::new());
 
         let mut slots = Vec::new();
         execute(&program, &mut state, &mut slots);
@@ -9497,8 +9500,8 @@ mod tests {
             name: "--double".to_string(),
             args: vec![Expr::Literal(21.0)],
         };
-        let empty_dt = HashMap::new();
-        let mut compiler = Compiler::new(&functions, &empty_dt);
+        let mut empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&functions, &mut empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
@@ -9531,7 +9534,7 @@ mod tests {
             },
         ];
 
-        let program = compile(&assignments, &[], &[], &HashMap::new(), &HashMap::new());
+        let program = compile(&assignments, &[], &[], &HashMap::new(), &mut HashMap::new());
 
         let mut slots = Vec::new();
         execute(&program, &mut state, &mut slots);
@@ -9582,7 +9585,7 @@ mod tests {
             },
         }];
 
-        let program = compile(&assignments, &[], &[], &functions, &dispatch_tables);
+        let program = compile(&assignments, &[], &[], &functions, &mut dispatch_tables);
 
         let mut state = State::default();
         let mut slots = Vec::new();
@@ -9649,7 +9652,7 @@ mod tests {
             name: "--readByte".to_string(),
             args: vec![Expr::Literal(5.0)],
         };
-        let mut compiler = Compiler::new(&functions, &dispatch_tables);
+        let mut compiler = Compiler::new(&functions, &mut dispatch_tables);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
         // Op::Call wraps the body, which contains the DispatchFlatArray op.
