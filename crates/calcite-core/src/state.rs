@@ -639,6 +639,55 @@ impl State {
             return;
         }
         let pack = self.packed_cell_size as usize;
+        if count == 1 {
+            let cell_idx = addr / pack;
+            if cell_idx < self.packed_cell_table.len() {
+                let cell_addr = self.packed_cell_table[cell_idx];
+                if cell_addr < 0 {
+                    let sidx = (-cell_addr - 1) as usize;
+                    if sidx < self.state_vars.len() {
+                        let off = addr % pack;
+                        let cell = self.state_vars[sidx];
+                        let shift = 8 * off as u32;
+                        let mask = !(0xFFi32 << shift);
+                        self.state_vars[sidx] =
+                            (cell & mask) | ((byte as i32) << shift);
+                    }
+                }
+            }
+            return;
+        }
+        if pack <= 4 {
+            let table_len = self.packed_cell_table.len();
+            let fill_cell = (0..pack).fold(0i32, |acc, off| {
+                acc | ((byte as i32) << (8 * off as u32))
+            });
+            let first_cell = addr / pack;
+            let last_cell = (end - 1) / pack;
+            for cell_idx in first_cell..=last_cell {
+                if cell_idx >= table_len { break; }
+                let cell_addr = self.packed_cell_table[cell_idx];
+                if cell_addr >= 0 { continue; }
+                let sidx = (-cell_addr - 1) as usize;
+                if sidx >= self.state_vars.len() { continue; }
+                let cell_start = cell_idx * pack;
+                let cell_end = cell_start + pack;
+                let lo = addr.max(cell_start);
+                let hi = end.min(cell_end);
+                if lo == cell_start && hi == cell_end {
+                    self.state_vars[sidx] = fill_cell;
+                    continue;
+                }
+                let mut cell = self.state_vars[sidx];
+                for off in (lo - cell_start)..(hi - cell_start) {
+                    let shift = 8 * off as u32;
+                    let mask = !(0xFFi32 << shift);
+                    cell = (cell & mask) | ((byte as i32) << shift);
+                }
+                self.state_vars[sidx] = cell;
+            }
+            return;
+        }
         let table_len = self.packed_cell_table.len();
         for i in addr..end {
             let cell_idx = i / pack;
@@ -677,6 +726,55 @@ impl State {
     /// before getting here in that case.
     pub fn bulk_copy_bytes(&mut self, src: usize, dst: usize, count: usize) {
         if count == 0 { return; }
+        if src == dst { return; }
+        let destructive_overlap = dst > src && dst < src.saturating_add(count);
+        if !destructive_overlap && self.read_log.borrow().is_none() && self.packed_cell_size > 0 {
+            let pack = self.packed_cell_size as usize;
+            if pack <= 4
+                && src % pack == 0
+                && dst % pack == 0
+                && count % pack == 0
+            {
+                let first_src_cell = src / pack;
+                let first_dst_cell = dst / pack;
+                let cells = count / pack;
+                let table_len = self.packed_cell_table.len();
+                let flat_len = self.memory.len();
+                let flat_shadow_ok = dst >= flat_len
+                    || (src.saturating_add(count) <= flat_len
+                        && dst.saturating_add(count) <= flat_len);
+                if flat_shadow_ok && first_src_cell + cells <= table_len && first_dst_cell + cells <= table_len {
+                    let mut can_copy_cells = true;
+                    for i in 0..cells {
+                        let src_cell_addr = self.packed_cell_table[first_src_cell + i];
+                        let dst_cell_addr = self.packed_cell_table[first_dst_cell + i];
+                        if src_cell_addr >= 0 || dst_cell_addr >= 0 {
+                            can_copy_cells = false;
+                            break;
+                        }
+                        let src_sidx = (-src_cell_addr - 1) as usize;
+                        let dst_sidx = (-dst_cell_addr - 1) as usize;
+                        if src_sidx >= self.state_vars.len() || dst_sidx >= self.state_vars.len() {
+                            can_copy_cells = false;
+                            break;
+                        }
+                    }
+                    if can_copy_cells {
+                        if dst < flat_len {
+                            self.memory.copy_within(src..src + count, dst);
+                        }
+                        for i in 0..cells {
+                            let src_cell_addr = self.packed_cell_table[first_src_cell + i];
+                            let dst_cell_addr = self.packed_cell_table[first_dst_cell + i];
+                            let src_sidx = (-src_cell_addr - 1) as usize;
+                            let dst_sidx = (-dst_cell_addr - 1) as usize;
+                            self.state_vars[dst_sidx] = self.state_vars[src_sidx];
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         for i in 0..count {
             let byte = (self.read_mem((src + i) as i32) & 0xFF) as u8;
             self.write_byte_packed_aware(dst + i, byte);
@@ -1412,5 +1510,55 @@ mod tests {
             // Source unchanged.
             assert_eq!(state.read_mem(0x200 + i), (i + 1) as i32);
         }
+    }
+
+    #[test]
+    fn bulk_fill_byte_updates_packed_cells_by_range() {
+        let mut state = State::new(8);
+        state.state_vars = vec![0x2211, 0x4433, 0x6655];
+        state.state_var_names = vec!["mc0".into(), "mc1".into(), "mc2".into()];
+        state.state_var_index.insert("mc0".into(), 0);
+        state.state_var_index.insert("mc1".into(), 1);
+        state.state_var_index.insert("mc2".into(), 2);
+        state.packed_cell_size = 2;
+        state.packed_cell_table = vec![-1, -2, -3];
+
+        state.bulk_fill_byte(1, 4, 0xAA);
+
+        assert_eq!(state.state_vars[0], 0xAA11);
+        assert_eq!(state.state_vars[1], 0xAAAA);
+        assert_eq!(state.state_vars[2], 0x66AA);
+        assert_eq!(&state.memory[1..5], &[0xAA, 0xAA, 0xAA, 0xAA]);
+        assert_eq!(state.read_mem(0), 0x11);
+        assert_eq!(state.read_mem(1), 0xAA);
+        assert_eq!(state.read_mem(2), 0xAA);
+        assert_eq!(state.read_mem(3), 0xAA);
+        assert_eq!(state.read_mem(4), 0xAA);
+        assert_eq!(state.read_mem(5), 0x66);
+    }
+
+    #[test]
+    fn bulk_copy_bytes_copies_aligned_packed_cells() {
+        let mut state = State::new(8);
+        state.state_vars = vec![0x2211, 0x4433, 0x6655, 0x8877];
+        state.state_var_names = vec!["mc0".into(), "mc1".into(), "mc2".into(), "mc3".into()];
+        for (i, name) in state.state_var_names.iter().enumerate() {
+            state.state_var_index.insert(name.clone(), i);
+        }
+        state.packed_cell_size = 2;
+        state.packed_cell_table = vec![-1, -2, -3, -4];
+        for addr in 0..8 {
+            state.memory[addr] = state.read_mem(addr as i32) as u8;
+        }
+
+        state.bulk_copy_bytes(0, 4, 4);
+
+        assert_eq!(state.state_vars[2], 0x2211);
+        assert_eq!(state.state_vars[3], 0x4433);
+        assert_eq!(&state.memory[4..8], &[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(state.read_mem(4), 0x11);
+        assert_eq!(state.read_mem(5), 0x22);
+        assert_eq!(state.read_mem(6), 0x33);
+        assert_eq!(state.read_mem(7), 0x44);
     }
 }

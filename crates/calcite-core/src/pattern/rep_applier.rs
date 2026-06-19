@@ -662,15 +662,28 @@ pub(crate) fn apply_copy_with_commit(
     };
     let dst_ptr_i64 = dst_ptr_value as i64;
     let src_ptr_i64 = src_ptr_value as i64;
-    for i in 0..n64 {
-        let iter_off = i * (signed_step as i64);
-        let dst_iter_base = dst_seg_base + dst_ptr_i64 + iter_off;
-        let src_iter_base = src_seg_base + src_ptr_i64 + iter_off;
-        for k in 0..(descriptor.writes.len() as i64) {
-            let s = src_iter_base + k;
-            let d = dst_iter_base + k;
-            let b = (state.read_mem(s as i32) & 0xFF) as u8;
-            bulk_store_byte(state, d, b);
+
+    let mut copied_bulk = false;
+    if signed_step > 0 {
+        let total = n64 * (descriptor.writes.len() as i64);
+        let src_linear = src_seg_base + src_ptr_i64;
+        let dst_linear = dst_seg_base + dst_ptr_i64;
+        if total > 0 && src_linear >= 0 && dst_linear >= 0 {
+            state.bulk_copy_bytes(src_linear as usize, dst_linear as usize, total as usize);
+            copied_bulk = true;
+        }
+    }
+    if !copied_bulk {
+        for i in 0..n64 {
+            let iter_off = i * (signed_step as i64);
+            let dst_iter_base = dst_seg_base + dst_ptr_i64 + iter_off;
+            let src_iter_base = src_seg_base + src_ptr_i64 + iter_off;
+            for k in 0..(descriptor.writes.len() as i64) {
+                let s = src_iter_base + k;
+                let d = dst_iter_base + k;
+                let b = (state.read_mem(s as i32) & 0xFF) as u8;
+                bulk_store_byte(state, d, b);
+            }
         }
     }
 
