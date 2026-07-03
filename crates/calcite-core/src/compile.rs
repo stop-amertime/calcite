@@ -2038,17 +2038,7 @@ impl<'a> Compiler<'a> {
                 .collect();
 
             // Condition true: compute 'then' value
-            let ops_before = ops.len();
             let then_slot = self.compile_expr(&branch.then, ops);
-            let ops_after = ops.len();
-            // Log ops for the branch that produces memAddr for opcode 214 uOp 1
-            if ops_after - ops_before > 10 && ops_after - ops_before < 5000 {
-                log::warn!("[linear branch] {} ops (idx {}-{}) result_slot={} then_slot={}",
-                    ops_after - ops_before, ops_before, ops_after, result_slot, then_slot);
-                for j in ops_before..std::cmp::min(ops_after, ops_before + 30) {
-                    log::warn!("  [{:4}] {:?}", j, ops[j]);
-                }
-            }
             ops.push(Op::LoadSlot {
                 dst: result_slot,
                 src: then_slot,
@@ -5416,29 +5406,6 @@ fn compact_slots(program: &mut CompiledProgram) {
     // Remap property_slots
     for val in program.property_slots.values_mut() {
         *val = slot_map[val];
-    }
-
-    // Debug: check for properties incorrectly sharing a physical slot.
-    // Recompute liveness here so we can report intervals.
-    {
-        let (liveness, _) = compute_liveness(&program.ops, &program.dispatch_tables);
-        let mut slot_to_names: std::collections::HashMap<Slot, Vec<String>> = std::collections::HashMap::new();
-        for (name, &slot) in &program.property_slots {
-            slot_to_names.entry(slot).or_default().push(name.clone());
-        }
-        for (phys_slot, names) in &slot_to_names {
-            if names.len() > 1 {
-                // For each original slot that maps to this physical slot, report its last-use
-                let info: Vec<String> = slot_map.iter()
-                    .filter(|(_, &v)| v == *phys_slot)
-                    .map(|(&orig, _)| {
-                        let lu = liveness.get(&orig).copied().unwrap_or(9999);
-                        format!("orig={} last_use_op={}", orig, lu)
-                    })
-                    .collect();
-                log::warn!("[slot-compaction] physical slot {} shared by {:?} — orig slots: {:?}", phys_slot, names, info);
-            }
-        }
     }
 
     // Reusable scratch buffers — avoids repeated HashMap allocations

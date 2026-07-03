@@ -11,6 +11,22 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-07-03 — deleted leftover compile diagnostics that flooded the browser console
+
+Two ungated debug blocks in `compile.rs` are gone: the `[linear
+branch]` op dump in `compile_style_condition` (an old "opcode 214
+memAddr" debugging aid — up to 31 warn lines per 10..5000-op branch,
+~1,100 console lines on a doom-scale cabinet) and the
+`[slot-compaction]` shared-slot report (which recomputed full
+liveness on every compile just to log). Both were warn-level, and the
+CSS-DOS bridge worker silences info but keeps warn — so they were the
+bulk of what users saw during an in-browser compile, making healthy
+compiles look wedged (see CSS-DOS logbook 2026-07-03 FINDING).
+`[compile detail]` info-level phase timings stay; the wasm
+`compile_phase_report()` records phases via compile_stats, not by
+console scraping. Verified: cargo build + `cargo test -p calcite-core
+--release` green, wasm-pack rebuilt, CSS-DOS smoke green.
+
 ## 2026-06-12 — cabinet compile wall 30.0 → 10.6 s (wasm, −64%): data-as-code fast paths + copy elimination
 
 The doom cabinet (332 MB) is ~90% byte data encoded as CSS (rom-disk
