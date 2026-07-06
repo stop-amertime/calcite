@@ -66,6 +66,21 @@ AND on the JS reference machine; rom-cabinet behaviour unchanged
 Throughput on the writable cabinet ~290K t/s vs ~584K rom (the
 shadow's extra state + per-tick remap props); rom carts unaffected.
 
+## 2026-07-05 — calcite-cli: --press-events now batches between events on the dump path
+
+The `--dump-tick`/`--dump-ticks` path ran the *entire* span tick-by-tick
+(`evaluator.tick` per tick) whenever any `--press-events` were given —
+~10× slower than `run_batch`, so late-tick dumps with input (e.g.
+driving a game to tick 16M+ to reproduce an input-dependent hang) never
+fit a 2-minute wall budget. The loop now `run_batch`es from cursor to
+the next event tick, applies the event, ticks once, and continues —
+same semantics (an event at tick T is applied before tick T executes),
+batch speed everywhere else.
+
+Used to reproduce + verify the CSS-DOS PoP ground-touch freeze
+(cross-link: CSS-DOS LOGBOOK 2026-07-05, a kiln PIT-channel bug — no
+calcite engine change needed; the state machine faithfully executed the
+buggy CSS, as it should).
 ## 2026-07-03 — deleted leftover compile diagnostics that flooded the browser console
 
 Two ungated debug blocks in `compile.rs` are gone: the `[linear

@@ -867,19 +867,32 @@ fn main() {
                 // Advance to each target in order, dumping along the way.
                 let mut cursor: u32 = 0;
                 for &target in &dump_targets {
-                    // Advance from cursor to target. Run tick-by-tick when key events
-                    // need injection; otherwise use run_batch + a final tick.
-                    if !press_events.is_empty() {
-                        for tick in cursor..target {
-                            apply_press_events(&press_events, tick, &mut state);
+                    // Advance from cursor to target with run_batch, pausing
+                    // exactly on each press-event tick to apply it. (The old
+                    // code ran tick-by-tick for the whole span when any press
+                    // events existed — ~10× slower, so late-tick dumps with
+                    // input never fit a wall-clock budget.)
+                    while cursor < target {
+                        let next_event = press_events
+                            .iter()
+                            .map(|(t, _, _)| *t)
+                            .filter(|&t| t >= cursor && t < target)
+                            .min();
+                        let stop = next_event.unwrap_or(target);
+                        if stop > cursor {
+                            let batch = stop - cursor;
+                            if batch > 1 {
+                                evaluator.run_batch(&mut state, batch - 1);
+                            }
                             evaluator.tick(&mut state);
+                            cursor = stop;
                         }
-                    } else if target > cursor {
-                        let batch = target - cursor;
-                        if batch > 1 {
-                            evaluator.run_batch(&mut state, batch - 1);
+                        if next_event == Some(stop) {
+                            apply_press_events(&press_events, stop, &mut state);
+                            // The event tick itself still has to execute.
+                            evaluator.tick(&mut state);
+                            cursor += 1;
                         }
-                        evaluator.tick(&mut state);
                     }
                     cursor = target;
 
