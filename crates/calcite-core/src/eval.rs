@@ -285,13 +285,31 @@ impl Evaluator {
             );
             return;
         };
+        let backing = match cw.backing {
+            crate::compile::CompiledWindowBacking::Literal { base_key, ref values } => {
+                crate::state::WindowBacking::Literal { base_key, values: values.clone() }
+            }
+            crate::compile::CompiledWindowBacking::PackedCells { table_id, pack } => {
+                let Some(table) = self.compiled.packed_cell_tables.get(table_id as usize) else {
+                    log::warn!(
+                        "[windowed-byte-array] packed backing table_id {} missing; falling back to per-byte CSS",
+                        table_id
+                    );
+                    return;
+                };
+                crate::state::WindowBacking::PackedCells {
+                    cell_table: std::sync::Arc::new(table.clone()),
+                    pack,
+                }
+            }
+        };
         state.windowed_byte_array = Some(crate::state::WindowedByteArray {
             window_base: cw.window_base,
             window_end: cw.window_end,
             key_cell_slot: slot,
             stride: cw.stride,
-            byte_array_base_key: cw.byte_array_base_key,
-            byte_array: cw.byte_array.clone(),
+            key_offset: cw.key_offset,
+            backing,
         });
         state.virtual_regions.push(crate::state::VirtualRegion {
             start: cw.window_base,
@@ -299,9 +317,8 @@ impl Evaluator {
             source: "windowed_byte_array",
         });
         log::info!(
-            "[windowed-byte-array] installed: window=[0x{:X},0x{:X}) stride={} key_cell={} byte_array_len={}",
-            cw.window_base, cw.window_end, cw.stride, cw.key_cell_property,
-            cw.byte_array.len()
+            "[windowed-byte-array] installed: window=[0x{:X},0x{:X}) stride={} key_offset={} key_cell={}",
+            cw.window_base, cw.window_end, cw.stride, cw.key_offset, cw.key_cell_property,
         );
     }
 

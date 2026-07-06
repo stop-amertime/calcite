@@ -557,8 +557,30 @@ pub struct CompiledWindowedByteArray {
     pub window_end: i32,
     pub key_cell_property: String,
     pub stride: i32,
-    pub byte_array_base_key: i32,
-    pub byte_array: std::sync::Arc<Vec<i32>>,
+    /// Constant added to `key * stride + (addr - window_base)` before the
+    /// backing lookup. Zero when the window's dispatch offsets start at the
+    /// window base; non-zero when the arms address a base-shifted key space
+    /// (e.g. a window whose backing cells live at a high linear base).
+    pub key_offset: i32,
+    pub backing: CompiledWindowBacking,
+}
+
+/// What a windowed byte array reads from (and, for cell backings, writes to).
+#[derive(Debug, Clone)]
+pub enum CompiledWindowBacking {
+    /// The inner dispatch flattened to a literal byte array (read-only —
+    /// window writes are dropped, matching the CSS where no property backs
+    /// the window).
+    Literal {
+        base_key: i32,
+        values: std::sync::Arc<Vec<i32>>,
+    },
+    /// The inner dispatch is a near-packed-byte read over `--mc{N}` cells:
+    /// computed key / pack indexes `packed_cell_tables[table_id]` (state-var
+    /// addresses), key % pack selects the byte. Writable — window writes
+    /// splice into the same cells, mirroring what the cabinet's write rules
+    /// do through the CSS path.
+    PackedCells { table_id: u32, pack: u8 },
 }
 
 /// Dense base-keyed lookup table for packed-byte literal exceptions.
@@ -1162,7 +1184,7 @@ fn match_high_byte_extract(expr: &Expr) -> Option<u64> {
 /// Returns `Some((pack, exception_keys))` if ≥80% of entries match the packed
 /// shape AND every packed entry is consistent with a single `pack` value.
 /// Returns `None` otherwise.
-pub(crate) fn classify_near_packed_byte(table: &DispatchTable) -> Option<(u8, Vec<i64>)> {
+pub(crate) fn classify_near_packed_byte(table: &DispatchTable) -> Option<(u8, i64, Vec<i64>)> {
     prof!("classify_near_packed_byte");
     if table.entries.len() < 100 {
         return None;
@@ -1170,6 +1192,13 @@ pub(crate) fn classify_near_packed_byte(table: &DispatchTable) -> Option<(u8, Ve
     // Currently we only recognise pack=2 (low/high byte via mod/round-down-div).
     // Higher packs would require additional shape detection.
     let pack: u8 = 2;
+    // The cell index referenced by an arm may sit at a CONSTANT offset from
+    // key/pack — a dispatch whose keys address a compact space while the
+    // backing cells live in a base-shifted name space (e.g. a byte window
+    // over cells whose names carry a high base so the small key space stays
+    // exact in a spec evaluator). Derive the offset from the first arm that
+    // matches the extract shape, then require it to hold for ≥80%.
+    let mut cell_offset: Option<i64> = None;
     let mut exceptions = Vec::new();
     let mut packed_count: usize = 0;
     for (&key, expr) in &table.entries {
@@ -1184,10 +1213,19 @@ pub(crate) fn classify_near_packed_byte(table: &DispatchTable) -> Option<(u8, Ve
         } else {
             match_high_byte_extract(expr)
         };
-        if cell_n == Some(expected_n) {
-            packed_count += 1;
-        } else {
-            exceptions.push(key);
+        match cell_n {
+            Some(n) => {
+                let delta = n as i64 - expected_n as i64;
+                match cell_offset {
+                    None => {
+                        cell_offset = Some(delta);
+                        packed_count += 1;
+                    }
+                    Some(c) if c == delta => packed_count += 1,
+                    Some(_) => exceptions.push(key),
+                }
+            }
+            None => exceptions.push(key),
         }
     }
     // Require ≥80% packed shape — looser than near-identity (90%) because the
@@ -1195,12 +1233,13 @@ pub(crate) fn classify_near_packed_byte(table: &DispatchTable) -> Option<(u8, Ve
     if packed_count * 10 < table.entries.len() * 8 {
         return None;
     }
+    let cell_offset = cell_offset.unwrap_or(0);
     log::info!(
-        "near-packed-byte ({}): {} packed entries, {} exceptions (lit handled in O(1) table)",
+        "near-packed-byte ({}): {} packed entries, cell_offset {}, {} exceptions (lit handled in O(1) table)",
         if pack == 2 { "PACK_SIZE=2" } else { "?" },
-        packed_count, exceptions.len()
+        packed_count, cell_offset, exceptions.len()
     );
-    Some((pack, exceptions))
+    Some((pack, cell_offset, exceptions))
 }
 
 /// Decoded shape of a single rom-disk-style dispatch entry.
@@ -1280,6 +1319,8 @@ fn recognise_windowed_byte_array(
     inline_exception_keys: &[i64],
     flat_dispatch_cache: &HashMap<String, (u32, i32, i32)>,
     compiled_flat_arrays: &[FlatDispatchArray],
+    packed_cell_table_cache: &HashMap<String, u32>,
+    near_packed_cache: &HashMap<String, Option<(u8, i64, Vec<i64>)>>,
 ) -> Option<CompiledWindowedByteArray> {
     use std::collections::BTreeMap;
     // Decode each inline-exception entry. Skip ones that aren't disk-shape.
@@ -1295,8 +1336,12 @@ fn recognise_windowed_byte_array(
         return None;
     }
     // Find the longest contiguous run with consistent (func, key_property,
-    // stride) and offset == (key - first_key). BTreeMap is ordered so a
-    // single linear sweep suffices.
+    // stride) and a CONSTANT delta between each entry's offset and its
+    // in-window position: offset == (key - first_key) + first_offset. The
+    // delta (first_offset) becomes the descriptor's key_offset — zero for
+    // windows whose arms address key space from 0, non-zero when the arms
+    // address a base-shifted key space. BTreeMap is ordered so a single
+    // linear sweep suffices.
     let mut best: Option<(i64, i64, DiskEntryShape)> = None; // (first_key, last_key, shape)
     let mut run_start: Option<(i64, DiskEntryShape)> = None;
     let mut prev_key: Option<i64> = None;
@@ -1307,16 +1352,16 @@ fn recognise_windowed_byte_array(
                     && start_shape.func_name == shape.func_name
                     && start_shape.key_property == shape.key_property
                     && start_shape.stride == shape.stride
-                    && shape.offset as i64 == k - start_k =>
+                    && shape.offset as i64 == (k - start_k) + start_shape.offset as i64 =>
             {
                 true
             }
             _ => false,
         };
         if !extends {
-            // Close out previous run, if any, and start fresh. A new run can
-            // start here only if shape.offset == 0 (otherwise it can't anchor
-            // a window whose offset == key - window_base).
+            // Close out previous run, if any, and start fresh at this entry
+            // (any offset can anchor a run — the anchor's offset is the
+            // run's constant key_offset).
             if let (Some((sk, ss)), Some(pk)) = (&run_start, prev_key) {
                 let len = (pk - sk + 1) as usize;
                 let better = best.as_ref().map_or(true, |b| (b.1 - b.0 + 1) < len as i64);
@@ -1324,11 +1369,7 @@ fn recognise_windowed_byte_array(
                     best = Some((*sk, pk, ss.clone()));
                 }
             }
-            if shape.offset == 0 {
-                run_start = Some((k, shape.clone()));
-            } else {
-                run_start = None;
-            }
+            run_start = Some((k, shape.clone()));
         }
         prev_key = Some(k);
     }
@@ -1346,24 +1387,43 @@ fn recognise_windowed_byte_array(
         return None;
     }
 
-    // Look up the inner function's flat array. If it isn't in the cache, the
-    // recogniser's preconditions weren't met — skip silently.
-    let &(array_id, base_key, _default) = flat_dispatch_cache.get(&shape.func_name)?;
-    let arr = compiled_flat_arrays.get(array_id as usize)?;
-
-    log::info!(
-        "[disk-window] recognised: window=[0x{:X},0x{:X}) {} entries, key cell {}, stride {}, inner func {} (array_id {} base_key {} len {})",
-        window_base, window_last + 1, span, shape.key_property, shape.stride,
-        shape.func_name, array_id, base_key, arr.values.len()
-    );
+    // Resolve the inner function's backing. Preference order:
+    //   1. A flat literal array (read-only backing).
+    //   2. A near-packed-byte dispatch over packed cells (writable backing —
+    //      the same cells the cabinet's write rules splice into).
+    // If neither is compiled for the function, the recogniser's
+    // preconditions weren't met — skip silently.
+    let backing = if let Some(&(array_id, base_key, _default)) =
+        flat_dispatch_cache.get(&shape.func_name)
+    {
+        let arr = compiled_flat_arrays.get(array_id as usize)?;
+        log::info!(
+            "[disk-window] recognised: window=[0x{:X},0x{:X}) {} entries, key cell {}, stride {}, key_offset {}, inner func {} → literal array (id {} base_key {} len {})",
+            window_base, window_last + 1, span, shape.key_property, shape.stride,
+            shape.offset, shape.func_name, array_id, base_key, arr.values.len()
+        );
+        CompiledWindowBacking::Literal { base_key, values: arr.values.clone() }
+    } else if let Some(&table_id) = packed_cell_table_cache.get(&shape.func_name) {
+        let pack = near_packed_cache
+            .get(&shape.func_name)
+            .and_then(|c| c.as_ref().map(|(p, _, _)| *p))?;
+        log::info!(
+            "[disk-window] recognised: window=[0x{:X},0x{:X}) {} entries, key cell {}, stride {}, key_offset {}, inner func {} → packed cells (table_id {} pack {})",
+            window_base, window_last + 1, span, shape.key_property, shape.stride,
+            shape.offset, shape.func_name, table_id, pack
+        );
+        CompiledWindowBacking::PackedCells { table_id, pack }
+    } else {
+        return None;
+    };
 
     Some(CompiledWindowedByteArray {
         window_base: window_base as i32,
         window_end: (window_last + 1) as i32,
         key_cell_property: shape.key_property,
         stride: shape.stride,
-        byte_array_base_key: base_key,
-        byte_array: arr.values.clone(),
+        key_offset: shape.offset,
+        backing,
     })
 }
 
@@ -1629,7 +1689,7 @@ struct Compiler<'a> {
     /// Cache: dispatch table name → near-identity exception keys (or None).
     near_identity_cache: HashMap<String, Option<Vec<i64>>>,
     /// Cache: dispatch table name → near-packed-byte (pack, exception keys) or None.
-    near_packed_cache: HashMap<String, Option<(u8, Vec<i64>)>>,
+    near_packed_cache: HashMap<String, Option<(u8, i64, Vec<i64>)>>,
     /// Cache: dispatch table name → table_id into `packed_cell_tables`.
     packed_cell_table_cache: HashMap<String, u32>,
     /// Packed-cell address tables (one per near-packed-byte dispatch).
@@ -2208,9 +2268,9 @@ impl<'a> Compiler<'a> {
                 }
                 // Near-packed-byte-read: CSS-DOS PACK_SIZE=2 memory layout.
                 // Compile as LoadPackedByte + small exception dispatch.
-                if let Some((pack, exception_keys)) = self.check_near_packed_byte(name) {
+                if let Some((pack, cell_offset, exception_keys)) = self.check_near_packed_byte(name) {
                     return self.compile_near_packed_byte_dispatch(
-                        name, args, pack, &exception_keys, ops,
+                        name, args, pack, cell_offset, &exception_keys, ops,
                     );
                 }
             }
@@ -2551,7 +2611,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// Classify a dispatch table as near-packed-byte (cached).
-    fn check_near_packed_byte(&mut self, name: &str) -> Option<(u8, Vec<i64>)> {
+    fn check_near_packed_byte(&mut self, name: &str) -> Option<(u8, i64, Vec<i64>)> {
         prof!("check_near_packed_byte");
         if let Some(cached) = self.near_packed_cache.get(name) {
             return cached.clone();
@@ -2569,12 +2629,14 @@ impl<'a> Compiler<'a> {
     /// whose expression is a compile-time literal (e.g., ROM bytes). These are
     /// handled inside Op::LoadPackedByte at runtime via an O(1) HashMap lookup
     /// BEFORE the packed-byte extract, avoiding per-call-site inline branches.
-    fn get_or_build_packed_cell_table(&mut self, name: &str, pack: u8) -> u32 {
+    fn get_or_build_packed_cell_table(&mut self, name: &str, pack: u8, cell_offset: i64) -> u32 {
         if let Some(&id) = self.packed_cell_table_cache.get(name) {
             return id;
         }
         let table = self.dispatch_tables.get(name).expect("dispatch table exists");
         // Find max N referenced by packed entries + collect literal exceptions.
+        // N is in KEY space (key/pack); the backing cell's name index is
+        // N + cell_offset (see classify_near_packed_byte).
         let mut max_n: i64 = -1;
         let mut literal_exceptions: Vec<(i64, i32)> = Vec::new();
         for (&key, expr) in &table.entries {
@@ -2586,7 +2648,7 @@ impl<'a> Compiler<'a> {
             } else {
                 match_high_byte_extract(expr)
             };
-            if cell_n == Some(expected_n) {
+            if cell_n.map(|n| n as i64) == Some(expected_n as i64 + cell_offset) {
                 max_n = max_n.max(expected_n as i64);
             } else if let Expr::Literal(v) = expr {
                 literal_exceptions.push((key, *v as i32));
@@ -2597,7 +2659,7 @@ impl<'a> Compiler<'a> {
         let len = (max_n + 1) as usize;
         let mut addrs = vec![0i32; len];
         for n in 0..len {
-            let cell_name = format!("mc{}", n);
+            let cell_name = format!("mc{}", n as i64 + cell_offset);
             if let Some(addr) = crate::eval::property_to_address(&cell_name) {
                 addrs[n] = addr;
             }
@@ -2640,11 +2702,12 @@ impl<'a> Compiler<'a> {
         name: &str,
         args: &[Expr],
         pack: u8,
+        cell_offset: i64,
         exception_keys: &[i64],
         ops: &mut Vec<Op>,
     ) -> Slot {
         prof!("compile_near_packed_byte_dispatch");
-        let table_id = self.get_or_build_packed_cell_table(name, pack);
+        let table_id = self.get_or_build_packed_cell_table(name, pack, cell_offset);
         let table = self.dispatch_tables.remove(name).unwrap();
         let func = self.functions.get(name);
 
@@ -2705,20 +2768,26 @@ impl<'a> Compiler<'a> {
             }
             // Try to recognise a "windowed byte array" shape across the inline
             // exceptions: a contiguous run of keys whose entries all decode as
-            // `--func((u16 cell) * stride + offset)` with offset = key - window_base
-            // and the same (func, cell, stride). On success the descriptor is
-            // stashed on self for `CompiledProgram` to pick up later. Runs
-            // AFTER per-entry compilation so the inner function (e.g.
-            // `--readDiskByte`) is in `flat_dispatch_cache`. The inline
-            // branches are emitted regardless — the runtime State short-circuit
-            // catches reads first, but the inline path is the correct fallback
-            // for any cabinet/future shape that doesn't fit the recogniser.
-            if self.recognised_windowed_byte_array.is_none() && name == "--readMem" {
+            // `--func((u16 cell) * stride + offset)` with a constant delta
+            // between offset and in-window position, and the same (func, cell,
+            // stride). On success the descriptor is stashed on self for
+            // `CompiledProgram` to pick up later. Runs AFTER per-entry
+            // compilation so the inner function's backing (flat literal array
+            // or near-packed cell table) is in the respective cache. The
+            // inline branches are emitted regardless — the runtime State
+            // short-circuit catches reads first, but the inline path is the
+            // correct fallback for any cabinet/future shape that doesn't fit
+            // the recogniser. Attempted on any dispatch with inline
+            // exceptions (purely structural — no property-name test);
+            // first successful recognition wins.
+            if self.recognised_windowed_byte_array.is_none() {
                 self.recognised_windowed_byte_array = recognise_windowed_byte_array(
                     &table,
                     &inline_exceptions,
                     &self.flat_dispatch_cache,
                     &self.compiled_flat_arrays,
+                    &self.packed_cell_table_cache,
+                    &self.near_packed_cache,
                 );
             }
             let result_slot = self.alloc();

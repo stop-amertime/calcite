@@ -470,8 +470,15 @@ fn memchr_fallback(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Learn a template from the collected entries and, if successful, emit
-/// pre-built `BroadcastWrite`s for the caller. If the shape isn't what we
-/// can lower into broadcast writes, we leave the bytes alone.
+/// pre-built `BroadcastWrite`s / `PackedSlotPort`s for the caller. If the
+/// shape isn't what we can lower, we leave the bytes alone (the slow parser
+/// picks them up).
+///
+/// A single physical run can contain several structurally-distinct segments
+/// back to back — e.g. two write-port families whose templates differ. The
+/// run is processed as a sequence of maximal verified segments: learn a
+/// template for the segment head, absorb entries while they verify, then
+/// start over at the first mismatch.
 fn emit_assignment_run(
     bytes: &[u8],
     prefix: &[u8],
@@ -503,66 +510,132 @@ fn emit_assignment_run(
         return;
     }
 
-    let (ra_idx, rb_idx, rc_idx) = pick_reference_triple(entries);
-    let (ra_start, ra_end, ra_addr) = entries[ra_idx];
-    let (rb_start, rb_end, rb_addr) = entries[rb_idx];
-    let (rc_start, rc_end, rc_addr) = entries[rc_idx];
-    let body_a = &bytes[ra_start..ra_end];
-    let body_b = &bytes[rb_start..rb_end];
-    let body_c = &bytes[rc_start..rc_end];
-
-    let (literals, mut hole_kinds) = match learn_template(body_a, ra_addr, body_b, rb_addr, body_c, rc_addr) {
-        Some(t) => t,
-        None => {
-            log::info!(
-                "[fast-path] assignment run with prefix `--{}` (entries={}) — template unlearnable, skipping",
-                String::from_utf8_lossy(prefix),
-                entries.len(),
-            );
-            return;
+    let mut rest = entries;
+    while rest.len() >= 3 {
+        let consumed = emit_assignment_segment(bytes, prefix, rest, result);
+        if consumed == 0 {
+            // Defensive: a segment must always consume ≥ 1 entry.
+            break;
         }
+        rest = &rest[consumed..];
+    }
+}
+
+/// Process one segment at the head of `entries`. Returns the number of
+/// entries consumed (absorbed or deliberately skipped); the caller resumes
+/// after them. Entries left unconsumed-and-unabsorbed keep their source
+/// bytes and flow through the ordinary (slow) parser.
+fn emit_assignment_segment(
+    bytes: &[u8],
+    prefix: &[u8],
+    entries: &[(usize, usize, u64)],
+    result: &mut FastPathResult,
+) -> usize {
+    let learn_from = |ia: usize, ib: usize, ic: usize| {
+        let (sa, ea, aa) = entries[ia];
+        let (sb, eb, ab) = entries[ib];
+        let (sc, ec, ac) = entries[ic];
+        learn_template(&bytes[sa..ea], aa, &bytes[sb..eb], ab, &bytes[sc..ec], ac)
+    };
+
+    // Learn a template. Spread refs first — robust against coincidental
+    // constants on uniform runs — then fall back to the segment-head triple
+    // (a mixed run's spread refs straddle segment boundaries and disagree).
+    let (ra_idx, rb_idx, rc_idx) = pick_reference_triple(entries);
+    let mut learned = learn_from(ra_idx, rb_idx, rc_idx);
+    let mut spread = learned.is_some();
+    if learned.is_none() {
+        learned = learn_from(0, 1, 2);
+        }
+    let Some((mut literals, mut hole_kinds)) = learned else {
+        log::info!(
+            "[fast-path] assignment run with prefix `--{}` (entries={}) — template unlearnable, skipping",
+            String::from_utf8_lossy(prefix),
+            entries.len(),
+        );
+        return entries.len();
     };
     // Refine: promote Const holes to Free if any sampled entry contradicts
-    // the learned constant. Catches "all refs coincidentally agree on a
-    // common value" — e.g. `initial-value: 0` is common so three random
-    // picks may all agree even though cells with ROM data differ.
-    if !refine_template(bytes, entries, &literals, &mut hole_kinds) {
+    // the learned constant. Only meaningful for a template meant to span the
+    // whole slice; a structural mismatch means the slice is mixed — fall
+    // back to the head-anchored template and let verification bound the
+    // segment instead.
+    if spread && !refine_template(bytes, entries, &literals, &mut hole_kinds) {
+        match learn_from(0, 1, 2) {
+            Some((l, k)) => {
+                literals = l;
+                hole_kinds = k;
+                spread = false;
+            }
+            None => {
+                log::info!(
+                    "[fast-path] assignment run `--{}` failed refinement and head re-learn, skipping",
+                    String::from_utf8_lossy(prefix),
+                );
+                return entries.len();
+            }
+        }
+    }
+    let _ = spread;
+
+    // Verify entries in order; the segment ends at the first mismatch.
+    let mut seg_len = 0usize;
+    for &(s, e, a) in entries {
+        if verify_entry(&bytes[s..e], &literals, &hole_kinds, a).is_none() {
+            break;
+        }
+        seg_len += 1;
+    }
+    if seg_len < 3 {
+        // The head triple doesn't even cover itself coherently — don't
+        // risk quadratic re-learning; leave the rest to the slow parser.
         log::info!(
-            "[fast-path] assignment run `--{}` failed refinement, skipping",
+            "[fast-path] assignment run `--{}` — segment head unverifiable, leaving {} entries to the parser",
             String::from_utf8_lossy(prefix),
+            entries.len(),
         );
-        return;
+        return entries.len();
+    }
+    let seg = &entries[..seg_len];
+    if seg_len < entries.len() {
+        log::info!(
+            "[fast-path] assignment run `--{}` splits at entry {} (of {}) — multi-segment run",
+            String::from_utf8_lossy(prefix),
+            seg_len,
+            entries.len(),
+        );
     }
 
     // Assignments with `Free` holes would need per-entry data to build
     // their Expr body, but we bypass Expr construction. The broadcast-write
     // fast path relies on every cell having identical structure modulo the
-    // addr parameter, so a `Free` hole means the run isn't suitable — bail.
+    // addr parameter, so a `Free` hole means the segment isn't suitable —
+    // consume it without absorbing (the slow parser + post-parse
+    // recognisers handle it).
     if hole_kinds.iter().any(|k| *k == HoleKind::Free) {
         log::info!(
-            "[fast-path] assignment run `--{}` has per-entry Free holes, skipping",
+            "[fast-path] assignment run `--{}` segment ({} entries) has per-entry Free holes, leaving to the parser",
             String::from_utf8_lossy(prefix),
+            seg_len,
         );
-        return;
+        return seg_len;
     }
 
-    // Verify all entries match. If any don't, we bail entirely for this
-    // run — we never want a partial fast-path where some cells are
-    // prebuilt and others fall through: it'd corrupt the broadcast-write
-    // address_map (missing keys) silently.
-    for &(s, e, a) in entries {
-        let body = &bytes[s..e];
-        if verify_entry(body, &literals, &hole_kinds, a).is_none() {
-            log::info!(
-                "[fast-path] assignment run `--{}` entries={} — cell at addr={} failed verification, skipping",
-                String::from_utf8_lossy(prefix),
-                entries.len(),
-                a,
-            );
-            return;
-        }
-    }
+    emit_learned_segment(bytes, prefix, seg, &literals, &hole_kinds, result);
+    seg_len
+}
 
+/// Emit prebuilt ports/broadcasts for a fully-verified segment.
+fn emit_learned_segment(
+    bytes: &[u8],
+    prefix: &[u8],
+    entries: &[(usize, usize, u64)],
+    literals: &[&[u8]],
+    hole_kinds: &[HoleKind],
+    result: &mut FastPathResult,
+) {
+    let (_, _, ra_addr) = entries[pick_reference_triple(entries).0];
+    let _ = bytes;
     // Parse the template body through cssparser ONCE to extract the
     // broadcast-write shape: which dest_properties, which value_exprs,
     // which gate, which fallback. We re-use the existing post-parse

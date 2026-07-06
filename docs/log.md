@@ -11,6 +11,61 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-07-06 — windowed byte array grows a writable (packed-cell) backing; affine packed families
+
+Cross-cutting with CSS-DOS's session-writable disk (`disk.writable`,
+see CSS-DOS LOGBOOK 2026-07-06). A writable window's cabinet shape:
+the window dispatch's inner function reads packed `--mc{N}` cells
+whose NAME indices sit at a constant offset from the key space, and
+the cells' `--applySlot` write cascades key on a second, window-local
+address property. Four generic (shape-only) extensions:
+
+- **`recognise_windowed_byte_array`** (`compile.rs`): arm runs no
+  longer need offset-0 anchors — any constant `offset − (key −
+  window_base)` delta works (carried as `key_offset`); the inner
+  function may now be a near-packed-byte dispatch, giving the
+  descriptor a `PackedCells { table_id, pack }` backing next to the
+  literal-array one. The `name == "--readMem"` guard is gone — the
+  recogniser is attempted on any dispatch with inline exceptions
+  (first success wins; purely structural).
+- **`state::WindowedByteArray`** gains `backing: WindowBacking`
+  (`Literal` | `PackedCells`). `read_mem` resolves window reads
+  through either; **`write_mem` now routes window writes** into
+  `PackedCells` backings (same key-remapped splice the cabinet's own
+  write rules perform) and keeps dropping them on `Literal` (rom
+  semantics).
+- **`classify_near_packed_byte` / `get_or_build_packed_cell_table`**:
+  a dispatch's packed arms may reference cells at `key/pack + C` for
+  a constant `C` derived from the arms (was: C = 0 only). The dense
+  addr table stays keyed in key-space; only the name lookup shifts.
+- **`recognise_packed_broadcast`**: port FAMILIES. Cells may split
+  into disjoint groups keyed on different address properties, each
+  port carrying its own constant name/arith delta; `address_map` is
+  now keyed by the ARITHMETIC byte address (the value the addr
+  property actually takes), so the runtime is unchanged. The old
+  "every port covers every cell" check became per-port completeness.
+- **`fast_path` assignment runs are segmented**: a physical `--mc`
+  run holding two structurally-distinct templates back to back (two
+  write families) now absorbs the leading uniform segment and leaves
+  the rest to the slow parser instead of bailing wholesale. On the
+  writable test cabinet: 329,680 RAM cells absorbed prebuilt, 184,320
+  disk cells slow-parsed then port-recognised (parse 1.7 → 2.6 s).
+- **`rep_applier` Copy**: a destination range entirely inside a
+  cell-backed window is serviced per-byte via `state.write_mem`
+  (bulk `REP MOVSW` into the window — the BIOS write path); every
+  other virtual-region destination still refuses loudly.
+
+Genericity: no new property-name knowledge anywhere (the one literal
+name test in the windowed recogniser was removed); deltas/offsets are
+derived from CSS shape per table/port. Verified: 288+ unit tests
+green, CSS-DOS smoke 6/6, writable e2e (`run.mjs writable` — batch
+writes a file via INT 13h AH=03h, TYPEs it back) green on calcite
+AND on the JS reference machine; rom-cabinet behaviour unchanged
+(smoke + zero-diff shapes — rom runs recognise with `key_offset: 0`,
+`Literal` backing, delta-0 single family, exactly as before).
+Throughput on the writable cabinet ~290K t/s vs ~584K rom (the
+shadow's extra state + per-tick remap props); rom carts unaffected.
+
 ## 2026-07-03 — deleted leftover compile diagnostics that flooded the browser console
 
 Two ungated debug blocks in `compile.rs` are gone: the `[linear

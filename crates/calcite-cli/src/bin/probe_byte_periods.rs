@@ -95,8 +95,16 @@ fn main() {
         }
     };
 
-    let bytes: Vec<u8> = dw
-        .byte_array
+    let (base_key, values) = match &dw.backing {
+        calcite_core::compile::CompiledWindowBacking::Literal { base_key, values } => {
+            (*base_key, values)
+        }
+        calcite_core::compile::CompiledWindowBacking::PackedCells { .. } => {
+            eprintln!("ERROR: windowed_byte_array is packed-cell-backed — no literal byte array to scan.");
+            std::process::exit(1);
+        }
+    };
+    let bytes: Vec<u8> = values
         .iter()
         .map(|&v| (v & 0xFF) as u8)
         .collect();
@@ -105,7 +113,7 @@ fn main() {
         dw.window_base,
         dw.window_end,
         dw.stride,
-        dw.byte_array_base_key,
+        base_key,
         bytes.len()
     );
 

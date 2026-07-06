@@ -191,14 +191,36 @@ pub struct WindowedByteArray {
     pub key_cell_slot: usize,
     /// Multiplier applied to the cell value before adding in-window offset.
     pub stride: i32,
-    /// First key represented by `byte_array[0]`. Subtract this from the
-    /// computed key before indexing. (The cabinet's `--readDiskByte` flat
-    /// array is base-keyed at the first non-zero entry, not at zero.)
-    pub byte_array_base_key: i32,
-    /// The flat byte array `--readDiskByte`'s dispatch compiles to. Shared
-    /// with `CompiledProgram::flat_dispatch_arrays` so we don't duplicate
-    /// the (potentially multi-MB) byte data.
-    pub byte_array: std::sync::Arc<Vec<i32>>,
+    /// Constant added to `key * stride + (addr - window_base)` before the
+    /// backing lookup — the dispatch arms' anchor offset (zero for arms
+    /// addressed from 0, non-zero for base-shifted key spaces).
+    pub key_offset: i32,
+    /// Where the window's bytes live.
+    pub backing: WindowBacking,
+}
+
+/// Backing store for a [`WindowedByteArray`].
+#[derive(Debug, Clone)]
+pub enum WindowBacking {
+    /// A read-only literal byte array (the inner dispatch flattened to
+    /// literals). `computed_key - base_key` indexes `values`; out of range
+    /// reads 0 (the dispatch default). Window writes are dropped — the CSS
+    /// has no property backing the window.
+    Literal {
+        base_key: i32,
+        /// Shared with `CompiledProgram::flat_dispatch_arrays` so we don't
+        /// duplicate the (potentially multi-MB) byte data.
+        values: std::sync::Arc<Vec<i32>>,
+    },
+    /// Bytes live in packed state-var cells: `computed_key / pack` indexes
+    /// `cell_table` (state-var addresses, 0 = no cell), `computed_key %
+    /// pack` selects the byte within the cell. Window writes splice into
+    /// the same cells — mirroring what the cabinet's own write rules do
+    /// through the CSS path.
+    PackedCells {
+        cell_table: std::sync::Arc<Vec<i32>>,
+        pack: u8,
+    },
 }
 
 impl State {
@@ -483,22 +505,41 @@ impl State {
                         .copied()
                         .unwrap_or(0);
                     let computed_key = key.wrapping_mul(dw.stride)
-                        .wrapping_add(addr - dw.window_base);
-                    let idx = computed_key.wrapping_sub(dw.byte_array_base_key);
-                    if idx >= 0 {
-                        if let Some(&v) = dw.byte_array.get(idx as usize) {
-                            if let Ok(mut borrow) = self.read_log.try_borrow_mut() {
-                                if let Some(ref mut log) = *borrow { log.push((addr, v)); }
+                        .wrapping_add(addr - dw.window_base)
+                        .wrapping_add(dw.key_offset);
+                    let v = match dw.backing {
+                        WindowBacking::Literal { base_key, ref values } => {
+                            let idx = computed_key.wrapping_sub(base_key);
+                            if idx >= 0 {
+                                values.get(idx as usize).copied().unwrap_or(0)
+                            } else {
+                                // Out of array → byte was 0 in the cabinet
+                                // (the flat array's `default`).
+                                0
                             }
-                            return v;
                         }
-                    }
-                    // Out of array → byte was 0 in the cabinet (the flat
-                    // array's `default`).
+                        WindowBacking::PackedCells { ref cell_table, pack } => {
+                            let pack = pack as i32;
+                            let cell_idx = computed_key / pack;
+                            let mut byte = 0;
+                            if cell_idx >= 0 {
+                                if let Some(&cell_addr) = cell_table.get(cell_idx as usize) {
+                                    if cell_addr < 0 {
+                                        let sidx = (-cell_addr - 1) as usize;
+                                        if let Some(&cell) = self.state_vars.get(sidx) {
+                                            let off = (computed_key % pack) as u32;
+                                            byte = (cell >> (8 * off)) & 0xFF;
+                                        }
+                                    }
+                                }
+                            }
+                            byte
+                        }
+                    };
                     if let Ok(mut borrow) = self.read_log.try_borrow_mut() {
-                        if let Some(ref mut log) = *borrow { log.push((addr, 0)); }
+                        if let Some(ref mut log) = *borrow { log.push((addr, v)); }
                     }
-                    return 0;
+                    return v;
                 }
             }
             if addr_u >= 0xF0000 {
@@ -583,6 +624,41 @@ impl State {
         if addr_u >= 0xF0000 {
             self.extended.insert(addr, value);
             return;
+        }
+        // Windowed byte array: writes into the window follow the same
+        // key-remap as reads. Cell-backed windows splice the byte into the
+        // backing state var (the same store the cabinet's own write rules
+        // hit through the CSS path); literal-backed windows drop the write
+        // (no property backs the window in the CSS).
+        if let Some(ref dw) = self.windowed_byte_array {
+            if addr >= dw.window_base && addr < dw.window_end {
+                if let WindowBacking::PackedCells { ref cell_table, pack } = dw.backing {
+                    let key = self.state_vars
+                        .get(dw.key_cell_slot)
+                        .copied()
+                        .unwrap_or(0);
+                    let computed_key = key.wrapping_mul(dw.stride)
+                        .wrapping_add(addr - dw.window_base)
+                        .wrapping_add(dw.key_offset);
+                    let pack = pack as i32;
+                    let cell_idx = computed_key / pack;
+                    if cell_idx >= 0 {
+                        if let Some(&cell_addr) = cell_table.get(cell_idx as usize) {
+                            if cell_addr < 0 {
+                                let sidx = (-cell_addr - 1) as usize;
+                                if sidx < self.state_vars.len() {
+                                    let off = (computed_key % pack) as u32;
+                                    let shift = 8 * off;
+                                    let mask = !(0xFFi32 << shift);
+                                    self.state_vars[sidx] = (self.state_vars[sidx] & mask)
+                                        | ((value & 0xFF) << shift);
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
         }
         let byte = (value & 0xFF) as u8;
         self.write_byte_packed_aware(addr_u, byte);

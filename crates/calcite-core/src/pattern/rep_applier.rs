@@ -631,11 +631,23 @@ pub(crate) fn apply_copy_with_commit(
     // destination is written through `bulk_store_byte` which routes
     // similarly, but the hardcoded path bails on virtual-region writes
     // (it has stricter assumptions about whether the bulk path matches
-    // CSS-side writeback). Match its behaviour.
+    // CSS-side writeback). Match its behaviour — with one carve-out: a
+    // destination range entirely inside a cell-backed (writable)
+    // windowed byte array is serviced per-byte through `state.write_mem`,
+    // which performs the same key-remapped cell splice the cabinet's own
+    // write rules do. Literal-backed (read-only) windows and every other
+    // virtual region still refuse loudly.
     let dst_seg_base = (dst_seg_value as i64) * 16;
     let dst_lo_linear = dst_seg_base + dst_lo;
     let dst_hi_linear = dst_seg_base + dst_hi;
-    if ranges_overlap_virtual(state, dst_lo_linear, dst_hi_linear - dst_lo_linear) {
+    let dst_in_writable_window = state.windowed_byte_array.as_ref().is_some_and(|dw| {
+        matches!(dw.backing, crate::state::WindowBacking::PackedCells { .. })
+            && dst_lo_linear >= dw.window_base as i64
+            && dst_hi_linear <= dw.window_end as i64
+    });
+    if !dst_in_writable_window
+        && ranges_overlap_virtual(state, dst_lo_linear, dst_hi_linear - dst_lo_linear)
+    {
         return ApplyOutcome::Unsupported("destination range overlaps virtual region");
     }
 
@@ -664,7 +676,7 @@ pub(crate) fn apply_copy_with_commit(
     let src_ptr_i64 = src_ptr_value as i64;
 
     let mut copied_bulk = false;
-    if signed_step > 0 {
+    if signed_step > 0 && !dst_in_writable_window {
         let total = n64 * (descriptor.writes.len() as i64);
         let src_linear = src_seg_base + src_ptr_i64;
         let dst_linear = dst_seg_base + dst_ptr_i64;
@@ -682,7 +694,14 @@ pub(crate) fn apply_copy_with_commit(
                 let s = src_iter_base + k;
                 let d = dst_iter_base + k;
                 let b = (state.read_mem(s as i32) & 0xFF) as u8;
-                bulk_store_byte(state, d, b);
+                if dst_in_writable_window {
+                    // Route through write_mem so the windowed byte array's
+                    // key-remapped cell splice applies (bulk_store_byte
+                    // writes raw memory/cells and would miss the window).
+                    state.write_mem(d as i32, b as i32);
+                } else {
+                    bulk_store_byte(state, d, b);
+                }
             }
         }
     }

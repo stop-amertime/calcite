@@ -102,23 +102,59 @@ const MIN_CELLS_FOR_RECOGNITION: usize = 100;
 /// Returns empty result if fewer than `MIN_CELLS_FOR_RECOGNITION` cells matched.
 pub fn recognise_packed_broadcast(assignments: &[Assignment]) -> PackedBroadcastResult {
     // Map from (gate, addr, val, width) → port being built.
+    //
+    // A cabinet can carry several PORT FAMILIES — disjoint groups of cells
+    // written through different address properties (e.g. one family keyed
+    // on a guest-linear address, another on a window-local offset). Each
+    // family's layers reference its own address property, so families land
+    // in distinct ports here. Within one port, the cell's NAME index may
+    // sit at a constant offset from the offset-arithmetic's byte address
+    // (`delta` below): the address_map is keyed by the ARITHMETIC byte
+    // address — the value space the addr property takes at runtime — so
+    // the runtime lookup needs no delta at all.
     type PortKey = (String, String, String, String);
-    let mut ports: HashMap<PortKey, PackedSlotPort> = HashMap::new();
+    struct PortBuild {
+        port: PackedSlotPort,
+        /// name byte addr − arithmetic byte addr; must be constant per port.
+        delta: i64,
+        /// Number of assignments that contributed a layer to this port.
+        expected: usize,
+    }
+    let mut ports: HashMap<PortKey, PortBuild> = HashMap::new();
     let mut absorbed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for assignment in assignments {
         let Some(cell_idx) = parse_packed_cell_index(&assignment.property) else {
             continue;
         };
-        // Cell N → byte address 2N (PACK_SIZE=2 hardcoded for now).
-        let cell_byte_addr = (cell_idx as i64) * 2;
+        // Cell N → NAME byte address 2N (PACK_SIZE=2 hardcoded for now).
+        let name_byte_addr = (cell_idx as i64) * 2;
         let layers = match decompose_apply_slot_chain(&assignment.value, &assignment.property) {
             Some(layers) => layers,
             None => continue,
         };
-        // Every layer of every cell must have the same (gate, addr, val, width)
-        // shape. We group layers by that quadruple — typically the cabinet
-        // produces NUM_WRITE_SLOTS distinct tuples (3 in the current scheme).
+        // Validate before inserting: every layer's (name − arith) delta must
+        // match its port's established delta, and no duplicate arithmetic key
+        // may appear within a port. On any mismatch skip the whole assignment
+        // — partial absorption is dangerous.
+        let ok = layers.iter().all(|layer| {
+            let key = (
+                layer.gate_property.clone(),
+                layer.addr_property.clone(),
+                layer.val_property.clone(),
+                layer.width_property.clone(),
+            );
+            match ports.get(&key) {
+                Some(pb) => {
+                    pb.delta == name_byte_addr - layer.cell_byte_addr
+                        && !pb.port.address_map.contains_key(&layer.cell_byte_addr)
+                }
+                None => true,
+            }
+        });
+        if !ok {
+            continue;
+        }
         for layer in layers {
             let key = (
                 layer.gate_property.clone(),
@@ -126,32 +162,21 @@ pub fn recognise_packed_broadcast(assignments: &[Assignment]) -> PackedBroadcast
                 layer.val_property.clone(),
                 layer.width_property.clone(),
             );
-            // The byte-offset arithmetic the layer encodes must equal the
-            // cell's byte address — i.e. `calc(var(--addr) - cell_byte_addr)`.
-            // If a layer's offset doesn't match, the assignment is structurally
-            // wrong for this pattern and we bail out.
-            if layer.cell_byte_addr != cell_byte_addr {
-                // Skip this whole assignment — partial absorption is dangerous.
-                // Erase any partial inserts for this cell (rare; cheaper to do
-                // per-cell than to validate up-front since malformed cells are
-                // expected to be very rare).
-                for port in ports.values_mut() {
-                    port.address_map.remove(&cell_byte_addr);
-                }
-                absorbed.remove(&assignment.property);
-                continue;
-            }
-            let port = ports
-                .entry(key)
-                .or_insert_with(|| PackedSlotPort {
+            let delta = name_byte_addr - layer.cell_byte_addr;
+            let pb = ports.entry(key).or_insert_with(|| PortBuild {
+                port: PackedSlotPort {
                     gate_property: layer.gate_property,
                     addr_property: layer.addr_property,
                     val_property: layer.val_property,
                     width_property: layer.width_property,
                     address_map: HashMap::new(),
                     pack: 2,
-                });
-            port.address_map.insert(cell_byte_addr, assignment.property.clone());
+                },
+                delta,
+                expected: 0,
+            });
+            pb.port.address_map.insert(layer.cell_byte_addr, assignment.property.clone());
+            pb.expected += 1;
         }
         absorbed.insert(assignment.property.clone());
     }
@@ -167,13 +192,12 @@ pub fn recognise_packed_broadcast(assignments: &[Assignment]) -> PackedBroadcast
         };
     }
 
-    // Sanity check: every port should cover the same set of cells. If not,
-    // some cells are missing layers and the per-cell behaviour would diverge.
-    // We require every port's address_map to have the same key set; otherwise
-    // bail.
-    let cell_count = absorbed.len();
-    for port in ports.values() {
-        if port.address_map.len() != cell_count {
+    // Sanity check: every port must hold exactly one entry per assignment
+    // that contributed a layer to it (no silent overwrites). Different
+    // ports may cover different cell sets — that is the family model —
+    // but each port's map must be internally complete.
+    for pb in ports.values() {
+        if pb.port.address_map.len() != pb.expected {
             return PackedBroadcastResult {
                 ports: Vec::new(),
                 absorbed_properties: std::collections::HashSet::new(),
@@ -182,12 +206,17 @@ pub fn recognise_packed_broadcast(assignments: &[Assignment]) -> PackedBroadcast
         }
     }
 
-    let mut ports_vec: Vec<PackedSlotPort> = ports.into_values().collect();
+    let mut ports_vec: Vec<PackedSlotPort> = ports.into_values().map(|pb| pb.port).collect();
     // Sort by gate property so the runtime iteration order is deterministic
     // and matches CSS layer order (slot 0 first). Slot ordering is important:
     // slot 0 is OUTERMOST in the applySlot chain, so it should be applied LAST
-    // at runtime to win same-cell collisions.
-    ports_vec.sort_by(|a, b| a.gate_property.cmp(&b.gate_property));
+    // at runtime to win same-cell collisions. Families with the same gate can
+    // apply in any relative order — their cell sets are disjoint.
+    ports_vec.sort_by(|a, b| {
+        a.gate_property
+            .cmp(&b.gate_property)
+            .then_with(|| a.addr_property.cmp(&b.addr_property))
+    });
 
     PackedBroadcastResult {
         ports: ports_vec,
