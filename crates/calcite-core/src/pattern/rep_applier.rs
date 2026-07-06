@@ -78,6 +78,18 @@ pub(crate) enum ApplyOutcome {
     /// No applier produces this in Phase 2; Phase 3 Task 3.4 (the
     /// precondition wart) wires it up.
     PreconditionNotMet,
+    /// The applier understands the shape but bulk application cannot
+    /// reproduce what per-tick evaluation would compute — e.g. a Copy
+    /// whose SOURCE bytes exist only in compiled dispatch (ROM regions
+    /// with no backing cells), which `state.read_mem` cannot resolve.
+    /// Per-tick CSS evaluation IS correct for these; the dispatcher
+    /// bails silently (with a diag counter) and the loop runs at one
+    /// iteration per tick. Distinct from `Unsupported` (a recogniser/
+    /// applier gap, which panics): here falling back is the *correct*
+    /// semantics, and such loops are structurally rare and short (a
+    /// boot loader copying a parameter table out of ROM, not a hot
+    /// framebuffer path).
+    PerIterFallback(&'static str),
     /// The recogniser produced a descriptor but the applier doesn't
     /// handle this shape (e.g., `BulkClass::PerIter`, or a Copy shape
     /// without indirect-read decomposition). The dispatcher PANICS
@@ -649,6 +661,32 @@ pub(crate) fn apply_copy_with_commit(
         && ranges_overlap_virtual(state, dst_lo_linear, dst_hi_linear - dst_lo_linear)
     {
         return ApplyOutcome::Unsupported("destination range overlaps virtual region");
+    }
+
+    // Virtual-region overlap on the SOURCE side too. `state.read_mem`
+    // resolves packed cells and windowed byte arrays, but NOT regions
+    // whose bytes exist only in compiled dispatch (e.g. a ROM region
+    // emitted as read-only dispatch arms with no backing cells) — for
+    // those it returns 0 and the copy would fabricate zeros. The one
+    // carve-out is a source range entirely inside the windowed byte
+    // array (either backing): read_mem resolves that exactly as the
+    // cabinet's own read rules do. Everything else that's virtual
+    // refuses loudly and falls back to per-tick execution, which
+    // evaluates the cabinet's real dispatch.
+    let src_seg_base_lin = if src_seg_scaled {
+        (src_seg_value as i64) * 16
+    } else {
+        src_seg_value as i64
+    };
+    let src_lo_linear = src_seg_base_lin + src_lo;
+    let src_hi_linear = src_seg_base_lin + src_hi;
+    let src_in_window = state.windowed_byte_array.as_ref().is_some_and(|dw| {
+        src_lo_linear >= dw.window_base as i64 && src_hi_linear <= dw.window_end as i64
+    });
+    if !src_in_window
+        && ranges_overlap_virtual(state, src_lo_linear, src_hi_linear - src_lo_linear)
+    {
+        return ApplyOutcome::PerIterFallback("source range overlaps virtual region");
     }
 
     // Hot loop. Walk per-iter, per-write — same as the hardcoded MOVSW

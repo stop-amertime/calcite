@@ -6707,6 +6707,16 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
             // recogniser gap, it's the cabinet telling us so.
             rep_diag_bail("precondition-not-met");
         }
+        ApplyOutcome::PerIterFallback(_reason) => {
+            // Bulk application can't reproduce per-tick semantics for
+            // this instance (e.g. copy source lives in dispatch-only
+            // ROM that read_mem can't resolve) but per-tick evaluation
+            // is CORRECT — let the CSS run the loop one iteration per
+            // tick. Deliberately not a panic: see the ApplyOutcome
+            // docs. Diag-counted so a perf investigation can spot a
+            // cabinet leaning on this path.
+            rep_diag_bail("per-iter-fallback");
+        }
         ApplyOutcome::Unsupported(reason) => {
             // Recogniser produced a descriptor but the applier
             // refused. Distinct from PreconditionNotMet: this is a

@@ -11,6 +11,31 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-07-06 — rep Copy applier: per-tick fallback when the SOURCE range is unresolvable
+
+Found by CSS-DOS's MS-DOS 4.00 boot (its boot sector copies an
+11-byte table out of the BIOS ROM range with `REP MOVSB`): the bulk
+`Copy` applier read source bytes via `state.read_mem`, which returns
+0 for **dispatch-only virtual regions** (bytes that exist only as
+`--readMem` arms, no backing cell — e.g. the ≥0xF0000 range). The
+fast-forward fabricated zeros where Chrome's per-tick evaluation
+reads real values — a silent wrong-answer, the worst kind under the
+cardinal rule.
+
+Fix (`pattern/rep_applier.rs`, `compile.rs`): new
+`ApplyOutcome::PerIterFallback(reason)` — distinct from
+`Unsupported`, which panics by design (no silent slow paths for
+shapes we claim to handle). `apply_copy_with_commit` computes the
+source linear range (respecting `src_seg_scaled`) and returns
+`PerIterFallback` when it overlaps a virtual region and is not
+entirely inside a windowed byte array (that carve-out stays on the
+bulk path — `read_mem` resolves it). The dispatcher logs a rep-diag
+bail and lets normal per-tick evaluation run, which is correct by
+construction. Verified: CSS-DOS ROM-copy probe cabinet (fabricated
+zeros before, real bytes after), MS-DOS 4.00 boots to `A>` + DIR
+via `--press-events`, 288 unit tests, CSS-DOS smoke 7/7.
+Cross-link: CSS-DOS LOGBOOK 2026-07-06-msdos4-boot-stage3.
+
 ## 2026-07-06 — windowed byte array grows a writable (packed-cell) backing; affine packed families
 
 Cross-cutting with CSS-DOS's session-writable disk (`disk.writable`,
