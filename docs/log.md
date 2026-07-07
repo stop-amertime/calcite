@@ -11,6 +11,21 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-07-07 — calcite-cli: `--press-events` accepts a pseudo-class prefix (`checked@kb-holdmode`)
+
+Not perf — dev-tooling. Press events were hardcoded to the `active`
+pseudo, so CLI runs couldn't drive checkbox-backed wires (CSS-DOS's
+hold wire keys on `:checked`), which made chorded-modifier behaviour
+untestable outside a browser. Format is now
+`TICK:[+|-][PSEUDO@]SELECTOR`, default pseudo `active` (fully
+backward compatible). Pseudo names are opaque strings passed to
+`set_pseudo_class_active` — no upstream knowledge. Used by CSS-DOS to
+verify the Corduroy 0.6.0 modifier work end-to-end on calcite-cli
+(hold → Shift tap → A tap → 'A'; Ctrl+C → DOS break; drain clears
+flags — see CSS-DOS LOGBOOK 2026-07-07).
+
+---
+
 ## 2026-07-07 — parse fast-path: AddrOffset holes absorb region-relative packed runs (msdos4 wasm compile 105s → 10.8s)
 
 CSS-DOS's writable msdos4 cabinet (464 MB) took **105 s** to compile

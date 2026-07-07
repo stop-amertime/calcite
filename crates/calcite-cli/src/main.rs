@@ -118,16 +118,18 @@ struct Cli {
 
     /// Inject pseudo-class press/release events at specific ticks.
     ///
-    /// Format: TICK:[+|-]SELECTOR,TICK:[+|-]SELECTOR,...
+    /// Format: TICK:[+|-][PSEUDO@]SELECTOR,...
     /// `+` (or no prefix) presses; `-` releases. SELECTOR is the id-
-    /// selector text without the leading `#` (e.g. `kb-a`). The event
-    /// flips the (`active`, SELECTOR) pseudo-class match edge on
-    /// `state.pseudo_active`; the cabinet's
-    /// `&:has(#SELECTOR:active) { --PROP: V }` rule produces V via
+    /// selector text without the leading `#` (e.g. `kb-a`). PSEUDO
+    /// defaults to `active`; any pseudo-class name the cabinet keys on
+    /// works (e.g. `checked@kb-holdmode` for checkbox-backed wires).
+    /// The event flips the (PSEUDO, SELECTOR) pseudo-class match edge
+    /// on `state.pseudo_active`; the cabinet's
+    /// `&:has(#SELECTOR:PSEUDO) { --PROP: V }` rule produces V via
     /// calcite's input-edge recogniser.
     ///
-    /// Example: `--press-events=50:kb-a,100:-kb-a`
-    /// Presses kb-a at tick 50, releases at tick 100.
+    /// Example: `--press-events=50:kb-a,100:-kb-a,200:checked@kb-holdmode`
+    /// Presses kb-a at 50, releases it at 100, checks kb-holdmode at 200.
     #[arg(long, value_name = "EVENTS")]
     press_events: Option<String>,
 
@@ -645,25 +647,25 @@ fn main() {
             });
 
             /// Apply any press-events scheduled for `tick` to `state`.
-            /// Each event is (tick, selector, active); only events
-            /// whose tick matches fire.
+            /// Each event is (tick, pseudo, selector, active); only
+            /// events whose tick matches fire.
             fn apply_press_events(
-                events: &[(u32, String, bool)],
+                events: &[(u32, String, String, bool)],
                 tick: u32,
                 state: &mut calcite_core::State,
             ) {
-                for (ev_tick, sel, active) in events {
+                for (ev_tick, pseudo, sel, active) in events {
                     if *ev_tick == tick {
-                        state.set_pseudo_class_active("active", sel, *active);
+                        state.set_pseudo_class_active(pseudo, sel, *active);
                     }
                 }
             }
 
-            // Parse --press-events=TICK:[+|-]SELECTOR,TICK:[+|-]SELECTOR,...
-            // Each event is (tick, selector, active). `+` or no prefix
-            // means press; `-` means release. The pseudo-class is
-            // always "active".
-            let press_events: Vec<(u32, String, bool)> = cli.press_events.as_ref().map(|s| {
+            // Parse --press-events=TICK:[+|-][PSEUDO@]SELECTOR,...
+            // Each event is (tick, pseudo, selector, active). `+` or no
+            // prefix means press; `-` means release. PSEUDO defaults to
+            // "active" (`checked@kb-holdmode` drives checkbox wires).
+            let press_events: Vec<(u32, String, String, bool)> = cli.press_events.as_ref().map(|s| {
                 s.split(',')
                     .filter(|part| !part.is_empty())
                     .map(|part| {
@@ -678,10 +680,14 @@ fn main() {
                         } else {
                             (true, sel_part.to_string())
                         };
-                        if sel.is_empty() {
-                            panic!("Empty selector in press-event: {part:?}");
+                        let (pseudo, sel) = match sel.split_once('@') {
+                            Some((p, s)) => (p.to_string(), s.to_string()),
+                            None => ("active".to_string(), sel),
+                        };
+                        if sel.is_empty() || pseudo.is_empty() {
+                            panic!("Empty selector/pseudo in press-event: {part:?}");
                         }
-                        (tick, sel, active)
+                        (tick, pseudo, sel, active)
                     })
                     .collect()
             }).unwrap_or_default();
@@ -875,7 +881,7 @@ fn main() {
                     while cursor < target {
                         let next_event = press_events
                             .iter()
-                            .map(|(t, _, _)| *t)
+                            .map(|(t, _, _, _)| *t)
                             .filter(|&t| t >= cursor && t < target)
                             .min();
                         let stop = next_event.unwrap_or(target);
@@ -1330,7 +1336,7 @@ fn main() {
                     // Determine this batch's size: capped by remaining ticks and
                     // by the next scripted press-event (if any).
                     let mut batch = batch_cap.min(ticks_limit - tick);
-                    for (ev_tick, _, _) in &press_events {
+                    for (ev_tick, _, _, _) in &press_events {
                         if *ev_tick >= tick && *ev_tick < tick + batch {
                             batch = ev_tick - tick;
                             if batch == 0 { batch = 1; break; } // fire this tick immediately
