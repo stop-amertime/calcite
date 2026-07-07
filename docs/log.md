@@ -11,6 +11,40 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-07-07 — parse fast-path: AddrOffset holes absorb region-relative packed runs (msdos4 wasm compile 105s → 10.8s)
+
+CSS-DOS's writable msdos4 cabinet (464 MB) took **105 s** to compile
+in the browser vs 6.1 s for doom8088 (same-day A/B) — `parse.cssparser`
+alone was 99 s. Cause: the 245,760 writable-disk shadow-cell
+assignments key their `--applySlot` cascade region-relative
+(`calc(var(--_dskOff2) - <k> * 2)` where k = cellIdx − shadow base),
+so the digit-template learner classified those holes `Free` and left
+the whole ~114 MB segment (plus knock-on remainder) to cssparser —
+whose wasm cost turns pathological at tens of millions of Expr
+allocations.
+
+Fix (`parser/fast_path.rs`): new `HoleKind::AddrOffset(delta)` — a
+hole that tracks the entry's address with a constant learned offset
+(`Addr` is the delta = 0 case). Learned from the three refs, checked
+by refine + per-entry verification like every other kind. The packed
+branch requires ALL AddrOffset holes in a template to share one delta
+and keys each entry's port at `(addr + delta) * pack`; mixed deltas
+and the flat-broadcast branch bail to the slow parser. The @property
+path demotes AddrOffset → Free so per-entry initial-values can never
+inherit the ref's materialised value. Pure byte-shape learning — no
+upstream knowledge (fires on any cabinet with region-relative array
+runs).
+
+Verified: 4 new unit tests (+ suite green, 311 lib tests);
+calcite-cli A/B byte-identical pre/post (msdos4 banner tick 1,450,000
+cycles 17,663,725; dos-writable sentinel tick 2,350,000 cycles
+29,510,330); CSS-DOS gates msdos + writable + smoke 6/6 all PASS.
+Web (new `msdos-boot` bench profile, 3 runs): compileMs 105,443 →
+**10,612/10,812/16,703** (median 10.8 s, run1 cold), blanked 48.6% →
+73.2%, doom compile-only unregressed (6.1 → 5.8 s). JSONs in CSS-DOS
+`docs/benches/msdos-boot-2026-07-07-*.json`. Cross-link: CSS-DOS
+LOGBOOK 2026-07-07-msdos4-compile-wall.
+
 ## 2026-07-06 — rep Copy applier: per-tick fallback when the SOURCE range is unresolvable
 
 Found by CSS-DOS's MS-DOS 4.00 boot (its boot sector copies an

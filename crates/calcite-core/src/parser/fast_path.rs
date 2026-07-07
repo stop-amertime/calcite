@@ -174,6 +174,12 @@ enum HoleKind {
     Addr,
     /// Hole always equals this constant.
     Const(u64),
+    /// Hole tracks the entry's address with a constant offset:
+    /// `hole = addr + delta` (delta ≠ 0; delta = 0 is `Addr`). Region-
+    /// relative addressing produces this — e.g. cells named at a high
+    /// base whose bodies reference the cell's offset *within* the region
+    /// (`--mc<base+k>: ... calc(var(--x) - <k> * 2) ...`).
+    AddrOffset(i64),
     /// Hole is a per-entry free variable — every entry supplies its own
     /// value here. The caller extracts the value at verification time.
     /// Used for e.g. `@property --mN { ... initial-value: <byte>; }`
@@ -225,9 +231,17 @@ fn learn_template<'a>(
         } else if va == vb && va == vc {
             kinds.push(HoleKind::Const(va));
         } else {
-            // Not a shared const, not the addr — treat as per-entry free
-            // variable. Verification will accept any numeric value here.
-            kinds.push(HoleKind::Free);
+            // Addr-with-constant-offset? (Region-relative addressing.)
+            let da = va as i64 - ref_a_addr as i64;
+            let db = vb as i64 - ref_b_addr as i64;
+            let dc = vc as i64 - ref_c_addr as i64;
+            if da == db && da == dc {
+                kinds.push(HoleKind::AddrOffset(da));
+            } else {
+                // Not a shared const, not addr-tracking — treat as per-
+                // entry free variable. Verification accepts any value here.
+                kinds.push(HoleKind::Free);
+            }
         }
     }
     Some((lits_a, kinds))
@@ -271,6 +285,11 @@ fn verify_entry(
                 }
                 HoleKind::Const(c) => {
                     if val != c {
+                        return None;
+                    }
+                }
+                HoleKind::AddrOffset(d) => {
+                    if val as i64 != addr as i64 + d {
                         return None;
                     }
                 }
@@ -636,6 +655,26 @@ fn emit_learned_segment(
 ) {
     let (_, _, ra_addr) = entries[pick_reference_triple(entries).0];
     let _ = bytes;
+    // AddrOffset holes are supported only when they all share ONE delta —
+    // that's the region-relative-addressing shape, where the shared delta
+    // maps each entry's addr into the region's local key space. Mixed
+    // deltas can't be keyed to one port family; leave those to the parser.
+    let mut addr_delta: i64 = 0;
+    for k in hole_kinds {
+        if let HoleKind::AddrOffset(d) = k {
+            if addr_delta == 0 {
+                addr_delta = *d;
+            } else if addr_delta != *d {
+                log::info!(
+                    "[fast-path] assignment run `--{}` has mixed AddrOffset deltas ({} vs {}), leaving to the parser",
+                    String::from_utf8_lossy(prefix),
+                    addr_delta,
+                    d,
+                );
+                return;
+            }
+        }
+    }
     // Parse the template body through cssparser ONCE to extract the
     // broadcast-write shape: which dest_properties, which value_exprs,
     // which gate, which fallback. We re-use the existing post-parse
@@ -669,10 +708,12 @@ fn emit_learned_segment(
     // and replicate across all entries as `PackedSlotPort`s. Matches what
     // `pattern::packed_broadcast_write` does on fully-parsed assignments.
     if let Some(skeletons) =
-        extract_packed_port_skeletons(&parsed_expr, &synth_property, ra_addr)
+        extract_packed_port_skeletons(&parsed_expr, &synth_property, ra_addr, addr_delta)
     {
-        // Every entry's cell_byte_addr is `addr * pack` (pack is hard-coded
-        // 2 in both kiln and the post-parse recogniser).
+        // Every entry's cell_byte_addr is `(addr + delta) * pack` (pack is
+        // hard-coded 2 in both kiln and the post-parse recogniser; delta is
+        // 0 except for region-relative runs, where it maps the cell's name
+        // address into the region-local key space the gate compares against).
         let pack: i64 = 2;
         let mut ports: Vec<PackedSlotPort> = skeletons
             .into_iter()
@@ -686,7 +727,7 @@ fn emit_learned_segment(
             })
             .collect();
         for &(_, _, a) in entries {
-            let cell_byte_addr = (a as i64) * pack;
+            let cell_byte_addr = (a as i64 + addr_delta) * pack;
             let cell_name = format!("--{}{}", prefix_str, a);
             for port in &mut ports {
                 port.address_map.insert(cell_byte_addr, cell_name.clone());
@@ -705,6 +746,18 @@ fn emit_learned_segment(
             entries.len(),
             entries.last().map(|e| e.1 - entries[0].0).unwrap_or(0),
             port_count,
+        );
+        return;
+    }
+
+    // The flat broadcast branch below keys its address_map on the raw
+    // entry addr; with a non-zero delta that keying would be wrong (the
+    // materialised value_expr carries region-relative constants). Only the
+    // packed branch understands deltas — bail to the slow parser here.
+    if addr_delta != 0 {
+        log::info!(
+            "[fast-path] assignment run `--{}` has AddrOffset holes but no packed shape; leaving to the parser",
+            prefix_str,
         );
         return;
     }
@@ -790,16 +843,18 @@ struct PackedPortSkeleton {
 ///                var(--val),
 ///                var(--width))`
 /// and the chain must terminate at `var(--__1{cell_property})` or similar.
-/// The constant `K` in the template equals `ra_addr * pack` (the ref addr's
-/// byte offset) — we check it matches for consistency, but the per-entry
-/// address_map is built from each entry's own addr, not from `K`.
+/// The constant `K` in the template equals `(ra_addr + addr_delta) * pack`
+/// (the ref addr's byte offset in the port family's key space; delta ≠ 0
+/// for region-relative runs) — we check it matches for consistency, but
+/// the per-entry address_map is built from each entry's own addr, not `K`.
 fn extract_packed_port_skeletons(
     expr: &Expr,
     cell_property: &str,
     ra_addr: u64,
+    addr_delta: i64,
 ) -> Option<Vec<PackedPortSkeleton>> {
     let pack: i64 = 2;
-    let expected_k = (ra_addr as i64) * pack;
+    let expected_k = (ra_addr as i64 + addr_delta) * pack;
 
     let mut layers: Vec<PackedPortSkeleton> = Vec::new();
     let mut cur = expr;
@@ -1051,6 +1106,11 @@ fn refine_template(
                         hole_kinds[hi] = HoleKind::Free;
                     }
                 }
+                HoleKind::AddrOffset(d) => {
+                    if hv as i64 != a as i64 + d {
+                        hole_kinds[hi] = HoleKind::Free;
+                    }
+                }
                 HoleKind::Free => {}
             }
         }
@@ -1076,6 +1136,9 @@ fn materialise_template(literals: &[&[u8]], hole_kinds: &[HoleKind], addr: u64) 
             let val = match hole_kinds[i] {
                 HoleKind::Addr => addr,
                 HoleKind::Const(c) => c,
+                // Learned from real entries, so addr + d ≥ 0 for any addr
+                // in the run; clamp defensively anyway.
+                HoleKind::AddrOffset(d) => (addr as i64 + d).max(0) as u64,
                 // Caller is supposed to bail before reaching us when Free
                 // holes are present; use 0 as a defensive placeholder.
                 HoleKind::Free => 0,
@@ -1655,6 +1718,16 @@ fn emit_property_run(
         return;
     }
 
+    // AddrOffset is an assignment-run concept (region-relative port keys);
+    // here it would be an initial-value that happens to track the address,
+    // and the single-parse-plus-override below would bake the REF's value
+    // into every entry. Demote to Free so such holes stay per-entry.
+    for k in hole_kinds.iter_mut() {
+        if matches!(k, HoleKind::AddrOffset(_)) {
+            *k = HoleKind::Free;
+        }
+    }
+
     // For @property blocks the templates we care about have a single Free
     // hole: the `initial-value: <N>` byte. We tolerate any number of
     // Consts and at most one Free hole. More than one Free is a shape we
@@ -1757,6 +1830,9 @@ fn materialise_property_template(
             let val = match hole_kinds[i] {
                 HoleKind::Addr => addr,
                 HoleKind::Const(c) => c,
+                // Demoted to Free by emit_property_run before we're called;
+                // handle defensively for exhaustiveness.
+                HoleKind::AddrOffset(d) => (addr as i64 + d).max(0) as u64,
                 HoleKind::Free => free_placeholder,
             };
             out.extend_from_slice(val.to_string().as_bytes());
@@ -1855,6 +1931,106 @@ mod tests {
         assert_eq!(kinds[0], HoleKind::Addr);
         assert_eq!(kinds[1], HoleKind::Addr);
         assert_eq!(kinds[2], HoleKind::Free);
+    }
+
+    #[test]
+    fn learn_template_detects_addr_offset() {
+        // A hole that tracks the entry's address with a constant offset
+        // (region-relative addressing: hole = addr - base). Must classify
+        // as AddrOffset, not Free.
+        let a = b"--m1048581: rel=5 const=7;";
+        let b = b"--m1048585: rel=9 const=7;";
+        let c = b"--m1048587: rel=11 const=7;";
+        let (_lits, kinds) = learn_template(a, 1048581, b, 1048585, c, 1048587).unwrap();
+        assert_eq!(kinds.len(), 3);
+        assert_eq!(kinds[0], HoleKind::Addr);
+        assert_eq!(kinds[1], HoleKind::AddrOffset(-1048576));
+        assert_eq!(kinds[2], HoleKind::Const(7));
+    }
+
+    #[test]
+    fn verify_entry_checks_addr_offset() {
+        let a = b"--m1048581: rel=5 const=7;";
+        let b = b"--m1048585: rel=9 const=7;";
+        let c = b"--m1048587: rel=11 const=7;";
+        let (lits, kinds) = learn_template(a, 1048581, b, 1048585, c, 1048587).unwrap();
+        assert_eq!(
+            verify_entry(b"--m1048618: rel=42 const=7;", &lits, &kinds, 1048618),
+            Some(vec![]),
+        );
+        // Wrong relative offset → mismatch.
+        assert_eq!(
+            verify_entry(b"--m1048618: rel=43 const=7;", &lits, &kinds, 1048618),
+            None,
+        );
+    }
+
+    /// Build a packed-cell assignment run in the writable-disk shadow
+    /// shape: cell names at a high base, per-slot window offsets keyed
+    /// region-relative (`calc(var(--_dskOffN) - k * 2)` where k = cell
+    /// index MINUS the base). This is the real shape kiln emits for
+    /// `disk.writable` carts.
+    fn shadow_run_css(base: u64, n: usize) -> String {
+        let mut css = String::from(".cpu {\n");
+        for k in 0..n {
+            let name = base + k as u64;
+            css.push_str(&format!(
+                "  --mc{name}: --applySlot(--applySlot(--applySlot(var(--__1mc{name}), \
+                 var(--_slot2Live), calc(var(--_dskOff2) - {k} * 2), calc(var(--_dskOff2) + 1 - {k} * 2), var(--memVal2), var(--_writeWidth)), \
+                 var(--_slot1Live), calc(var(--_dskOff1) - {k} * 2), calc(var(--_dskOff1) + 1 - {k} * 2), var(--memVal1), var(--_writeWidth)), \
+                 var(--_slot0Live), calc(var(--_dskOff0) - {k} * 2), calc(var(--_dskOff0) + 1 - {k} * 2), var(--memVal0), var(--_writeWidth));\n",
+            ));
+        }
+        css.push_str("  --keep: 7;\n}\n");
+        css
+    }
+
+    #[test]
+    fn shadow_offset_run_absorbed_into_packed_ports() {
+        let base = 1_048_576u64;
+        let n = 1500usize;
+        let css = shadow_run_css(base, n);
+        let result = recognise(&css);
+        // Three slots → three pre-built packed ports covering every cell.
+        assert_eq!(result.packed_broadcast_ports.len(), 3);
+        for port in &result.packed_broadcast_ports {
+            assert_eq!(port.address_map.len(), n);
+            // Keys are region-relative byte addrs ((addr - base) * pack),
+            // matching what --_dskOffN carries at runtime.
+            assert_eq!(port.address_map.get(&0).unwrap(), &format!("--mc{base}"));
+            assert_eq!(
+                port.address_map.get(&84).unwrap(),
+                &format!("--mc{}", base + 42),
+            );
+            assert_eq!(port.pack, 2);
+        }
+        // Every cell absorbed + blanked; only --keep survives the reparse.
+        assert_eq!(result.absorbed_properties.len(), n);
+        let blanked = apply_blank_ranges(&css, &result.blank_ranges);
+        let prog = crate::parser::parse_stylesheet(&blanked).unwrap();
+        assert_eq!(prog.assignments.len(), 1, "only --keep survives");
+        assert_eq!(prog.assignments[0].property, "--keep");
+    }
+
+    #[test]
+    fn mixed_addr_offset_deltas_left_to_parser() {
+        // Two AddrOffset holes with DIFFERENT deltas can't be keyed to one
+        // port family — the segment must be left alone (nothing absorbed,
+        // nothing blanked), not mis-absorbed.
+        let mut css = String::from(".cpu {\n");
+        for k in 0..1500u64 {
+            let name = 1_048_576 + k;
+            let other = 2_000_000 + k;
+            css.push_str(&format!(
+                "  --mc{name}: --applySlot(var(--__1mc{name}), var(--_slot0Live), \
+                 calc(var(--_dskOff0) - {k} * 2), calc(var(--_dskOff0) + 1 - {k} * 2), var(--memVal{other}), var(--_writeWidth));\n",
+            ));
+        }
+        css.push_str("}\n");
+        let result = recognise(&css);
+        assert!(result.packed_broadcast_ports.is_empty());
+        assert!(result.absorbed_properties.is_empty());
+        assert!(result.blank_ranges.is_empty());
     }
 
     #[test]
