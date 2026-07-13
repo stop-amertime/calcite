@@ -303,10 +303,18 @@ impl CalciteEngine {
             return false;
         }
         let chunk = if chunk_ticks == 0 { count.max(1) } else { chunk_ticks };
+        // `At` watches fire on exact tick equality — a poll grid that
+        // steps over the tick never fires them. Shrink the batch so a
+        // poll lands exactly on each target, the same way calcite-cli's
+        // watch loop does (cli/wasm parity).
+        let at_targets = self.watch_registry.at_targets();
         let mut remaining = count;
         let mut tick_now: u32 = self.state.frame_counter;
         while remaining > 0 {
-            let n = remaining.min(chunk);
+            let mut n = remaining.min(chunk);
+            if let Some(&t) = at_targets.iter().find(|&&t| t > tick_now) {
+                n = n.min(t - tick_now);
+            }
             self.evaluator.run_batch_silent(&mut self.state, n);
             tick_now = tick_now.saturating_add(n);
             calcite_core::script_eval::poll(

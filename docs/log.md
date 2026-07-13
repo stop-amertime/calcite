@@ -11,6 +11,24 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-07-13 — `at` watches never fired on wasm: run_batch_watched now lands polls on at-targets
+
+Not perf — cli/wasm parity ("works in cli but not wasm is broken").
+`WatchKind::At` fires on exact tick equality; calcite-cli's watch loop
+shrinks each batch so the poll cursor lands exactly on the next At
+target, but `run_batch_watched` (wasm) polled on a fixed chunk grid
+that stepped straight over them — an `at:tick=N:then=pseudo_pulse=…`
+key tap worked on CLI and silently never fired in the browser. Found
+by CSS-DOS's new `windows-all` bench profile (its README.DOC launch
+keys are `at` watches; the web run hung at the Executive forever).
+Fix: `WatchRegistry::at_targets()` (sorted At ticks, unit-tested) +
+run_batch_watched clamps each batch to `next_target - tick_now`.
+Profiles without `at` watches see an empty target list — behaviour
+unchanged (doom-all/msdos-boot unaffected). Verified: windows-all web
+run completes with key_r/key_enter firing at exactly 5.2M/5.36M and
+write_loaded halting at 8.33M; workspace tests green. Cross-link:
+CSS-DOS LOGBOOK 2026-07-13-windows-all-bench.
+
 ## 2026-07-13 — rep applier: virtual-destination writes fall back per-tick instead of panicking
 
 Not perf — correctness/coverage. Both bulk appliers (Fill and Movs

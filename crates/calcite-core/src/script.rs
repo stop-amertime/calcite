@@ -378,6 +378,24 @@ impl WatchRegistry {
         std::mem::take(&mut self.events)
     }
 
+    /// Sorted exact-tick targets of registered `At` watches. `At`
+    /// fires on tick equality only, so a batch runner polling on a
+    /// fixed chunk grid steps right over them — runners must shrink
+    /// their batch so a poll lands exactly on each target (calcite-cli
+    /// does; `run_batch_watched` on wasm consumes this).
+    pub fn at_targets(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self
+            .watches
+            .iter()
+            .filter_map(|w| match w.kind {
+                WatchKind::At { tick } => Some(tick),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Has any fired watch requested a halt?
     pub fn halt_requested(&self) -> bool {
         self.halt_requested
@@ -434,5 +452,27 @@ mod tests {
         assert!(!r.halt_requested());
         assert_eq!(r.name_index("tick"), Some(0));
         assert_eq!(r.name_index("missing"), None);
+    }
+
+    #[test]
+    fn at_targets_sorted_across_kinds() {
+        let mut r = WatchRegistry::new();
+        for (name, tick) in [("late", 900_u32), ("early", 300)] {
+            r.register(WatchSpec {
+                name: name.to_string(),
+                kind: WatchKind::At { tick },
+                gate: None,
+                actions: vec![Action::Emit],
+                sample_vars: Vec::new(),
+            });
+        }
+        r.register(WatchSpec {
+            name: "stride".to_string(),
+            kind: WatchKind::Stride { every: 100, last_fired_at: Cell::new(0) },
+            gate: None,
+            actions: vec![Action::Emit],
+            sample_vars: Vec::new(),
+        });
+        assert_eq!(r.at_targets(), vec![300, 900]);
     }
 }
