@@ -343,14 +343,18 @@ pub(crate) fn apply_fill_with_commit(
 
     // Virtual-region overlap check: bulk writes through state.memory
     // can't substitute for cabinet-emitted dispatch over BIOS / ROM-disk
-    // / packed-broadcast windows. The hardcoded path bails on this and
-    // panics; the descriptor-driven applier returns Unsupported and
-    // lets the caller decide.
+    // / packed-broadcast windows — but per-tick evaluation CAN: it runs
+    // the cabinet's own write cascade, which is the reference semantic
+    // for such writes (on a rom cabinet a store into the disk window
+    // simply matches no write rule and drops, exactly as Chrome would
+    // evaluate it — Windows 1.01's WRITE.EXE hits this via Corduroy's
+    // INT 13h AH=03h path on a read-only floppy, 2026-07-13). Fall back
+    // per-iter instead of refusing; the diag counter keeps it visible.
     let seg_for_range = prepared[0].0; // all writes share the same seg in Fill
     let dst_lo_linear = seg_for_range + off_lo;
     let dst_hi_linear = seg_for_range + off_hi;
     if ranges_overlap_virtual(state, dst_lo_linear, dst_hi_linear - dst_lo_linear) {
-        return ApplyOutcome::Unsupported(
+        return ApplyOutcome::PerIterFallback(
             "destination range overlaps virtual region",
         );
     }
@@ -641,14 +645,18 @@ pub(crate) fn apply_copy_with_commit(
     // is read through `state.read_mem`, which transparently handles
     // packed cells / extended map / windowed byte arrays. The
     // destination is written through `bulk_store_byte` which routes
-    // similarly, but the hardcoded path bails on virtual-region writes
-    // (it has stricter assumptions about whether the bulk path matches
-    // CSS-side writeback). Match its behaviour — with one carve-out: a
-    // destination range entirely inside a cell-backed (writable)
-    // windowed byte array is serviced per-byte through `state.write_mem`,
-    // which performs the same key-remapped cell splice the cabinet's own
-    // write rules do. Literal-backed (read-only) windows and every other
-    // virtual region still refuse loudly.
+    // similarly, but the bulk path can't substitute for cabinet-emitted
+    // write dispatch over virtual regions. One carve-out stays on the
+    // fast path: a destination range entirely inside a cell-backed
+    // (writable) windowed byte array is serviced per-byte through
+    // `state.write_mem`, which performs the same key-remapped cell
+    // splice the cabinet's own write rules do. Every OTHER virtual
+    // destination falls back to per-tick evaluation, which runs the
+    // cabinet's real write cascade — the reference semantic (a store
+    // into a literal-backed rom-disk window matches no write rule and
+    // drops, exactly as Chrome evaluates it; Windows 1.01's WRITE.EXE
+    // hits this via Corduroy's INT 13h AH=03h on a read-only floppy,
+    // 2026-07-13).
     let dst_seg_base = (dst_seg_value as i64) * 16;
     let dst_lo_linear = dst_seg_base + dst_lo;
     let dst_hi_linear = dst_seg_base + dst_hi;
@@ -660,7 +668,7 @@ pub(crate) fn apply_copy_with_commit(
     if !dst_in_writable_window
         && ranges_overlap_virtual(state, dst_lo_linear, dst_hi_linear - dst_lo_linear)
     {
-        return ApplyOutcome::Unsupported("destination range overlaps virtual region");
+        return ApplyOutcome::PerIterFallback("destination range overlaps virtual region");
     }
 
     // Virtual-region overlap on the SOURCE side too. `state.read_mem`

@@ -11,6 +11,35 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-07-13 — rep applier: virtual-destination writes fall back per-tick instead of panicking
+
+Not perf — correctness/coverage. Both bulk appliers (Fill and Movs
+shapes) returned `Unsupported` → panic ("No slow path") when the
+destination range overlapped a virtual region. Windows 1.01's
+WRITE.EXE is the first real cabinet to hit it: launching a .DOC file
+makes DOS write to disk, Corduroy's INT 13h AH=03h REP MOVSWs the
+sector into the rom-disk window at D000:0, and on a **read-only**
+cabinet the window is literal-backed — a virtual destination.
+
+Chrome's semantic for such writes is well-defined: the cabinet has no
+write rule for those addresses, so the store drops (the BIOS comment
+documents this — a rom floppy behaves like adapter ROM / a
+write-protected disk). Per-tick evaluation runs the cabinet's real
+write cascade and reproduces that exactly, so the correct outcome is
+`PerIterFallback`, not a refusal: the "refuse loudly" policy did its
+job by surfacing the gap, and the fallback IS the reference-faithful
+slow path the panic asked for. The writable-window carve-out (packed
+cell splice on the fast path) is unchanged; the diag counter keeps
+per-iter fallbacks visible for perf triage.
+
+Verified: Windows 1.01 cart — WRITE.EXE now opens README.DOC (menu
+bar + document rendered, screenshot in CSS-DOS repo); CSS-DOS gates
+smoke 6/6, msdos, windows (kbd+mouse launch) all PASS on the rebuilt
+CLI; wasm re-vendored to the site, websmoke PASS. Cross-link: CSS-DOS
+LOGBOOK 2026-07-13 (windows101 cart + serial mouse).
+
+---
+
 ## 2026-07-07 — calcite-cli: `--press-events` accepts a pseudo-class prefix (`checked@kb-holdmode`)
 
 Not perf — dev-tooling. Press events were hardcoded to the `active`
